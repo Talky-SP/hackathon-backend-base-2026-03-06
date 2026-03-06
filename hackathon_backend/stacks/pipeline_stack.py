@@ -24,7 +24,7 @@ class DevPipelineStack(Stack):
 
         source = pipelines.CodePipelineSource.connection(
             "YourOrg/YourRepo", "develop",                      # CHANGE: your GitHub repo
-            connection_arn="arn:aws:codeconnections:eu-west-3:111111111111:connection/YOUR-CONN-ID",  # CHANGE
+            connection_arn="arn:aws:codeconnections:eu-west-3:131880217295:connection/YOUR-CONN-ID",  # CHANGE
         )
 
         pipeline = pipelines.CodePipeline(

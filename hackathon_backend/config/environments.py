@@ -18,7 +18,7 @@ class Config:
         self.app_name = "hackathon"  # CHANGE THIS: prefix for all resource names
 
         if env == Environment.DEV:
-            self.account_id = "111111111111"       # CHANGE: target AWS account ID
+            self.account_id = "131880217295"       # CHANGE: target AWS account ID
             self.region = "eu-west-3"              # CHANGE: target region
             self.stage = "dev"
             self.log_level = "INFO"

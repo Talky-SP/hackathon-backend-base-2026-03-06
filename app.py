@@ -36,7 +36,7 @@ def _get_pipeline_target() -> str | None:
 
 def _create_pipeline_stacks(target: str | None) -> None:
     # CHANGE: account and region to match your pipeline account
-    pipeline_env = Environment(account="111111111111", region="eu-west-3")
+    pipeline_env = Environment(account="131880217295", region="eu-west-3")
 
     if target in (None, "all"):
         DevPipelineStack(app, "HackathonDevPipelineStack", env=pipeline_env)
