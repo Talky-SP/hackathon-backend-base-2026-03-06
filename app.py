@@ -1,28 +1,69 @@
-#!/usr/bin/env python3
 import os
-
 import aws_cdk as cdk
-
-from hackathon_backend_base_2026_03_06.hackathon_backend_base_2026_03_06_stack import HackathonBackendBase20260306Stack
-
+from aws_cdk import Environment
+from hackathon_backend.stacks.local_dev_stage import LocalDevStage
+from hackathon_backend.stacks.pipeline_stack import DevPipelineStack, PrePipelineStack, ProdPipelineStack
 
 app = cdk.App()
-HackathonBackendBase20260306Stack(app, "HackathonBackendBase20260306Stack",
-    # If you don't specify 'env', this stack will be environment-agnostic.
-    # Account/Region-dependent features and context lookups will not work,
-    # but a single synthesized template can be deployed anywhere.
 
-    # Uncomment the next line to specialize this stack for the AWS Account
-    # and Region that are implied by the current CLI configuration.
 
-    #env=cdk.Environment(account=os.getenv('CDK_DEFAULT_ACCOUNT'), region=os.getenv('CDK_DEFAULT_REGION')),
+def _normalize_pipeline_target(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = str(value).strip().lower()
+    aliases = {
+        "dev": "dev", "development": "dev",
+        "pre": "pre", "preproduction": "pre",
+        "prod": "prod", "production": "prod",
+        "all": "all", "*": "all",
+    }
+    return aliases.get(normalized)
 
-    # Uncomment the next line if you know exactly what Account and Region you
-    # want to deploy the stack to. */
 
-    #env=cdk.Environment(account='123456789012', region='us-east-1'),
+def _get_pipeline_target() -> str | None:
+    for context_key in ("pipeline", "env", "stage"):
+        target = _normalize_pipeline_target(app.node.try_get_context(context_key))
+        if target:
+            return target
 
-    # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
-    )
+    for env_key in ("HACKATHON_PIPELINE", "CDK_PIPELINE", "HACKATHON_ENV", "HACKATHON_STAGE"):
+        target = _normalize_pipeline_target(os.getenv(env_key))
+        if target:
+            return target
+
+    return None
+
+
+def _create_pipeline_stacks(target: str | None) -> None:
+    # CHANGE: account and region to match your pipeline account
+    pipeline_env = Environment(account="111111111111", region="eu-west-3")
+
+    if target in (None, "all"):
+        DevPipelineStack(app, "HackathonDevPipelineStack", env=pipeline_env)
+        PrePipelineStack(app, "HackathonPrePipelineStack", env=pipeline_env)
+        ProdPipelineStack(app, "HackathonProdPipelineStack", env=pipeline_env)
+        return
+
+    if target == "dev":
+        DevPipelineStack(app, "HackathonDevPipelineStack", env=pipeline_env)
+        return
+
+    if target == "pre":
+        PrePipelineStack(app, "HackathonPrePipelineStack", env=pipeline_env)
+        return
+
+    if target == "prod":
+        ProdPipelineStack(app, "HackathonProdPipelineStack", env=pipeline_env)
+        return
+
+    raise ValueError("Unsupported pipeline target. Use dev, pre, prod, or all.")
+
+
+if os.getenv("CDK_LOCAL") == "1":
+    acct = os.getenv("CDK_DEFAULT_ACCOUNT", "000000000000")
+    region = os.getenv("CDK_DEFAULT_REGION", "eu-west-3")
+    LocalDevStage(app, "Local", env=Environment(account=acct, region=region))
+else:
+    _create_pipeline_stacks(_get_pipeline_target())
 
 app.synth()
