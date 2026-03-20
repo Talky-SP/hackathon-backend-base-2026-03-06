@@ -8,8 +8,9 @@ python -m hackathon_backend.services.lambdas.agent.server --port 8000
 ```
 
 Server endpoints:
-- **WebSocket**: `ws://localhost:8000/ws/chat` (real-time streaming)
-- **REST**: `POST http://localhost:8000/api/chat` (single request)
+- **WebSocket**: `ws://localhost:8000/ws/chat` (real-time chat with streaming)
+- **REST Chat**: `POST http://localhost:8000/api/chat` (send message)
+- **Chat CRUD**: `GET/POST/DELETE /api/chats`, `GET /api/chats/{id}/messages`
 - **Models**: `GET http://localhost:8000/api/models`
 - **Health**: `GET http://localhost:8000/api/health`
 - **Swagger**: `http://localhost:8000/docs`
@@ -28,6 +29,7 @@ const ws = new WebSocket('ws://localhost:8000/ws/chat');
 ws.send(JSON.stringify({
     question: "Cuanto me he gastado en total?",
     location_id: "deloitte-84",       // Required: tenant ID
+    chat_id: "uuid-of-chat",          // Optional: null = new chat, string = continue chat
     model: "claude-sonnet-4.5",        // Optional: orchestrator model
     classifier_model: "gpt-5-mini",    // Optional: classifier model
     request_id: "abc123"               // Optional: for tracking
@@ -37,6 +39,16 @@ ws.send(JSON.stringify({
 ### Receive events (streaming feedback)
 
 The server sends multiple messages during processing:
+
+#### Chat ID message (sent immediately)
+```json
+{
+    "type": "chat_id",
+    "chat_id": "45b57715-a6d8-472b-854d-8e155ee29fd6",
+    "request_id": "abc123"
+}
+```
+Store this `chat_id` and send it back in subsequent messages to continue the conversation.
 
 #### Event messages (progress feedback)
 ```json
