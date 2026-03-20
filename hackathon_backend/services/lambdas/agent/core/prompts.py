@@ -114,6 +114,10 @@ PROMPT_REGISTRY = {
         "name": "cfo-agent-db-query",
         "default": DB_QUERY_AGENT_SYSTEM,
     },
+    "query_agent_system": {
+        "name": "cfo-query-agent",
+        "default": "",  # Defined in query_agent.py (too long for here)
+    },
 }
 
 

@@ -78,27 +78,47 @@ def _register_azure_anthropic_model(model_id: str, secret_key: str):
 
 
 def _register_vertex_models():
-    """Register Gemini models via Vertex AI using service-account JSON."""
+    """Register Gemini models via Vertex AI using service-account JSON.
+
+    Uses multi-location fallback: global → us-central1.
+    Gemini 3.x preview models are typically available in global and us-central1.
+    """
     sec = get_secret("vertex_ai")
-    # Write the service-account JSON to a temp file for google-auth
+    # Write the service-account JSON to a temp file for google-auth (ADC)
     sa_path = os.path.join(os.environ.get("TEMP", "/tmp"), "vertex_sa.json")
     with open(sa_path, "w") as f:
         json.dump(sec, f)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
 
-    vertex_base = {
-        "vertex_project": sec["project_id"],
-        "vertex_location": "europe-west1",
-    }
+    project_id = sec["project_id"]
 
+    # Gemini 3.0 Flash
     AVAILABLE_MODELS["gemini-3.0-flash"] = {
         "model": "vertex_ai/gemini-3-flash-preview",
-        **vertex_base,
+        "vertex_project": project_id,
+        "vertex_location": "global",
     }
+    # Gemini 3.1 Pro
     AVAILABLE_MODELS["gemini-3.1-pro"] = {
         "model": "vertex_ai/gemini-3.1-pro-preview",
-        **vertex_base,
+        "vertex_project": project_id,
+        "vertex_location": "global",
     }
+
+    # Fallback chains: try different locations, then fall back to older model
+    _VERTEX_FALLBACK_CHAIN["gemini-3.0-flash"] = [
+        {"model": "vertex_ai/gemini-3-flash-preview", "vertex_project": project_id, "vertex_location": "us-central1"},
+        {"model": "vertex_ai/gemini-2.5-flash", "vertex_project": project_id, "vertex_location": "global"},
+        {"model": "vertex_ai/gemini-2.5-flash", "vertex_project": project_id, "vertex_location": "us-central1"},
+    ]
+    _VERTEX_FALLBACK_CHAIN["gemini-3.1-pro"] = [
+        {"model": "vertex_ai/gemini-3.1-pro-preview", "vertex_project": project_id, "vertex_location": "us-central1"},
+        {"model": "vertex_ai/gemini-2.5-pro", "vertex_project": project_id, "vertex_location": "global"},
+    ]
+
+
+# Fallback chains per vertex model — list of alternative {model, location} configs
+_VERTEX_FALLBACK_CHAIN: dict[str, list[dict]] = {}
 
 
 def init_models():
@@ -148,14 +168,34 @@ def get_langfuse() -> Langfuse:
 def completion(model_id: str, messages: list[dict], **kwargs) -> Any:
     """
     Call any registered model via LiteLLM.
+    For Vertex AI models, tries fallback locations if the primary fails.
     Accepts the same kwargs as litellm.completion (tools, temperature, etc.)
     """
     if model_id not in AVAILABLE_MODELS:
         raise ValueError(
             f"Unknown model '{model_id}'. Available: {list(AVAILABLE_MODELS.keys())}"
         )
-    params = {**AVAILABLE_MODELS[model_id], **kwargs, "messages": messages}
-    return litellm.completion(**params)
+
+    model_cfg = AVAILABLE_MODELS[model_id]
+    params = {**model_cfg, **kwargs, "messages": messages}
+
+    # For Vertex AI models, try primary config then fallback chain
+    fallbacks = _VERTEX_FALLBACK_CHAIN.get(model_id, [])
+    if not fallbacks:
+        return litellm.completion(**params)
+
+    try:
+        return litellm.completion(**params)
+    except Exception as primary_err:
+        last_err = primary_err
+        for fb_cfg in fallbacks:
+            try:
+                fallback_params = {**params, **fb_cfg}
+                return litellm.completion(**fallback_params)
+            except Exception as fb_err:
+                last_err = fb_err
+                continue
+        raise last_err
 
 
 # ---------------------------------------------------------------------------
