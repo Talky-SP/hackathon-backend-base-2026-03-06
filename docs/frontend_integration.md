@@ -465,7 +465,169 @@ function CFOChat({ locationId }) {
 
 ---
 
-## 8. Example Queries to Test
+## 8. Chat Management API
+
+The server supports persistent multi-turn conversations. Each chat has a unique `chat_id` and stores full message history.
+
+### Create a new chat
+```
+POST /api/chats?location_id=deloitte-84&model=claude-sonnet-4.5
+```
+Response:
+```json
+{
+    "chat_id": "45b57715-a6d8-472b-854d-8e155ee29fd6",
+    "location_id": "deloitte-84",
+    "title": "",
+    "model": "claude-sonnet-4.5",
+    "created_at": 1711036800.0,
+    "updated_at": 1711036800.0,
+    "message_count": 0
+}
+```
+
+### List chats
+```
+GET /api/chats?location_id=deloitte-84&limit=50
+```
+Response:
+```json
+{
+    "chats": [
+        {
+            "chat_id": "45b57715-...",
+            "location_id": "deloitte-84",
+            "title": "Cuanto me he gastado en total?",
+            "model": "claude-sonnet-4.5",
+            "created_at": 1711036800.0,
+            "updated_at": 1711036900.0,
+            "message_count": 4
+        }
+    ]
+}
+```
+
+### Get chat metadata
+```
+GET /api/chats/{chat_id}
+```
+
+### Get chat messages (full history)
+```
+GET /api/chats/{chat_id}/messages?limit=200
+```
+Response:
+```json
+{
+    "chat_id": "45b57715-...",
+    "messages": [
+        {
+            "id": 1,
+            "chat_id": "45b57715-...",
+            "role": "user",
+            "content": "Cuantos proveedores tengo?",
+            "timestamp": 1711036800.0,
+            "metadata": {}
+        },
+        {
+            "id": 2,
+            "chat_id": "45b57715-...",
+            "role": "assistant",
+            "content": "Tienes 49 proveedores registrados...",
+            "timestamp": 1711036810.0,
+            "metadata": {
+                "type": "full_answer",
+                "chart": true,
+                "sources_count": 49,
+                "model": "claude-sonnet-4.5"
+            }
+        }
+    ]
+}
+```
+
+### Update chat (title or model)
+```
+PATCH /api/chats/{chat_id}?title=Mi+conversacion&model=claude-opus-4.6
+```
+
+### Delete chat
+```
+DELETE /api/chats/{chat_id}
+```
+Response: `{"deleted": true}`
+
+---
+
+## 9. Multi-Turn Conversation Flow
+
+The agent supports follow-up questions with automatic context. Here's the recommended frontend flow:
+
+### Flow diagram
+```
+1. User opens app → no chat_id yet
+2. User sends first message → send with chat_id: null
+3. Server returns chat_id event → store it
+4. User sends follow-up → send with stored chat_id
+5. Server uses conversation history for context
+```
+
+### Example multi-turn conversation
+```javascript
+let currentChatId = null;
+
+// Turn 1: "Cuantos proveedores tengo?"
+ws.send(JSON.stringify({
+    question: "Cuantos proveedores tengo?",
+    location_id: "deloitte-84",
+    chat_id: null  // new chat
+}));
+// → Receives chat_id event, store it
+// → Result: "Tienes 49 proveedores" + bar chart
+
+// Turn 2: "Y cual es el que mas facturas tiene?"
+ws.send(JSON.stringify({
+    question: "Y cual es el que mas facturas tiene?",
+    location_id: "deloitte-84",
+    chat_id: currentChatId  // continue same chat
+}));
+// → Agent understands context, answers from previous data
+
+// Turn 3: "Cuanto le debo a ese proveedor?"
+ws.send(JSON.stringify({
+    question: "Cuanto le debo a ese proveedor?",
+    location_id: "deloitte-84",
+    chat_id: currentChatId
+}));
+// → Agent resolves "ese proveedor" from history, queries DB for unpaid invoices
+```
+
+### Context window behavior
+- The server keeps full message history in storage
+- When calling the LLM, it builds a **context window** (max 20 messages, 30K chars)
+- Older messages are automatically **summarized** to save tokens
+- Recent messages are sent verbatim for accuracy
+- The frontend does NOT need to manage context — just send `chat_id`
+
+### Sidebar: loading previous chats
+```javascript
+// Load chat list for sidebar
+const { chats } = await fetch('/api/chats?location_id=deloitte-84').then(r => r.json());
+
+// When user clicks a chat, load its messages
+const { messages } = await fetch(`/api/chats/${chatId}/messages`).then(r => r.json());
+
+// Resume conversation by sending chat_id with new messages
+ws.send(JSON.stringify({
+    question: "Nueva pregunta...",
+    location_id: "deloitte-84",
+    chat_id: chatId
+}));
+```
+
+---
+
+## 10. Example Queries to Test
 
 | Query | What it tests |
 |-------|--------------|
@@ -482,7 +644,7 @@ function CFOChat({ locationId }) {
 
 ---
 
-## 9. Error Handling
+## 11. Error Handling
 
 ```javascript
 ws.onerror = (error) => {

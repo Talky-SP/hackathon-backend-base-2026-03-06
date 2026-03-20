@@ -72,6 +72,7 @@ def orchestrate(
         temperature=0.2,
     )
 
+    usage = _extract_usage(response, model_id, "orchestrator")
     choice = response.choices[0]
 
     # MODE 1: Direct answer — no tool calls
@@ -81,6 +82,7 @@ def orchestrate(
             "answer": choice.message.content or "",
             "chart": None,
             "model_used": model_id,
+            "usage": [usage],
         }
 
     # MODE 2: Needs data — extract the fetch_financial_data call(s)
@@ -100,4 +102,17 @@ def orchestrate(
         "data_requests": data_requests,
         "chart_suggestion": chart_suggestion,
         "model_used": model_id,
+        "usage": [usage],
+    }
+
+
+def _extract_usage(response, model_id: str, step: str) -> dict:
+    """Extract token usage from a LiteLLM response."""
+    u = getattr(response, "usage", None)
+    return {
+        "model": model_id,
+        "step": step,
+        "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(u, "total_tokens", 0) or 0,
     }

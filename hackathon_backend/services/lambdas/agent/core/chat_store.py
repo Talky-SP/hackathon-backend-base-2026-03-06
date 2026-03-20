@@ -77,6 +77,29 @@ def _get_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_chats_location ON chats(location_id, updated_at)
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS llm_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            message_id INTEGER,
+            location_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            step TEXT NOT NULL DEFAULT 'unknown',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0.0,
+            timestamp REAL NOT NULL,
+            metadata TEXT DEFAULT '{}',
+            FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_costs_chat ON llm_costs(chat_id, timestamp)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_costs_location ON llm_costs(location_id, timestamp)
+    """)
     conn.commit()
     return conn
 
@@ -195,6 +218,153 @@ def get_messages(chat_id: str, limit: int = 200) -> list[dict]:
             d["metadata"] = {}
         result.append(d)
     return result
+
+
+# ---------------------------------------------------------------------------
+# LLM Cost tracking
+# ---------------------------------------------------------------------------
+# Approximate cost per 1M tokens (USD) — updated March 2026
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "gemini-3.0-flash":  {"input": 0.10, "output": 0.40},
+    "gemini-3.1-pro":    {"input": 1.25, "output": 5.00},
+    "gpt-5-mini":        {"input": 0.15, "output": 0.60},
+    "claude-sonnet-4.5": {"input": 3.00, "output": 15.00},
+    "claude-opus-4.6":   {"input": 15.00, "output": 75.00},
+}
+
+
+def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate USD cost from token counts."""
+    pricing = MODEL_PRICING.get(model, {"input": 1.0, "output": 5.0})
+    return round(
+        (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000,
+        6,
+    )
+
+
+def record_llm_cost(
+    chat_id: str,
+    location_id: str,
+    model: str,
+    step: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int | None = None,
+    cost_usd: float | None = None,
+    message_id: int | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Record a single LLM call's cost."""
+    now = time.time()
+    if total_tokens is None:
+        total_tokens = prompt_tokens + completion_tokens
+    if cost_usd is None:
+        cost_usd = _estimate_cost(model, prompt_tokens, completion_tokens)
+    meta_str = json.dumps(metadata or {}, ensure_ascii=False, default=str)
+    db = _get_db()
+    cursor = db.execute(
+        "INSERT INTO llm_costs (chat_id, message_id, location_id, model, step, "
+        "prompt_tokens, completion_tokens, total_tokens, cost_usd, timestamp, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, message_id, location_id, model, step,
+         prompt_tokens, completion_tokens, total_tokens, cost_usd, now, meta_str),
+    )
+    db.commit()
+    cost_id = cursor.lastrowid
+    db.close()
+    return {"id": cost_id, "cost_usd": cost_usd, "total_tokens": total_tokens}
+
+
+def get_chat_costs(chat_id: str) -> dict:
+    """Get aggregated costs for a single chat."""
+    db = _get_db()
+    rows = db.execute(
+        "SELECT * FROM llm_costs WHERE chat_id = ? ORDER BY timestamp ASC", (chat_id,)
+    ).fetchall()
+    agg = db.execute(
+        "SELECT COUNT(*) as calls, SUM(prompt_tokens) as prompt_tokens, "
+        "SUM(completion_tokens) as completion_tokens, SUM(total_tokens) as total_tokens, "
+        "SUM(cost_usd) as total_cost_usd FROM llm_costs WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    # Cost breakdown by model
+    by_model = db.execute(
+        "SELECT model, COUNT(*) as calls, SUM(prompt_tokens) as prompt_tokens, "
+        "SUM(completion_tokens) as completion_tokens, SUM(total_tokens) as total_tokens, "
+        "SUM(cost_usd) as cost_usd FROM llm_costs WHERE chat_id = ? GROUP BY model", (chat_id,)
+    ).fetchall()
+    # Cost breakdown by step
+    by_step = db.execute(
+        "SELECT step, COUNT(*) as calls, SUM(total_tokens) as total_tokens, "
+        "SUM(cost_usd) as cost_usd FROM llm_costs WHERE chat_id = ? GROUP BY step", (chat_id,)
+    ).fetchall()
+    db.close()
+
+    details = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["metadata"] = json.loads(d["metadata"])
+        except (json.JSONDecodeError, TypeError):
+            d["metadata"] = {}
+        details.append(d)
+
+    return {
+        "chat_id": chat_id,
+        "summary": {
+            "total_calls": agg["calls"] or 0,
+            "prompt_tokens": agg["prompt_tokens"] or 0,
+            "completion_tokens": agg["completion_tokens"] or 0,
+            "total_tokens": agg["total_tokens"] or 0,
+            "total_cost_usd": round(agg["total_cost_usd"] or 0, 6),
+        },
+        "by_model": [dict(r) for r in by_model],
+        "by_step": [dict(r) for r in by_step],
+        "details": details,
+    }
+
+
+def get_location_costs(location_id: str, since: float | None = None) -> dict:
+    """Get aggregated costs for a location (user), optionally filtered by time."""
+    db = _get_db()
+    where = "WHERE location_id = ?"
+    params: list = [location_id]
+    if since:
+        where += " AND timestamp >= ?"
+        params.append(since)
+
+    agg = db.execute(
+        f"SELECT COUNT(*) as calls, SUM(prompt_tokens) as prompt_tokens, "
+        f"SUM(completion_tokens) as completion_tokens, SUM(total_tokens) as total_tokens, "
+        f"SUM(cost_usd) as total_cost_usd FROM llm_costs {where}", params
+    ).fetchone()
+
+    by_model = db.execute(
+        f"SELECT model, COUNT(*) as calls, SUM(prompt_tokens) as prompt_tokens, "
+        f"SUM(completion_tokens) as completion_tokens, SUM(total_tokens) as total_tokens, "
+        f"SUM(cost_usd) as cost_usd FROM llm_costs {where} GROUP BY model", params
+    ).fetchall()
+
+    by_chat = db.execute(
+        f"SELECT c.chat_id, c.title, COUNT(*) as calls, SUM(l.total_tokens) as total_tokens, "
+        f"SUM(l.cost_usd) as cost_usd FROM llm_costs l "
+        f"JOIN chats c ON l.chat_id = c.chat_id {where.replace('location_id', 'l.location_id').replace('timestamp', 'l.timestamp')} "
+        f"GROUP BY l.chat_id ORDER BY cost_usd DESC LIMIT 50", params
+    ).fetchall()
+
+    db.close()
+
+    return {
+        "location_id": location_id,
+        "summary": {
+            "total_calls": agg["calls"] or 0,
+            "prompt_tokens": agg["prompt_tokens"] or 0,
+            "completion_tokens": agg["completion_tokens"] or 0,
+            "total_tokens": agg["total_tokens"] or 0,
+            "total_cost_usd": round(agg["total_cost_usd"] or 0, 6),
+        },
+        "by_model": [dict(r) for r in by_model],
+        "by_chat": [dict(r) for r in by_chat],
+    }
 
 
 # ---------------------------------------------------------------------------

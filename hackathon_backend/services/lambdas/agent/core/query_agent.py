@@ -545,6 +545,7 @@ def run_query_agent(
     query_counter = 0
     max_iterations = 15
     sources_collected: list[dict] = []
+    usage_records: list[dict] = []
 
     for iteration in range(max_iterations):
         emit("thinking", {"step": iteration + 1, "message": "Planificando siguiente paso..." if iteration == 0 else "Analizando resultados..."})
@@ -556,13 +557,25 @@ def run_query_agent(
             temperature=0.1,
         )
 
+        # Track usage per iteration
+        u = getattr(response, "usage", None)
+        usage_records.append({
+            "model": model_id,
+            "step": f"query_agent_iter_{iteration + 1}",
+            "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(u, "total_tokens", 0) or 0,
+        })
+
         choice = response.choices[0]
 
         # If no tool calls, the agent is done
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
             final_text = choice.message.content or ""
             emit("agent_done", {"message": "Respuesta generada"})
-            return _parse_final_response(final_text, sources_collected)
+            result = _parse_final_response(final_text, sources_collected)
+            result["usage"] = usage_records
+            return result
 
         # Process tool calls
         messages.append(choice.message)
@@ -689,6 +702,7 @@ def run_query_agent(
                             "answer": analysis_result.get("answer", ""),
                             "chart": analysis_result.get("chart"),
                             "sources": analysis_result.get("sources", sources_collected),
+                            "usage": usage_records,
                         }
                     if "sources" in analysis_result:
                         sources_collected = analysis_result.get("sources", sources_collected)
@@ -711,6 +725,7 @@ def run_query_agent(
         "answer": "Se ha alcanzado el limite de iteraciones del agente de consultas.",
         "chart": None,
         "sources": sources_collected,
+        "usage": usage_records,
     }
 
 

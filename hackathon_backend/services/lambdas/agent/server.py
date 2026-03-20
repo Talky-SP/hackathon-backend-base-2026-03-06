@@ -41,6 +41,7 @@ from hackathon_backend.services.lambdas.agent.core.query_agent import run_query_
 from hackathon_backend.services.lambdas.agent.core.chat_store import (
     create_chat, get_chat, list_chats, delete_chat, update_chat,
     add_message, get_messages, build_context_window,
+    record_llm_cost, get_chat_costs, get_location_costs,
 )
 
 from langfuse import observe, get_client as _get_langfuse_client
@@ -110,6 +111,8 @@ def _run_pipeline(
     """Full pipeline: classify -> orchestrate -> query agent."""
     emit = on_event or (lambda e, d: None)
 
+    all_usage: list[dict] = []
+
     # Step 1: Classify (use full question + recent context for better classification)
     classify_text = question
     if conversation_history and len(conversation_history) >= 2:
@@ -119,7 +122,8 @@ def _run_pipeline(
         classify_text = f"[Contexto previo: {context_hint}] {question}"
 
     emit("step", {"step": "classify", "message": "Clasificando intencion..."})
-    intent = classify_intent(classify_text, model_id=classifier_model)
+    intent, classifier_usage = classify_intent(classify_text, model_id=classifier_model)
+    all_usage.append(classifier_usage)
     emit("intent", {"intent": intent})
 
     if intent == "complex_task":
@@ -133,6 +137,7 @@ def _run_pipeline(
             "chart": None,
             "sources": [],
             "model_used": classifier_model,
+            "usage": all_usage,
         }
 
     # Step 2: Orchestrate (with conversation history for follow-ups)
@@ -144,6 +149,8 @@ def _run_pipeline(
         conversation_history=conversation_history,
     )
 
+    all_usage.extend(orch_result.get("usage", []))
+
     if orch_result["type"] == "direct_answer":
         emit("step", {"step": "done", "message": "Respuesta directa"})
         return {
@@ -153,6 +160,7 @@ def _run_pipeline(
             "sources": [],
             "intent": intent,
             "model_used": orchestrator_model,
+            "usage": all_usage,
         }
 
     # Step 3: Query agent
@@ -170,6 +178,8 @@ def _run_pipeline(
         on_event=on_event,
     )
 
+    all_usage.extend(agent_result.get("usage", []))
+
     return {
         "type": "full_answer",
         "answer": agent_result["answer"],
@@ -177,7 +187,23 @@ def _run_pipeline(
         "sources": agent_result.get("sources", []),
         "intent": intent,
         "model_used": orchestrator_model,
+        "usage": all_usage,
     }
+
+
+def _store_pipeline_costs(result: dict, chat_id: str, location_id: str, message_id: int | None = None):
+    """Store all LLM usage records from a pipeline run."""
+    for usage in result.get("usage", []):
+        record_llm_cost(
+            chat_id=chat_id,
+            location_id=location_id,
+            model=usage.get("model", "unknown"),
+            step=usage.get("step", "unknown"),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            message_id=message_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +281,13 @@ async def chat(req: ChatRequest):
         "model": result.get("model_used"),
     })
 
+    # Store LLM costs
+    _store_pipeline_costs(result, chat_id, req.location_id, msg["id"])
+
     result["request_id"] = request_id
     result["chat_id"] = chat_id
     result["message_id"] = msg["id"]
+    result.pop("usage", None)  # Don't expose raw usage in REST response
     _get_langfuse_client().flush()
     return ChatResponse(**result)
 
@@ -312,6 +342,48 @@ async def api_update_chat(chat_id: str, title: str | None = None, model: str | N
 async def api_create_chat(location_id: str = DEFAULT_LOCATION_ID, model: str = "claude-sonnet-4.5"):
     """Create a new empty chat."""
     return create_chat(location_id, model=model)
+
+
+# ---------------------------------------------------------------------------
+# Cost & context endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/chats/{chat_id}/costs")
+async def api_chat_costs(chat_id: str):
+    """Get AI cost breakdown for a specific chat."""
+    return get_chat_costs(chat_id)
+
+
+@app.get("/api/chats/{chat_id}/context")
+async def api_chat_context(chat_id: str):
+    """Get the current context window that would be sent to the LLM."""
+    _ensure_init()
+    context = build_context_window(chat_id)
+    total_chars = sum(len(m["content"]) for m in context)
+    return {
+        "chat_id": chat_id,
+        "context_messages": len(context),
+        "total_chars": total_chars,
+        "messages": context,
+    }
+
+
+@app.get("/api/costs")
+async def api_location_costs(location_id: str = DEFAULT_LOCATION_ID, days: int | None = None):
+    """Get AI cost summary for a location (user). Optionally filter by last N days."""
+    since = None
+    if days:
+        since = time.time() - (days * 86400)
+    return get_location_costs(location_id, since=since)
+
+
+@app.get("/api/costs/models")
+async def api_model_pricing():
+    """Get the pricing table used for cost estimation."""
+    from hackathon_backend.services.lambdas.agent.core.chat_store import MODEL_PRICING
+    return {
+        "pricing_per_1m_tokens_usd": MODEL_PRICING,
+        "note": "Costs are estimates based on public pricing. Actual costs may vary.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +490,9 @@ async def ws_chat(ws: WebSocket):
                     "sources_count": len(result.get("sources", [])),
                     "model": result.get("model_used"),
                 })
+
+                # Store LLM costs
+                _store_pipeline_costs(result, _chat_id, location_id, assistant_msg["id"])
 
                 await ws.send_json({
                     "type": "result",
