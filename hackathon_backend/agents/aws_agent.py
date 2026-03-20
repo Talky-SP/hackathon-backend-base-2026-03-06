@@ -10,6 +10,7 @@ from boto3.dynamodb.types import TypeDeserializer
 
 from hackathon_backend.agents.agent import Agent, AgentResult
 from hackathon_backend.agents.table_schema import get_all_schemas_description, TABLES
+from hackathon_backend.agents.chart_tool import CHART_TOOL_INSTRUCTIONS, generate_chart
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,8 @@ Rules:
 
 Available DynamoDB tables and their schemas:
 {schemas}
+
+{chart_instructions}
 """
 
 QUERY_GEN_PROMPT = """\
@@ -40,6 +43,9 @@ For each strategy include:
   (use string expressions, not boto3 Key/Attr objects)
 - "rationale": why this approach is efficient or when it is appropriate
 - "efficiency_score": 1-10 (10 = best)
+- "chart" (optional): if the user wants a visualization, include a JSON object with:
+  - "description": what to chart (e.g. "bar chart of monthly expenses")
+  - "type" (optional): "bar", "line", "pie", or "doughnut"
 
 Return a JSON object: {{ "strategies": [ {{...}}, {{...}}, {{...}} ] }}
 Only return the JSON, no extra text.
@@ -87,13 +93,17 @@ class AWSAgent(Agent):
         self._schemas_text = get_all_schemas_description(stage)
         self._current_request: str = ""
         self._selected_strategy: dict | None = None
+        self._chart_request: dict | None = None
 
     # ------------------------------------------------------------------
     # LLM helpers
     # ------------------------------------------------------------------
 
     def _build_system_prompt(self) -> str:
-        return SYSTEM_PROMPT.format(schemas=self._schemas_text)
+        return SYSTEM_PROMPT.format(
+            schemas=self._schemas_text,
+            chart_instructions=CHART_TOOL_INSTRUCTIONS,
+        )
 
     def _llm_json(self, user_content: str) -> dict:
         """Call the LLM and parse the response as JSON."""
@@ -135,12 +145,14 @@ class AWSAgent(Agent):
         selection = self._llm_json(selection_prompt)
         idx = selection.get("selected_index", 0)
         self._selected_strategy = strategies[idx]
+        self._chart_request = self._selected_strategy.get("chart")
 
         self._trace.append({
             "phase": "select_strategy",
             "selected_index": idx,
             "reason": selection.get("reason", ""),
             "strategy": self._selected_strategy,
+            "chart_request": self._chart_request,
         })
 
         logger.info(
@@ -237,7 +249,28 @@ class AWSAgent(Agent):
     # ------------------------------------------------------------------
 
     def run(self, user_request: str) -> AgentResult:
-        return super().run(user_request)
+        result = super().run(user_request)
+
+        # Post-processing: generate chart if requested
+        if result.success and self._chart_request and result.data:
+            try:
+                chart_desc = self._chart_request.get("description", user_request)
+                if self._chart_request.get("type"):
+                    chart_desc = f"{self._chart_request['type']} chart: {chart_desc}"
+
+                logger.info("AWSAgent.run | generating chart: %s", chart_desc[:100])
+                result.chart_html = generate_chart(
+                    data=result.data,
+                    chart_request=chart_desc,
+                    model=self.model,
+                    llm_caller=self._call_llm,
+                )
+                self._trace.append({"phase": "chart_generation", "status": "success"})
+            except Exception as exc:
+                logger.warning("AWSAgent.run | chart generation failed: %s", exc)
+                self._trace.append({"phase": "chart_generation", "status": "error", "error": str(exc)})
+
+        return result
 
     def query(self, user_request: str) -> str:
         """Convenience method — returns JSON string directly."""

@@ -18,6 +18,7 @@ class AgentResult:
     error: str | None = None
     iterations_used: int = 0
     trace: list[dict] = field(default_factory=list)
+    chart_html: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(
