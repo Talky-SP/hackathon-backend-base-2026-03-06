@@ -16,6 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import os
+
+# Fix Windows console encoding for Unicode output
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from langfuse import observe, get_client as _get_langfuse_client
 
@@ -107,22 +113,46 @@ def interactive_mode(location_id: str, orchestrator_model: str, classifier_model
         print("\n  Processing...")
         result = run_pipeline(question, location_id, orchestrator_model, classifier_model)
 
-        print(f"\n  Agent ({result.get('model_used', '?')}):")
-        print(f"  {result['answer']}")
-
-        if result.get("chart"):
-            print(f"\n  Chart: {json.dumps(result['chart'], indent=2, ensure_ascii=False)}")
-
-        if result.get("tool_calls_made", 0) > 0:
-            print(f"  [DB queries executed: {result['tool_calls_made']}]")
+        _print_result(result)
 
         # Flush Langfuse
         _get_langfuse_client().flush()
 
 
+def _print_result(result: dict):
+    """Pretty-print the pipeline result."""
+    resp_type = result.get("type", "unknown")
+    model = result.get("model_used", "?")
+
+    if resp_type == "direct_answer":
+        print(f"\n  [{model}] Direct answer:")
+        print(f"  {result['answer']}")
+    elif resp_type == "needs_data":
+        print(f"\n  [{model}] Needs data from DB agent:")
+        print(f"  Question: {result['user_question']}")
+        print(f"  Data requests:")
+        for i, req in enumerate(result.get("data_requests", []), 1):
+            print(f"    {i}. [{req['table']}] {req['description']}")
+            if req.get("fields_needed"):
+                print(f"       Fields: {', '.join(req['fields_needed'])}")
+            if req.get("date_range"):
+                dr = req["date_range"]
+                print(f"       Date range: {dr.get('from', '?')} -> {dr.get('to', '?')}")
+            if req.get("filters"):
+                print(f"       Filters: {req['filters']}")
+        if result.get("chart_suggestion"):
+            print(f"  Chart: {result['chart_suggestion']}")
+    elif result.get("intent") == "complex_task":
+        print(f"\n  [Complex Task] {result['answer']}")
+    else:
+        print(f"\n  {json.dumps(result, indent=2, ensure_ascii=False)}")
+
+
 def single_query(question: str, location_id: str, orchestrator_model: str, classifier_model: str):
     """Run a single question and print the result."""
     result = run_pipeline(question, location_id, orchestrator_model, classifier_model)
+    _print_result(result)
+    print(f"\n  --- Raw JSON ---")
     print(json.dumps(result, indent=2, ensure_ascii=False))
     _get_langfuse_client().flush()
 
