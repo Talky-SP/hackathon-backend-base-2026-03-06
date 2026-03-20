@@ -10,7 +10,7 @@ from typing import Any
 
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
-from langfuse.decorators import observe
+from langfuse import observe
 
 # ---------------------------------------------------------------------------
 # Tool definition (OpenAI function-calling schema) — passed to the LLM

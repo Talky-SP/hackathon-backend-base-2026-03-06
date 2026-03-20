@@ -10,6 +10,9 @@ import boto3
 import litellm
 from langfuse import Langfuse
 
+# Allow litellm to drop unsupported params (e.g. temperature for gpt-5)
+litellm.drop_params = True
+
 # ---------------------------------------------------------------------------
 # AWS Secrets Manager
 # ---------------------------------------------------------------------------
@@ -47,19 +50,35 @@ def get_secret(key: str) -> dict[str, Any]:
 AVAILABLE_MODELS: dict[str, dict] = {}
 
 
-def _register_azure_model(model_id: str, secret_key: str, litellm_provider: str = "azure"):
-    """Register an Azure-hosted model into our registry."""
+def _register_azure_openai_model(model_id: str, secret_key: str):
+    """Register an Azure OpenAI model (GPT family) into our registry."""
     sec = get_secret(secret_key)
     AVAILABLE_MODELS[model_id] = {
-        "model": f"{litellm_provider}/{sec['AZURE_DEPLOYMENT_NAME']}",
+        "model": f"azure/{sec['AZURE_DEPLOYMENT_NAME']}",
         "api_key": sec["AZURE_API_KEY"],
         "api_base": sec["AZURE_API_BASE"],
         "api_version": sec.get("AZURE_API_VERSION", ""),
     }
 
 
-def _register_vertex_model():
-    """Register Gemini via Vertex AI using service-account JSON."""
+def _register_azure_anthropic_model(model_id: str, secret_key: str):
+    """Register an Azure-hosted Anthropic model (Claude family) into our registry.
+    These use Azure AI Services with Anthropic's native /messages API."""
+    sec = get_secret(secret_key)
+    # Strip the /anthropic/v1/messages suffix — litellm adds it
+    api_base = sec["AZURE_API_BASE"]
+    if "/anthropic/v1/messages" in api_base:
+        api_base = api_base.replace("/anthropic/v1/messages", "")
+
+    AVAILABLE_MODELS[model_id] = {
+        "model": f"azure_ai/{sec['AZURE_DEPLOYMENT_NAME']}",
+        "api_key": sec["AZURE_API_KEY"],
+        "api_base": api_base,
+    }
+
+
+def _register_vertex_models():
+    """Register Gemini models via Vertex AI using service-account JSON."""
     sec = get_secret("vertex_ai")
     # Write the service-account JSON to a temp file for google-auth
     sa_path = os.path.join(os.environ.get("TEMP", "/tmp"), "vertex_sa.json")
@@ -67,19 +86,27 @@ def _register_vertex_model():
         json.dump(sec, f)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
 
-    AVAILABLE_MODELS["gemini-2.0-flash"] = {
-        "model": "vertex_ai/gemini-2.0-flash",
+    vertex_base = {
         "vertex_project": sec["project_id"],
         "vertex_location": "europe-west1",
+    }
+
+    AVAILABLE_MODELS["gemini-3.0-flash"] = {
+        "model": "vertex_ai/gemini-3-flash-preview",
+        **vertex_base,
+    }
+    AVAILABLE_MODELS["gemini-3.1-pro"] = {
+        "model": "vertex_ai/gemini-3.1-pro-preview",
+        **vertex_base,
     }
 
 
 def init_models():
     """Load all secrets and register every model. Call once at startup."""
-    _register_vertex_model()
-    _register_azure_model("gpt-5-mini", "gpt5_mini")
-    _register_azure_model("claude-sonnet-4.5", "claude_sonnet")
-    _register_azure_model("claude-opus-4.6", "claude_opus")
+    _register_vertex_models()
+    _register_azure_openai_model("gpt-5-mini", "gpt5_mini")
+    _register_azure_anthropic_model("claude-sonnet-4.5", "claude_sonnet")
+    _register_azure_anthropic_model("claude-opus-4.6", "claude_opus")
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +129,9 @@ def init_langfuse() -> Langfuse:
         host=sec["host"],
     )
 
-    # Wire Langfuse callback into LiteLLM so every completion is traced
-    litellm.success_callback = ["langfuse"]
-    litellm.failure_callback = ["langfuse"]
+    # Langfuse v4 uses OpenTelemetry — the @observe decorator on our functions
+    # handles tracing. LiteLLM calls are traced via the observe context.
+    # No need to set litellm.success_callback (incompatible with langfuse v4).
 
     return _langfuse
 

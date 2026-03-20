@@ -17,7 +17,7 @@ import argparse
 import json
 import sys
 
-from langfuse.decorators import observe, langfuse_context
+from langfuse import observe, get_client as _get_langfuse_client
 
 from hackathon_backend.services.lambdas.agent.core.config import (
     init_all,
@@ -39,18 +39,9 @@ def run_pipeline(
     classifier_model: str,
 ) -> dict:
     """Full agent pipeline: classify → route → respond."""
-    langfuse_context.update_current_trace(
-        user_id=location_id,
-        metadata={"orchestrator_model": orchestrator_model, "classifier_model": classifier_model},
-    )
-
     # Step 1: Classify intent
     intent = classify_intent(question, model_id=classifier_model)
     print(f"\n  Intent: {intent}")
-
-    langfuse_context.update_current_observation(
-        metadata={"intent": intent},
-    )
 
     # Step 2: Route based on intent
     if intent == "complex_task":
@@ -126,14 +117,14 @@ def interactive_mode(location_id: str, orchestrator_model: str, classifier_model
             print(f"  [DB queries executed: {result['tool_calls_made']}]")
 
         # Flush Langfuse
-        langfuse_context.flush()
+        _get_langfuse_client().flush()
 
 
 def single_query(question: str, location_id: str, orchestrator_model: str, classifier_model: str):
     """Run a single question and print the result."""
     result = run_pipeline(question, location_id, orchestrator_model, classifier_model)
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    langfuse_context.flush()
+    _get_langfuse_client().flush()
 
 
 def main():

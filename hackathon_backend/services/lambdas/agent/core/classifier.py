@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from langfuse.decorators import observe
+from langfuse import observe
 
 from hackathon_backend.services.lambdas.agent.core.config import completion
 from hackathon_backend.services.lambdas.agent.core.prompts import get_prompt
