@@ -38,6 +38,10 @@ from hackathon_backend.services.lambdas.agent.core.prompts import sync_prompts_t
 from hackathon_backend.services.lambdas.agent.core.classifier import classify_intent
 from hackathon_backend.services.lambdas.agent.core.orchestrator import orchestrate
 from hackathon_backend.services.lambdas.agent.core.query_agent import run_query_agent
+from hackathon_backend.services.lambdas.agent.core.chat_store import (
+    create_chat, get_chat, list_chats, delete_chat, update_chat,
+    add_message, get_messages, build_context_window,
+)
 
 from langfuse import observe, get_client as _get_langfuse_client
 
@@ -76,6 +80,7 @@ class ChatRequest(BaseModel):
     location_id: str = DEFAULT_LOCATION_ID
     model: str = "claude-sonnet-4.5"
     classifier_model: str = "gpt-5-mini"
+    chat_id: str | None = None  # None = create new chat
 
 
 class ChatResponse(BaseModel):
@@ -86,6 +91,8 @@ class ChatResponse(BaseModel):
     intent: str = "fast_chat"
     model_used: str = ""
     request_id: str = ""
+    chat_id: str = ""
+    message_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,14 +104,22 @@ def _run_pipeline(
     location_id: str,
     orchestrator_model: str,
     classifier_model: str,
+    conversation_history: list[dict] | None = None,
     on_event=None,
 ) -> dict:
     """Full pipeline: classify -> orchestrate -> query agent."""
     emit = on_event or (lambda e, d: None)
 
-    # Step 1: Classify
+    # Step 1: Classify (use full question + recent context for better classification)
+    classify_text = question
+    if conversation_history and len(conversation_history) >= 2:
+        # Include last exchange for context-aware classification
+        last_pair = conversation_history[-2:]
+        context_hint = " | ".join(m["content"][:100] for m in last_pair)
+        classify_text = f"[Contexto previo: {context_hint}] {question}"
+
     emit("step", {"step": "classify", "message": "Clasificando intencion..."})
-    intent = classify_intent(question, model_id=classifier_model)
+    intent = classify_intent(classify_text, model_id=classifier_model)
     emit("intent", {"intent": intent})
 
     if intent == "complex_task":
@@ -120,12 +135,13 @@ def _run_pipeline(
             "model_used": classifier_model,
         }
 
-    # Step 2: Orchestrate
+    # Step 2: Orchestrate (with conversation history for follow-ups)
     emit("step", {"step": "orchestrate", "message": "Analizando pregunta..."})
     orch_result = orchestrate(
         user_message=question,
         location_id=location_id,
         model_id=orchestrator_model,
+        conversation_history=conversation_history,
     )
 
     if orch_result["type"] == "direct_answer":
@@ -201,14 +217,101 @@ def _get_provider(model_id: str) -> str:
 async def chat(req: ChatRequest):
     _ensure_init()
     request_id = str(uuid.uuid4())[:8]
+
+    # Resolve or create chat
+    chat_id = req.chat_id
+    if not chat_id:
+        chat_data = create_chat(req.location_id, model=req.model)
+        chat_id = chat_data["chat_id"]
+    else:
+        chat_data = get_chat(chat_id)
+        if not chat_data:
+            chat_data = create_chat(req.location_id, model=req.model)
+            chat_id = chat_data["chat_id"]
+
+    # Store user message
+    add_message(chat_id, "user", req.question)
+
+    # Build conversation context
+    history = build_context_window(chat_id)
+    # Remove the last user message (we pass it as the question)
+    if history and history[-1]["role"] == "user":
+        history = history[:-1]
+
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
-        lambda: _run_pipeline(req.question, req.location_id, req.model, req.classifier_model),
+        lambda: _run_pipeline(
+            req.question, req.location_id, req.model, req.classifier_model,
+            conversation_history=history if history else None,
+        ),
     )
+
+    # Store assistant response
+    msg = add_message(chat_id, "assistant", result.get("answer", ""), metadata={
+        "type": result.get("type"),
+        "chart": result.get("chart") is not None,
+        "sources_count": len(result.get("sources", [])),
+        "model": result.get("model_used"),
+    })
+
     result["request_id"] = request_id
+    result["chat_id"] = chat_id
+    result["message_id"] = msg["id"]
     _get_langfuse_client().flush()
     return ChatResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Chat management endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/chats")
+async def api_list_chats(location_id: str = DEFAULT_LOCATION_ID, limit: int = 50):
+    """List all chats for a location."""
+    _ensure_init()
+    return {"chats": list_chats(location_id, limit=limit)}
+
+
+@app.get("/api/chats/{chat_id}")
+async def api_get_chat(chat_id: str):
+    """Get chat metadata."""
+    chat_data = get_chat(chat_id)
+    if not chat_data:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return chat_data
+
+
+@app.get("/api/chats/{chat_id}/messages")
+async def api_get_messages(chat_id: str, limit: int = 200):
+    """Get all messages for a chat."""
+    msgs = get_messages(chat_id, limit=limit)
+    return {"chat_id": chat_id, "messages": msgs}
+
+
+@app.delete("/api/chats/{chat_id}")
+async def api_delete_chat(chat_id: str):
+    """Delete a chat and all its messages."""
+    deleted = delete_chat(chat_id)
+    return {"deleted": deleted}
+
+
+@app.patch("/api/chats/{chat_id}")
+async def api_update_chat(chat_id: str, title: str | None = None, model: str | None = None):
+    """Update chat title or model."""
+    kwargs = {}
+    if title is not None:
+        kwargs["title"] = title
+    if model is not None:
+        kwargs["model"] = model
+    updated = update_chat(chat_id, **kwargs)
+    return {"updated": updated}
+
+
+@app.post("/api/chats")
+async def api_create_chat(location_id: str = DEFAULT_LOCATION_ID, model: str = "claude-sonnet-4.5"):
+    """Create a new empty chat."""
+    return create_chat(location_id, model=model)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +340,28 @@ async def ws_chat(ws: WebSocket):
             model = msg.get("model", "claude-sonnet-4.5")
             classifier_model = msg.get("classifier_model", "gpt-5-mini")
             request_id = msg.get("request_id", str(uuid.uuid4())[:8])
+            chat_id = msg.get("chat_id")
+
+            # Resolve or create chat
+            if not chat_id:
+                chat_data = create_chat(location_id, model=model)
+                chat_id = chat_data["chat_id"]
+            else:
+                chat_data = get_chat(chat_id)
+                if not chat_data:
+                    chat_data = create_chat(location_id, model=model)
+                    chat_id = chat_data["chat_id"]
+
+            # Store user message
+            add_message(chat_id, "user", question)
+
+            # Build conversation context (exclude the message we just added)
+            history = build_context_window(chat_id)
+            if history and history[-1]["role"] == "user":
+                history = history[:-1]
+
+            # Send chat_id back immediately
+            await ws.send_json({"type": "chat_id", "chat_id": chat_id, "request_id": request_id})
 
             # Event queue for async->sync bridge
             event_queue: asyncio.Queue = asyncio.Queue()
@@ -248,6 +373,10 @@ async def ws_chat(ws: WebSocket):
                 except Exception:
                     pass
 
+            # Capture for closure
+            _history = history if history else None
+            _chat_id = chat_id
+
             # Run pipeline in thread, forward events to WebSocket
             loop = asyncio.get_event_loop()
 
@@ -255,7 +384,10 @@ async def ws_chat(ws: WebSocket):
                 # Start pipeline in background thread
                 future = loop.run_in_executor(
                     None,
-                    lambda: _run_pipeline(question, location_id, model, classifier_model, on_event=on_event),
+                    lambda: _run_pipeline(
+                        question, location_id, model, classifier_model,
+                        conversation_history=_history, on_event=on_event,
+                    ),
                 )
 
                 # Forward events while pipeline runs
@@ -278,11 +410,20 @@ async def ws_chat(ws: WebSocket):
 
                 # Get result and send final response
                 result = await future
-                result["request_id"] = request_id
+
+                # Store assistant response
+                assistant_msg = add_message(_chat_id, "assistant", result.get("answer", ""), metadata={
+                    "type": result.get("type"),
+                    "chart": result.get("chart") is not None,
+                    "sources_count": len(result.get("sources", [])),
+                    "model": result.get("model_used"),
+                })
 
                 await ws.send_json({
                     "type": "result",
                     "request_id": request_id,
+                    "chat_id": _chat_id,
+                    "message_id": assistant_msg["id"],
                     "data": {
                         "type": result.get("type", ""),
                         "answer": result.get("answer", ""),
