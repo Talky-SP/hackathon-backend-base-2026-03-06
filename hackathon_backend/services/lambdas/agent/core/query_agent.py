@@ -383,24 +383,55 @@ YOUR CAPABILITIES:
 1. `dynamo_query` — Execute DynamoDB queries using GSIs for optimal performance
 2. `run_analysis` — Run Python code to compute metrics, aggregations, and chart data
 
+TABLES AND QUERY PATTERNS:
+
+1. User_Expenses (expense invoices):
+   PK=userId, SK=categoryDate (CATEGORY#YYYY-MM-DD#UUID)
+   GSIs: UserIdInvoiceDateIndex(pk=userId,sk=invoice_date), UserIdSupplierCifIndex(pk=userId,sk=supplier_cif),
+         UserIdPnlDateIndex(pk=userId,sk=pnl_date), UserByReconStateDate(pk=userId,sk=recon_state_date R#date/U#date),
+         UserSupplierDateIndex(pk=userSupplierKey={userId}#{cif},sk=charge_date)
+   Fields: total,importe,ivas[{type,base_imponible,amount}],supplier,supplier_cif,invoice_date,due_date,
+           category,concept,reconciled,documentKind(invoice/credit_note),vatTotalAmount,retencion,
+           accountingEntries[{accountCode,accountName,amount,side(DEBE/HABER),kind(provider/expense/asset/vat)}],
+           all_products[{product_name,unit_price,quantity,final_price}],amount_due,amount_paid
+
+2. User_Invoice_Incomes (income invoices):
+   PK=userId, SK=categoryDate. Same GSIs pattern as expenses but with client_name/client_cif instead of supplier.
+   GSIs: UserIdInvoiceDateIndex, UserIdClientCifIndex(pk=userId,sk=client_cif), UserByReconStateDate
+
+3. Providers (supplier master): PK=locationId, SK=cif
+   Fields: nombre,cif,trade_name,facturas(list of expense categoryDates),provincia,emails,phones
+
+4. Customers: PK=locationId, SK=cif. Fields: nombre,cif,facturas
+
+5. Bank_Reconciliations: PK=locationId, SK=MTXN#{bookingDate}#{transactionId}
+   GSI: LocationByStatusDate(pk=locationId,sk=status_date={status}#{bookingDate})
+   Fields: amount,bookingDate,description,merchant,status(PENDING/MATCHED),transactionId
+
+6. Payroll_Slips: PK=locationId, SK=categoryDate({date}#{nif})
+   GSI: OrgCifPeriodIndex(pk=org_cif,sk=PERIOD#{yyyy-mm}#EMP#{nif})
+   Fields: employee_nif,payroll_info{gross_amount,net_amount,company_ss_contribution,irpf_amount}
+
+7. Employees: PK=locationId, SK=employeeNif
+8. Daily_Stats: PK=locationId, SK=dayKey
+9. Monthly_Stats: PK=locationId, SK=monthKey
+
 WORKFLOW:
-1. PLAN: Think about what data you need. For complex questions, you may need multiple steps:
-   - Example: "How much did I spend on Makro?" → First query Providers to find Makro's CIF → Then query User_Expenses filtered by that CIF
-   - Example: "Compare expenses vs income in Nov" → Query both User_Expenses and User_Invoice_Incomes for Nov → run_analysis to compute totals
+1. PLAN: Think step by step. For complex questions, chain queries:
+   - "Gasto en Makro?" → Query Providers to find Makro's CIF → Query User_Expenses with UserIdSupplierCifIndex
+   - "Facturas sin pagar?" → Query UserByReconStateDate with sk begins_with "U#"
+   - "Cuentas contables de X?" → Get expenses, look at accountingEntries field
+   - "Productos/lamparas?" → Get expenses, look at all_products[].product_name field
+   - "Prevision gastos?" → Query recent months, analyze trends with run_analysis
 
-2. EXECUTE: Run queries one at a time or in parallel. Each query result is stored as query_1, query_2, etc.
+2. EXECUTE: Run queries. Each result stored as query_1, query_2, etc.
+3. ANALYZE: ALWAYS call run_analysis as final step with structured output.
 
-3. ANALYZE: Use run_analysis to compute metrics from the fetched data.
-
-4. RESPOND: Return your final answer with the structure described below.
-
-QUERY OPTIMIZATION RULES:
-- ALWAYS use GSIs when possible. Never do full partition scans when a GSI can narrow results.
-- For date ranges: Use UserIdInvoiceDateIndex (sk=invoice_date) with between operator
-- For supplier lookups: First query Providers table (PK=locationId, SK=cif) to find CIF, then use UserIdSupplierCifIndex
-- For reconciliation status: Use UserByReconStateDate (sk begins_with "R#" for reconciled, "U#" for unreconciled)
-- For bank transactions by date: Use LocationByStatusDate GSI
-- locationId is ALWAYS auto-enforced — you don't need to worry about it
+RULES:
+- Use GSIs, never full scans. Date queries → UserIdInvoiceDateIndex. Supplier → UserIdSupplierCifIndex.
+- Reconciliation: recon_state_date begins_with "R#" = paid, "U#" = unpaid. Also check reconciled field.
+- For "unpaid": if reconciled is None/False/missing → unpaid. If reconciled is True → paid.
+- locationId is auto-enforced for security.
 
 CRITICAL: You MUST ALWAYS finish by calling run_analysis to compute the final structured answer.
 NEVER just write a text response — always call run_analysis as the last step.
@@ -451,6 +482,16 @@ TODAY'S DATE: 2026-03-20. Use this for relative date references ("last month" = 
 # ---------------------------------------------------------------------------
 # Main query agent entry point
 # ---------------------------------------------------------------------------
+# Type for streaming callbacks
+from typing import Callable
+
+EventCallback = Callable[[str, dict], None]
+
+
+def _noop_callback(event: str, data: dict) -> None:
+    pass
+
+
 @observe(name="query_agent")
 def run_query_agent(
     user_question: str,
@@ -458,6 +499,7 @@ def run_query_agent(
     location_id: str,
     model_id: str = "claude-sonnet-4.5",
     chart_suggestion: dict | None = None,
+    on_event: EventCallback | None = None,
 ) -> dict[str, Any]:
     """
     Run the query agent: plans queries, executes them, analyzes results.
@@ -495,6 +537,9 @@ def run_query_agent(
         {"role": "user", "content": user_content},
     ]
 
+    emit = on_event or _noop_callback
+    emit("agent_start", {"question": user_question, "data_requests": data_requests, "model": model_id})
+
     # Agent loop: keep calling tools until the LLM is done
     query_results: dict[str, dict] = {}
     query_counter = 0
@@ -502,6 +547,8 @@ def run_query_agent(
     sources_collected: list[dict] = []
 
     for iteration in range(max_iterations):
+        emit("thinking", {"step": iteration + 1, "message": "Planificando siguiente paso..." if iteration == 0 else "Analizando resultados..."})
+
         response = completion(
             model_id=model_id,
             messages=messages,
@@ -514,7 +561,7 @@ def run_query_agent(
         # If no tool calls, the agent is done
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
             final_text = choice.message.content or ""
-            # Try to parse structured result from the text
+            emit("agent_done", {"message": "Respuesta generada"})
             return _parse_final_response(final_text, sources_collected)
 
         # Process tool calls
@@ -536,6 +583,10 @@ def run_query_agent(
                 query_counter += 1
                 query_key = f"query_{query_counter}"
 
+                table_label = args["table_name"].replace("_", " ")
+                idx_label = f" (GSI: {args.get('index_name')})" if args.get("index_name") else ""
+                emit("querying", {"message": f"Consultando {table_label}{idx_label}...", "table": args["table_name"], "query_key": query_key})
+
                 result = _execute_query(
                     table_name=args["table_name"],
                     location_id=location_id,
@@ -550,6 +601,12 @@ def run_query_agent(
                 )
 
                 query_results[query_key] = result
+
+                if result.get("success"):
+                    emit("query_result", {"query_key": query_key, "table": args["table_name"], "count": result["count"],
+                                          "message": f"Encontrados {result['count']} registros en {table_label}"})
+                else:
+                    emit("query_error", {"query_key": query_key, "table": args["table_name"], "error": result.get("error", "?")})
 
                 # Collect sources from invoice/transaction items
                 if result.get("success"):
@@ -589,8 +646,11 @@ def run_query_agent(
                         "charge_date", "reconciled", "amount_due", "amount_paid",
                         "documentKind", "vatTotalAmount", "vatDeductibleAmount",
                         "vatOperationType", "retencion", "invoice_number",
+                        "accountingEntries", "all_products",
+                        "recon_state_date", "invoice_supplier_id",
                         # Providers/Customers
                         "nombre", "cif", "trade_name", "facturas", "provincia",
+                        "emails", "phones", "website",
                         # Bank
                         "amount", "bookingDate", "description", "merchant", "status",
                         "transactionId", "SK", "matched_expense_id", "matched_invoice_id",
@@ -616,6 +676,7 @@ def run_query_agent(
                 })
 
             elif fn_name == "run_analysis":
+                emit("analyzing", {"message": "Ejecutando analisis de datos..."})
                 code = args["code"]
                 result = _execute_code(code, query_results)
 
@@ -623,7 +684,7 @@ def run_query_agent(
                     analysis_result = result["result"]
                     # If analysis returned final structured answer, capture it
                     if "answer" in analysis_result:
-                        # This is the final response — return immediately
+                        emit("agent_done", {"message": "Respuesta generada"})
                         return {
                             "answer": analysis_result.get("answer", ""),
                             "chart": analysis_result.get("chart"),
