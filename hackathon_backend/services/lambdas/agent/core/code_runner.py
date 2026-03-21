@@ -12,7 +12,7 @@ statistical analysis — anything, dynamically.
 Architecture:
 - run_code_execution() — main entry point, routes to provider
 - _claude_code_exec() — LiteLLM call with code_execution_20250825 tool
-- _gemini_code_exec() — google.genai SDK call with code_execution tool
+- _gemini_code_exec() — LiteLLM call with codeExecution tool (Vertex AI)
 - _extract_b64_files() — extracts base64-encoded files from Claude stdout
 - Container reuse for multi-step within a task
 """
@@ -27,33 +27,6 @@ from typing import Any
 
 import litellm
 from langfuse import observe
-
-# ---------------------------------------------------------------------------
-# Lazy SDK clients (initialized on first use with credentials from config)
-# ---------------------------------------------------------------------------
-_gemini_client = None
-
-
-def _get_gemini_client():
-    """Get or create Gemini client configured for Vertex AI."""
-    global _gemini_client
-    if _gemini_client is not None:
-        return _gemini_client
-
-    from google import genai
-    from google.genai import types as genai_types
-
-    # GOOGLE_APPLICATION_CREDENTIALS already set by config.init_models()
-    from hackathon_backend.services.lambdas.agent.core.config import get_secret
-    sec = get_secret("vertex_ai")
-
-    _gemini_client = genai.Client(
-        vertexai=True,
-        project=sec["project_id"],
-        location="global",
-    )
-    return _gemini_client
-
 
 # ---------------------------------------------------------------------------
 # Artifacts directory
@@ -297,7 +270,7 @@ def _extract_b64_files(stdout: str, task_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Gemini Code Execution (via google.genai SDK → Vertex AI)
+# Gemini Code Execution (via LiteLLM → Vertex AI)
 # ---------------------------------------------------------------------------
 def _gemini_code_exec(
     prompt: str,
@@ -306,123 +279,109 @@ def _gemini_code_exec(
     max_tokens: int,
     system_prompt: str | None,
 ) -> dict:
-    """Execute code using Gemini's native code execution tool."""
-    client = _get_gemini_client()
-    from google.genai import types as genai_types
+    """Execute code using Gemini's native code execution tool via LiteLLM."""
+    from hackathon_backend.services.lambdas.agent.core.config import AVAILABLE_MODELS, init_models
 
-    # Map our model IDs to Gemini model names
-    model_map = {
-        "gemini-3.0-flash": "gemini-3-flash-preview",
-        "gemini-3.1-pro": "gemini-3.1-pro-preview",
-    }
-    gemini_model = model_map.get(model_id, "gemini-3-flash-preview")
+    if not AVAILABLE_MODELS:
+        init_models()
 
-    config = genai_types.GenerateContentConfig(
-        tools=[genai_types.Tool(code_execution=genai_types.ToolCodeExecution)],
-        max_output_tokens=max_tokens,
-        temperature=0.1,
+    # Resolve model config
+    cfg_key = "gemini-3.0-flash"
+    if model_id in AVAILABLE_MODELS:
+        cfg_key = model_id
+    cfg = AVAILABLE_MODELS.get(cfg_key, {})
+
+    # Build messages — add instruction to include code in response for local re-execution
+    gemini_code_instruction = (
+        "\n\nIMPORTANT: In your response, include ALL the Python code you executed "
+        "inside ```python code blocks so it can be reproduced."
     )
+    messages = []
     if system_prompt:
-        config.system_instruction = system_prompt
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt + gemini_code_instruction})
 
-    try:
-        response = client.models.generate_content(
-            model=gemini_model,
-            contents=prompt,
-            config=config,
-        )
-    except Exception as e:
-        # Try fallback location
+    litellm_kwargs: dict[str, Any] = {
+        "model": cfg.get("model", f"vertex_ai/{model_id}"),
+        "messages": messages,
+        "tools": [{"codeExecution": {}}],
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+    }
+    # Pass vertex config if available
+    if cfg.get("vertex_project"):
+        litellm_kwargs["vertex_project"] = cfg["vertex_project"]
+        litellm_kwargs["vertex_location"] = cfg.get("vertex_location", "global")
+
+    # Try primary, then fallback locations
+    from hackathon_backend.services.lambdas.agent.core.config import _VERTEX_FALLBACK_CHAIN
+    fallbacks = _VERTEX_FALLBACK_CHAIN.get(cfg_key, [])
+
+    response = None
+    last_err = None
+    for attempt_cfg in [litellm_kwargs] + [
+        {**litellm_kwargs, **fb} for fb in fallbacks
+    ]:
         try:
-            client2 = _create_gemini_client_location("us-central1")
-            response = client2.models.generate_content(
-                model=gemini_model,
-                contents=prompt,
-                config=config,
-            )
-        except Exception as e2:
-            return {
-                "success": False,
-                "text": f"Gemini code execution error: {e2}",
-                "code_blocks": [],
-                "files": [],
-                "container_id": None,
-                "usage": {},
-            }
+            response = litellm.completion(**attempt_cfg)
+            break
+        except Exception as e:
+            last_err = e
+            continue
 
-    # Parse response parts
-    text_parts = []
+    if response is None:
+        return {
+            "success": False,
+            "text": f"Gemini code execution error: {last_err}",
+            "code_blocks": [],
+            "files": [],
+            "container_id": None,
+            "usage": {},
+        }
+
+    # Parse LiteLLM response
+    msg = response.choices[0].message
+    text = msg.content or ""
     code_blocks = []
     files = []
 
-    if response.candidates and response.candidates[0].content:
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, "text") and part.text:
-                text_parts.append(part.text)
-            if hasattr(part, "executable_code") and part.executable_code:
-                code_blocks.append({
-                    "type": "python",
-                    "code": part.executable_code.code,
-                })
-            if hasattr(part, "code_execution_result") and part.code_execution_result:
-                output = part.code_execution_result.output
-                if output:
-                    text_parts.append(f"[Code output: {output[:500]}]")
-            # Inline image/file data from Gemini
-            if hasattr(part, "inline_data") and part.inline_data:
-                saved = _save_gemini_inline_data(part.inline_data, task_id)
-                if saved:
-                    files.append(saved)
+    # LiteLLM flattens Gemini's code execution parts into the text content
+    # as markdown code blocks. Extract them for local re-execution.
+    code_blocks = _extract_python_from_markdown(text)
 
-    # Extract token usage
+    # Usage
     usage = {}
-    if hasattr(response, "usage_metadata") and response.usage_metadata:
-        um = response.usage_metadata
-        prompt_tokens = getattr(um, "prompt_token_count", 0) or 0
-        completion_tokens = getattr(um, "candidates_token_count", 0) or 0
+    if response.usage:
+        u = response.usage
         usage = {
             "model": model_id,
             "step": "code_execution",
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens": u.prompt_tokens or 0,
+            "completion_tokens": u.completion_tokens or 0,
+            "total_tokens": u.total_tokens or 0,
         }
 
-    # Gemini code execution runs in its sandbox and files stay there.
-    # Re-execute the generated code locally to capture the files.
+    # Gemini sandbox files aren't downloadable — re-execute code locally
     if code_blocks and not files and task_id:
         local_files = _execute_code_locally(code_blocks, task_id)
         files.extend(local_files)
 
     return {
         "success": True,
-        "text": "\n".join(text_parts),
+        "text": text,
         "code_blocks": code_blocks,
         "files": files,
-        "container_id": None,  # Gemini doesn't have container reuse
+        "container_id": None,
         "usage": usage,
     }
 
 
-def _create_gemini_client_location(location: str):
-    """Create a Gemini client for a specific Vertex AI location."""
-    from google import genai
-    from hackathon_backend.services.lambdas.agent.core.config import get_secret
-    sec = get_secret("vertex_ai")
-    return genai.Client(
-        vertexai=True,
-        project=sec["project_id"],
-        location=location,
-    )
-
-
-def _save_gemini_inline_data(inline_data, task_id: str) -> dict | None:
+def _save_inline_data(inline_data: dict, task_id: str) -> dict | None:
     """Save inline data from Gemini response (images, generated files)."""
     try:
-        mime_type = inline_data.mime_type or "application/octet-stream"
-        data = inline_data.data
+        mime_type = inline_data.get("mime_type", "application/octet-stream")
+        data = inline_data.get("data", "")
 
-        # Determine filename based on mime type
         ext_map = {
             "image/png": ".png",
             "image/jpeg": ".jpg",
@@ -448,8 +407,19 @@ def _save_gemini_inline_data(inline_data, task_id: str) -> dict | None:
             "type": _detect_file_type(filename),
         }
     except Exception as e:
-        print(f"Warning: Could not save Gemini inline data: {e}")
+        print(f"Warning: Could not save inline data: {e}")
         return None
+
+
+def _extract_python_from_markdown(text: str) -> list[dict]:
+    """Extract Python code blocks from markdown-formatted text."""
+    blocks = []
+    # Match ```python ... ``` blocks
+    for match in re.finditer(r"```python\s*\n(.+?)```", text, re.DOTALL):
+        code = match.group(1).strip()
+        if code:
+            blocks.append({"type": "python", "code": code})
+    return blocks
 
 
 # ---------------------------------------------------------------------------
