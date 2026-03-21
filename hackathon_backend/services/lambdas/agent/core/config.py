@@ -91,12 +91,12 @@ def _register_vertex_models():
         "vertex_location": "europe-west1",
     }
 
-    AVAILABLE_MODELS["gemini-3.0-flash"] = {
-        "model": "vertex_ai/gemini-3-flash-preview",
+    AVAILABLE_MODELS["gemini-2.5-flash"] = {
+        "model": "vertex_ai/gemini-2.5-flash",
         **vertex_base,
     }
-    AVAILABLE_MODELS["gemini-3.1-pro"] = {
-        "model": "vertex_ai/gemini-3.1-pro-preview",
+    AVAILABLE_MODELS["gemini-2.0-flash"] = {
+        "model": "vertex_ai/gemini-2.0-flash",
         **vertex_base,
     }
 

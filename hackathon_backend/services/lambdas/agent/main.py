@@ -51,16 +51,25 @@ def run_pipeline(
 
     # Step 2: Route based on intent
     if intent == "complex_task":
+        from hackathon_backend.agents.task_agent import TaskAgent
+
+        print(f"\n  Routing to TaskAgent (Deep Agent)...")
+        agent = TaskAgent(
+            user_id=location_id,
+            model_id=orchestrator_model,
+        )
+        result = agent.run(question)
+        data = result.data or {}
         return {
-            "answer": (
-                "Esta es una tarea compleja que requiere procesamiento en segundo plano. "
-                "El sistema de tareas asíncronas aún no está implementado. "
-                "Por ahora, solo se soportan consultas rápidas (fast_chat)."
-            ),
+            "answer": data.get("answer", "") if result.success else (result.error or "Task failed"),
+            "report": data.get("report"),
+            "data": data.get("data"),
+            "sources": data.get("sources", []),
+            "chart": result.chart_html,
+            "exports": data.get("exports", []),
             "intent": intent,
-            "chart": None,
-            "tool_calls_made": 0,
-            "model_used": classifier_model,
+            "tool_calls_made": result.iterations_used,
+            "model_used": orchestrator_model,
         }
 
     # Step 3: Fast-chat orchestration
@@ -143,7 +152,19 @@ def _print_result(result: dict):
         if result.get("chart_suggestion"):
             print(f"  Chart: {result['chart_suggestion']}")
     elif result.get("intent") == "complex_task":
-        print(f"\n  [Complex Task] {result['answer']}")
+        print(f"\n  [Deep Agent | {model}] Complex task result:")
+        answer = result.get("answer", "")
+        if len(answer) > 500:
+            print(f"  {answer[:500]}...")
+        else:
+            print(f"  {answer}")
+        if result.get("exports"):
+            print(f"  Exports: {result['exports']}")
+        if result.get("chart"):
+            print(f"  Chart: generated ({len(result['chart'])} chars)")
+        if result.get("sources"):
+            print(f"  Sources: {len(result['sources'])} items")
+        print(f"  Tool calls: {result.get('tool_calls_made', 0)}")
     else:
         print(f"\n  {json.dumps(result, indent=2, ensure_ascii=False)}")
 

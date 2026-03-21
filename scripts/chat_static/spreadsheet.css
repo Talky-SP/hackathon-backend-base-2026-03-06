@@ -1,0 +1,164 @@
+/* Talky Mini Spreadsheet */
+.talky-sheet {
+  margin-top: 12px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+  background: white;
+  font-size: 13px;
+}
+
+.ts-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #fafafa;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.ts-title {
+  font-weight: 600;
+  color: #333;
+  font-size: 13px;
+}
+
+.ts-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.ts-btn {
+  padding: 4px 10px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+  font-size: 12px;
+  color: #555;
+  transition: all 0.15s;
+}
+
+.ts-btn:hover {
+  border-color: #f2764b;
+  color: #f2764b;
+}
+
+.ts-btn-export {
+  background: #f2764b;
+  color: white !important;
+  border-color: #f2764b;
+}
+
+.ts-btn-export:hover {
+  background: #d4563a;
+  border-color: #d4563a;
+}
+
+.ts-table-wrap {
+  overflow-x: auto;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.ts-table {
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+.ts-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.ts-table th {
+  background: #f2764b;
+  color: white;
+  padding: 6px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  border-right: 1px solid rgba(255,255,255,0.2);
+}
+
+.ts-table th:last-child { border-right: none; }
+
+.ts-table td {
+  padding: 5px 12px;
+  border-bottom: 1px solid #f0f0f0;
+  border-right: 1px solid #f0f0f0;
+  min-width: 60px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ts-table td:last-child { border-right: none; }
+
+.ts-table td[contenteditable]:focus {
+  outline: 2px solid #f2764b;
+  outline-offset: -2px;
+  background: #fff8f6;
+}
+
+.ts-table td[contenteditable]:hover {
+  background: #fafafa;
+}
+
+.ts-table tbody tr:hover {
+  background: #fef6f4;
+}
+
+.ts-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ts-row-num {
+  width: 30px;
+  text-align: center;
+  color: #aaa;
+  font-size: 11px;
+  background: #fafafa !important;
+  user-select: none;
+}
+
+th.ts-row-num { background: #e06540 !important; }
+
+.ts-row-del {
+  width: 28px;
+  text-align: center;
+  padding: 0 !important;
+}
+
+.ts-del-btn {
+  cursor: pointer;
+  color: #ccc;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  text-align: center;
+  transition: all 0.15s;
+}
+
+.ts-del-btn:hover {
+  color: #e74c3c;
+  background: #fee;
+}
+
+th.ts-row-del { background: #e06540 !important; }
+
+.ts-status {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: #999;
+  background: #fafafa;
+  border-top: 1px solid #e0e0e0;
+}

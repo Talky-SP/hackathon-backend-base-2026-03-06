@@ -1,13 +1,15 @@
 """
-Registry of DynamoDB table schemas derived from the CDK constructs.
+Registry of DynamoDB table schemas derived from table_wiki.py (single source of truth).
 
-This gives the LLM enough context to write correct queries
-without scanning the actual tables at runtime.
+Keeps the original TableSchema/GSI dataclasses and utility functions for
+backward compatibility with existing code (e.g. old AWSAgent).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from hackathon_backend.agents.table_wiki import TABLE_WIKI, resolve_table_name
 
 
 @dataclass
@@ -42,138 +44,30 @@ class TableSchema:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Table definitions — keep in sync with hackathon_backend/constructs/databases
-# ---------------------------------------------------------------------------
+def _build_tables_from_wiki() -> list[TableSchema]:
+    """Build TableSchema list from the canonical TABLE_WIKI."""
+    tables = []
+    for table_name, wiki in TABLE_WIKI.items():
+        gsis = []
+        for gsi_name, gsi_info in wiki.get("gsis", {}).items():
+            gsis.append(GSI(
+                name=gsi_name,
+                partition_key=gsi_info["pk"],
+                sort_key=gsi_info.get("sk"),
+                pk_type="S",
+                sk_type=gsi_info.get("sk_type", "S") if gsi_info.get("sk") else "S",
+            ))
+        sk = wiki.get("sk")
+        tables.append(TableSchema(
+            table_name_pattern=wiki["table_name_pattern"],
+            partition_key=wiki["pk"]["name"],
+            sort_key=sk["name"] if sk else None,
+            gsis=gsis,
+        ))
+    return tables
 
-TABLES: list[TableSchema] = [
-    TableSchema(
-        table_name_pattern="{Stage}_User_Expenses",
-        partition_key="userId",
-        sort_key="categoryDate",
-        gsis=[
-            GSI("InvoiceNumberSupplierIndex", "userId", "invoice_supplier_id"),
-            GSI("UserIdInvoiceDateIndex", "userId", "invoice_date"),
-            GSI("UserIdSupplierCifIndex", "userId", "supplier_cif"),
-            GSI("UserIdPnlDateIndex", "userId", "pnl_date"),
-            GSI("UserByReconStateDate", "userId", "recon_state_date"),
-            GSI("UserSupplierDateIndex", "userSupplierKey", "charge_date"),
-            GSI("UserIdInvoiceIdIndex", "userId", "invoiceid"),
-            GSI("UserNeedsReviewIndex", "needsReviewPK", "categoryDate"),
-            GSI("UserByProcessingStatusIndex", "processing_status", "categoryDate"),
-            GSI("UserWorkflowStateIndex", "workflowStatePK", "categoryDate"),
-            GSI("UserDisplayStateIndex", "displayStatePK", "categoryDate"),
-            GSI("UserNeedsExportIndex", "needsExportPK", "categoryDate"),
-            GSI("UserHasChangesIndex", "hasChangesPK", "categoryDate"),
-            GSI("UserPendingReconciliationVerificationIndex", "reconciliationVerifiedPK", "categoryDate"),
-            GSI("UserNeedsSuenlaceExportIndex", "needsSuenlaceExportPK", "categoryDate"),
-            GSI("UserConciliationNeedsExportIndex", "conciliationNeedsExportPK", "categoryDate"),
-            GSI("UserReconciliationNeedsA3ExportIndex", "reconciliationNeedsA3ExportPK", "categoryDate"),
-            GSI("UserA3ExportQueueIndex", "queuedForA3ExportPK", "categoryDate"),
-        ],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Companies",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[
-            GSI("ByNamePrefixIndex", "company_name_prefix_4", "revenue", sk_type="N"),
-            GSI("ByNameWordIndex", "name_word_1", "revenue", sk_type="N"),
-            GSI("ByNameWord2Index", "name_word_2", "revenue", sk_type="N"),
-            GSI("ByFullNameIndex", "company_name_normalized", "revenue", sk_type="N"),
-            GSI("ByCityIndex", "city", "revenue", sk_type="N"),
-            GSI("ByProvinceIndex", "province", "revenue", sk_type="N"),
-            GSI("ByRevenueTierIndex", "revenue_tier", "revenue", sk_type="N"),
-            GSI("ByCnaeCodeIndex", "cnae_code", "revenue", sk_type="N"),
-            GSI("ByCityAndNameIndex", "city", "company_name_normalized"),
-            GSI("ByCifIndex", "cif", "revenue", sk_type="N"),
-        ],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_User_Invoice_Incomes",
-        partition_key="userId",
-        sort_key="categoryDate",
-        gsis=[],  # Add GSIs as needed
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Bank_Reconciliations",
-        partition_key="userId",
-        sort_key="categoryDate",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Payroll_Slips",
-        partition_key="userId",
-        sort_key="categoryDate",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Delivery_Notes",
-        partition_key="userId",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Employees",
-        partition_key="userId",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Providers",
-        partition_key="userId",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Customers",
-        partition_key="userId",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Suppliers",
-        partition_key="userId",
-        sort_key="CIF",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Organizations",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Organization_Locations",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_User_Invoice_Category_Configs",
-        partition_key="userId",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Document_Ibans",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Daily_Stats",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[],
-    ),
-    TableSchema(
-        table_name_pattern="{Stage}_Monthly_Stats",
-        partition_key="PK",
-        sort_key="SK",
-        gsis=[],
-    ),
-]
+
+TABLES: list[TableSchema] = _build_tables_from_wiki()
 
 
 def get_all_schemas_description(stage: str) -> str:

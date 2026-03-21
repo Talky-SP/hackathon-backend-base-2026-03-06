@@ -114,6 +114,10 @@ PROMPT_REGISTRY = {
         "name": "cfo-agent-db-query",
         "default": DB_QUERY_AGENT_SYSTEM,
     },
+    "task_agent_system": {
+        "name": "cfo-agent-deep-task",
+        "default": "See hackathon_backend.agents.task_agent.TASK_AGENT_SYSTEM_PROMPT",
+    },
 }
 
 

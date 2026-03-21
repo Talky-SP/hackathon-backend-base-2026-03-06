@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Talky AWSAgent Test Chat</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link rel="stylesheet" href="spreadsheet.css">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f5f5f5;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    background: #f2764b;
+    color: white;
+    padding: 12px 20px;
+    font-size: 18px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  header .subtitle { font-size: 12px; font-weight: 400; opacity: 0.85; }
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .msg {
+    max-width: 80%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    line-height: 1.5;
+    font-size: 14px;
+    word-wrap: break-word;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: #f2764b;
+    color: white;
+    border-bottom-right-radius: 4px;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+    background: white;
+    color: #333;
+    border-bottom-left-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  .msg.error {
+    background: #fee;
+    color: #c00;
+    border: 1px solid #fcc;
+  }
+  .msg .answer { margin-bottom: 8px; }
+  .msg .metrics {
+    font-size: 12px;
+    color: #666;
+    border-top: 1px solid #eee;
+    padding-top: 8px;
+    margin-top: 8px;
+  }
+  .msg .sources-toggle {
+    font-size: 12px;
+    color: #f2764b;
+    cursor: pointer;
+    margin-top: 6px;
+  }
+  .msg .sources {
+    display: none;
+    font-size: 11px;
+    color: #888;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-top: 6px;
+    background: #fafafa;
+    padding: 8px;
+    border-radius: 6px;
+  }
+  .msg .sources.open { display: block; }
+  .chart-container {
+    margin-top: 12px;
+    background: white;
+    border-radius: 8px;
+    padding: 10px;
+  }
+  .typing {
+    align-self: flex-start;
+    color: #999;
+    font-size: 13px;
+    padding: 8px 16px;
+  }
+  .typing span {
+    animation: blink 1.4s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.2; }
+    40% { opacity: 1; }
+  }
+  .progress-bar {
+    align-self: flex-start;
+    background: white;
+    border-radius: 12px;
+    padding: 12px 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    border-bottom-left-radius: 4px;
+    max-width: 80%;
+    font-size: 13px;
+  }
+  .progress-bar .step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    color: #666;
+  }
+  .progress-bar .step.active { color: #f2764b; font-weight: 500; }
+  .progress-bar .step.done { color: #22c55e; }
+  .progress-bar .step .icon { width: 16px; text-align: center; }
+  .progress-bar .step.active .icon::after { content: '⏳'; }
+  .progress-bar .step.done .icon::after { content: '✓'; }
+  .mode-toggle {
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    background: #eee;
+    border-radius: 6px;
+    margin-right: 8px;
+  }
+  .mode-toggle button {
+    padding: 4px 10px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    background: transparent;
+    color: #666;
+  }
+  .mode-toggle button.active {
+    background: white;
+    color: #f2764b;
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+  }
+  #input-bar {
+    display: flex;
+    gap: 8px;
+    padding: 12px 20px;
+    background: white;
+    border-top: 1px solid #ddd;
+  }
+  #input-bar input {
+    flex: 1;
+    padding: 10px 14px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+  }
+  #input-bar input:focus { border-color: #f2764b; }
+  #input-bar button {
+    padding: 10px 20px;
+    background: #f2764b;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #input-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #input-bar button:hover:not(:disabled) { background: #d4563a; }
+</style>
+</head>
+<body>
+
+<header>
+  Talky AI CFO
+  <span class="subtitle">Fast mode (AWSAgent) &bull; Deep mode (TaskAgent) &bull; Auto (classifier picks)</span>
+</header>
+
+<div id="chat"></div>
+
+<div id="input-bar">
+  <div class="mode-toggle">
+    <button id="mode-fast" class="active" onclick="setMode('fast')">Fast</button>
+    <button id="mode-auto" onclick="setMode('auto')">Auto</button>
+    <button id="mode-deep" onclick="setMode('deep')">Deep</button>
+  </div>
+  <input type="text" id="msg-input" placeholder="Ask about your financial data..." autofocus>
+  <button id="send-btn" onclick="sendMessage()">Send</button>
+</div>
+
+<script src="spreadsheet.js"></script>
+<script>
+const chatEl = document.getElementById('chat');
+const inputEl = document.getElementById('msg-input');
+const sendBtn = document.getElementById('send-btn');
+let currentMode = 'fast';
+
+function setMode(mode) {
+  currentMode = mode;
+  document.querySelectorAll('.mode-toggle button').forEach(b => b.classList.remove('active'));
+  document.getElementById('mode-' + mode).classList.add('active');
+}
+
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+function addMessage(html, cls) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.innerHTML = html;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+function showTyping() {
+  const div = document.createElement('div');
+  div.className = 'typing';
+  div.id = 'typing-indicator';
+  div.innerHTML = '<span>.</span><span>.</span><span>.</span> Thinking';
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function hideTyping() {
+  const el = document.getElementById('typing-indicator');
+  if (el) el.remove();
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function renderResult(data, msgDiv) {
+  const d = data.data || {};
+
+  // Build response HTML
+  let html = '';
+  // Answer
+  if (d.answer) {
+    html += '<div class="answer">' + escapeHtml(d.answer) + '</div>';
+  } else if (typeof d === 'string') {
+    html += '<div class="answer">' + escapeHtml(d) + '</div>';
+  }
+
+  // Metrics
+  if (d.metrics && Object.keys(d.metrics).length > 0) {
+    const parts = Object.entries(d.metrics).map(([k,v]) => `${k}: ${v}`);
+    html += '<div class="metrics">' + escapeHtml(parts.join(' | ')) + '</div>';
+  }
+
+  // Sources toggle
+  if (d.sources && d.sources.length > 0) {
+    const srcId = 'src-' + Date.now();
+    html += '<div class="sources-toggle" onclick="document.getElementById(\'' + srcId + '\').classList.toggle(\'open\')">Show ' + d.sources.length + ' sources</div>';
+    html += '<div class="sources" id="' + srcId + '"><pre>' + escapeHtml(JSON.stringify(d.sources, null, 2)) + '</pre></div>';
+  }
+
+  html += '<div class="metrics" style="border:none;padding:0;margin-top:4px;">Iterations: ' + (data.iterations_used || 0) + '</div>';
+
+  if (!msgDiv) msgDiv = addMessage(html, 'assistant');
+  else msgDiv.innerHTML = html;
+
+  // Spreadsheet — render structured data as editable table
+  const sheetData = d.data;
+  if (sheetData) {
+    const rows = Array.isArray(sheetData) ? sheetData
+      : (typeof sheetData === 'object' ? Object.values(sheetData).find(v => Array.isArray(v)) : null);
+    if (rows && rows.length > 0 && typeof rows[0] === 'object') {
+      const sheetContainer = document.createElement('div');
+      msgDiv.appendChild(sheetContainer);
+      const title = d.report?.title || '';
+      TalkySheet.create(sheetContainer, rows, { title });
+    }
+  }
+
+  // Chart
+  if (data.chart_html) {
+    const chartDiv = document.createElement('div');
+    chartDiv.className = 'chart-container';
+    chartDiv.innerHTML = data.chart_html;
+    msgDiv.appendChild(chartDiv);
+    const scripts = chartDiv.querySelectorAll('script');
+    scripts.forEach(oldScript => {
+      if (oldScript.src) return;
+      const newScript = document.createElement('script');
+      newScript.textContent = oldScript.textContent;
+      oldScript.parentNode.replaceChild(newScript, oldScript);
+    });
+  }
+
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return msgDiv;
+}
+
+const PROGRESS_LABELS = {
+  planning: 'Planning task...',
+  querying: 'Querying database...',
+  computing: 'Computing metrics...',
+  analyzing: 'Analyzing data...',
+  charting: 'Generating chart...',
+  exporting: 'Creating export...',
+  asking_user: 'Needs your input...',
+  done: 'Done!',
+};
+
+async function sendMessage() {
+  const text = inputEl.value.trim();
+  if (!text) return;
+
+  inputEl.value = '';
+  sendBtn.disabled = true;
+  addMessage(escapeHtml(text), 'user');
+
+  if (currentMode === 'deep') {
+    // Deep always streams via SSE
+    await sendDeepMessage(text);
+  } else if (currentMode === 'auto') {
+    // Auto: ask server which mode, then use appropriate path
+    await sendAutoMessage(text);
+  } else {
+    // Fast: simple sync request
+    await sendFastMessage(text);
+  }
+
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+async function sendAutoMessage(text) {
+  // First classify, then route
+  showTyping();
+  try {
+    const resp = await fetch('/api/classify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+    const cls = await resp.json();
+    hideTyping();
+
+    if (cls.intent === 'complex_task') {
+      // Show what classifier decided
+      const note = addMessage('<small style="color:#999">Classifier: complex_task — switching to Deep mode</small>', 'assistant');
+      await sendDeepMessage(text);
+    } else {
+      await sendFastMessage(text);
+    }
+  } catch (err) {
+    hideTyping();
+    // Fallback to fast
+    await sendFastMessage(text);
+  }
+}
+
+async function sendFastMessage(text) {
+  showTyping();
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, mode: currentMode }),
+    });
+    const data = await resp.json();
+    hideTyping();
+    if (!data.success) {
+      addMessage('Error: ' + escapeHtml(data.error || 'Unknown error'), 'assistant error');
+      return;
+    }
+    renderResult(data);
+  } catch (err) {
+    hideTyping();
+    addMessage('Network error: ' + escapeHtml(err.message), 'assistant error');
+  }
+}
+
+async function sendDeepMessage(text) {
+  // Create progress bar
+  const progressDiv = document.createElement('div');
+  progressDiv.className = 'progress-bar';
+  progressDiv.innerHTML = '<div class="step active"><span class="icon"></span> Starting deep analysis...</div>';
+  chatEl.appendChild(progressDiv);
+  chatEl.scrollTop = chatEl.scrollHeight;
+
+  const steps = [];
+
+  try {
+    const resp = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n\n');
+      buffer = lines.pop() || '';
+
+      for (const chunk of lines) {
+        if (!chunk.startsWith('data: ')) continue;
+        const jsonStr = chunk.slice(6).trim();
+        if (!jsonStr) continue;
+
+        let evt;
+        try { evt = JSON.parse(jsonStr); } catch { continue; }
+
+        if (evt.type === 'progress') {
+          // Mark previous step as done
+          const lastStep = progressDiv.querySelector('.step.active');
+          if (lastStep) { lastStep.classList.remove('active'); lastStep.classList.add('done'); }
+
+          const label = PROGRESS_LABELS[evt.event] || evt.event;
+          const detail = evt.data?.description || evt.data?.plan || '';
+          const stepDiv = document.createElement('div');
+          stepDiv.className = 'step active';
+          stepDiv.innerHTML = `<span class="icon"></span> ${escapeHtml(label)}${detail ? ' <small style="color:#999">— ' + escapeHtml(detail.substring(0,60)) + '</small>' : ''}`;
+          progressDiv.appendChild(stepDiv);
+          chatEl.scrollTop = chatEl.scrollHeight;
+        }
+
+        if (evt.type === 'result') {
+          // Mark all steps as done
+          progressDiv.querySelectorAll('.step.active').forEach(s => { s.classList.remove('active'); s.classList.add('done'); });
+          // Render the result
+          renderResult(evt);
+        }
+      }
+    }
+  } catch (err) {
+    progressDiv.innerHTML += '<div class="step" style="color:#e74c3c">Error: ' + escapeHtml(err.message) + '</div>';
+  }
+}
+</script>
+
+</body>
+</html>
