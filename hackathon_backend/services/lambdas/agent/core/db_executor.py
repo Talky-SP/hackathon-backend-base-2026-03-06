@@ -32,7 +32,7 @@ def _get_dynamodb():
 
 
 # ---------------------------------------------------------------------------
-# Table config — maps table name to PK field, date GSI, and date SK
+# Table config — maps table name to PK field, date GSI, and date SK-
 # ---------------------------------------------------------------------------
 TABLE_CONFIG = {
     "User_Expenses": {

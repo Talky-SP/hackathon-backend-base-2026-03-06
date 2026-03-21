@@ -1063,7 +1063,7 @@ ws.onmessage = (event) => {
         // msg.data.files is an array of generated files (may be empty)
         const files = msg.data.files || [];
         files.forEach(file => {
-            // file = { filename: "gastos_export.xlsx", url: "/api/tasks/chat_abc/artifacts/gastos_export.xlsx", type: "excel" }
+            // file = { filename: "gastos_export.xlsx", url: "/api/tasks/chat_abc/artifacts/gastos_export.xlsx", type: "excel" }..
             renderDownloadButton(file);
         });
 
