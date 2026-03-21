@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 from langfuse import observe
 
-from hackathon_backend.services.lambdas.agent.core.config import completion
+from hackathon_backend.services.lambdas.agent.core.config import traced_completion, is_cancelled, CancelledError
 from hackathon_backend.services.lambdas.agent.core.query_agent import (
     _execute_query, _execute_code, _sanitize, _extract_source,
     QUERY_AGENT_TOOLS, QUERY_AGENT_SYSTEM,
@@ -93,8 +93,13 @@ Focus ONLY on your objective — do not try to answer the full user question.
 
     query_results: dict[str, dict] = {}
     query_counter = 0
+    # location_id for traced_completion — extracted from the _execute_query calls
 
     for iteration in range(max_iterations):
+        # Check cancellation
+        if is_cancelled(task_id):
+            raise CancelledError(f"Task {task_id} cancelled")
+
         # Check budget before each LLM call
         budget = check_budget(task_id)
         if not budget["ok"]:
@@ -108,9 +113,12 @@ Focus ONLY on your objective — do not try to answer the full user question.
         update_task_step(step_id, "RUNNING",
                          result_summary=f"Iteration {iteration + 1}/{max_iterations}")
 
-        response = completion(
+        response = traced_completion(
             model_id=model_id,
             messages=messages,
+            step=f"sub_agent_iter_{iteration + 1}",
+            task_id=task_id,
+            location_id=location_id,
             tools=QUERY_AGENT_TOOLS,
             temperature=0.1,
         )
@@ -283,49 +291,7 @@ Focus ONLY on your objective — do not try to answer the full user question.
     }
 
 
-# ---------------------------------------------------------------------------
-# Task execution plans — hardcoded templates for each TOP task type
-# ---------------------------------------------------------------------------
-TASK_PLANS: dict[str, list[dict]] = {
-    "cash_flow_forecast": [
-        {"name": "query_unpaid_expenses", "description": "Consultar facturas de gasto pendientes de pago (próximos 91 días)", "parallel_group": 1,
-         "objective": "Query User_Expenses table using UserByReconStateDate index with sk begins_with 'U#' to find all unpaid expenses. For each, extract: supplier, total, due_date, amount_due, amount_paid. Return a structured result with the list of unpaid expenses and their due dates."},
-        {"name": "query_unpaid_incomes", "description": "Consultar facturas de ingreso pendientes de cobro", "parallel_group": 1,
-         "objective": "Query User_Invoice_Incomes table using UserByReconStateDate index with sk begins_with 'U#' to find all unpaid income invoices. For each, extract: client_name, total, due_date, amount_due, amount_paid. Return a structured result with the list of pending receivables."},
-        {"name": "query_payroll", "description": "Consultar nóminas recientes para proyección", "parallel_group": 1,
-         "objective": "Query Payroll_Slips to get the last 3 months of payroll data. Extract: payroll_info.gross_amount, payroll_info.net_amount, payroll_info.company_ss_contribution. Calculate the average monthly payroll cost for projection."},
-        {"name": "query_bank_pending", "description": "Consultar transacciones bancarias pendientes", "parallel_group": 1,
-         "objective": "Query Bank_Reconciliations using LocationByStatusDate index with sk begins_with 'PENDING#' to find unreconciled transactions. Sum the pending amounts (positive = income, negative = expense)."},
-    ],
-    "pack_reporting": [
-        {"name": "query_expenses_month", "description": "Consultar gastos del mes por categoría", "parallel_group": 1,
-         "objective": "Query User_Expenses using UserIdPnlDateIndex for the current month. Group by category and concept. Calculate total importe, total vatTotalAmount. Return breakdown by category with subtotals."},
-        {"name": "query_incomes_month", "description": "Consultar ingresos del mes", "parallel_group": 1,
-         "objective": "Query User_Invoice_Incomes using UserIdPnlDateIndex for the current month. Group by category. Calculate total importe. Return breakdown with client distribution."},
-        {"name": "query_payroll_month", "description": "Consultar costes salariales del mes", "parallel_group": 1,
-         "objective": "Query Payroll_Slips for the current month. Sum gross_amount, company_ss_contribution, irpf_amount. Return total personnel costs."},
-    ],
-    "modelo_303": [
-        {"name": "query_iva_soportado", "description": "IVA Soportado (gastos) del trimestre", "parallel_group": 1,
-         "objective": "Query User_Expenses using UserIdPnlDateIndex for the current quarter. For each invoice, extract: ivas array (rate, base_imponible, amount), vatTotalAmount, vatDeductibleAmount, vatNonDeductibleAmount, vatOperationType. Group by vatOperationType and IVA rate. Return the totals."},
-        {"name": "query_iva_repercutido", "description": "IVA Repercutido (ingresos) del trimestre", "parallel_group": 1,
-         "objective": "Query User_Invoice_Incomes using UserIdPnlDateIndex for the current quarter. Extract ivas array and group by rate. Calculate total bases imponibles and cuotas. Return the breakdown."},
-    ],
-    "aging_analysis": [
-        {"name": "query_unpaid_receivables", "description": "Facturas de ingreso pendientes de cobro", "parallel_group": 1,
-         "objective": "Query User_Invoice_Incomes using UserByReconStateDate with sk begins_with 'U#'. Get all unpaid invoices. For each: client_name, client_cif, total, due_date, invoice_date, amount_due. Classify into aging buckets: 0-30 days, 31-60, 61-90, >90 days overdue from today."},
-        {"name": "query_unpaid_payables", "description": "Facturas de gasto pendientes de pago", "parallel_group": 1,
-         "objective": "Query User_Expenses using UserByReconStateDate with sk begins_with 'U#'. Get all unpaid invoices. For each: supplier, supplier_cif, total, due_date, amount_due. Classify into aging buckets."},
-    ],
-    "client_profitability": [
-        {"name": "query_incomes_by_client", "description": "Ingresos por cliente", "parallel_group": 1,
-         "objective": "Query User_Invoice_Incomes for the last 12 months using UserIdPnlDateIndex. Group by client_cif and client_name. Sum importe per client. Return top clients ranked by revenue."},
-        {"name": "query_expenses_by_supplier", "description": "Gastos por proveedor/categoría", "parallel_group": 1,
-         "objective": "Query User_Expenses for the last 12 months using UserIdPnlDateIndex. Group by category and supplier. Sum importe per category. Return breakdown for margin calculation."},
-        {"name": "query_payroll_total", "description": "Costes salariales totales", "parallel_group": 1,
-         "objective": "Query Payroll_Slips for the last 12 months. Calculate total gross + SS contribution. This is needed to allocate personnel costs across clients."},
-    ],
-}
+# No hardcoded plans — the AI generates plans dynamically via _create_custom_plan
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +335,8 @@ def execute_task(
             emit("task_progress", {"task_id": task_id, "progress": 5, "step": "Procesando documentos..."})
             doc_context = _process_uploads(task_id, uploaded_files, model_id, all_usage, emit)
 
-        # Step 2: Get execution plan
-        plan = TASK_PLANS.get(task_type)
-        if not plan:
-            # Use LLM to create a custom plan
-            plan = _create_custom_plan(task_id, task_type, description, doc_context, model_id, all_usage, emit)
+        # Step 2: AI generates the execution plan dynamically
+        plan = _create_custom_plan(task_id, task_type, description, doc_context, model_id, all_usage, emit)
 
         # Step 3: Create task steps
         for i, step_def in enumerate(plan):
@@ -419,6 +382,18 @@ def execute_task(
             "total_tokens": sum(u.get("total_tokens", 0) for u in all_usage),
         }
 
+    except CancelledError:
+        update_task_status(task_id, "CANCELLED")
+        emit("task_cancelled", {"task_id": task_id, "message": "Tarea cancelada por el usuario"})
+        return {
+            "success": False,
+            "summary": "Tarea cancelada por el usuario",
+            "error": "cancelled",
+            "artifacts": [],
+            "sources": all_sources,
+            "cost_usd": 0,
+            "total_tokens": sum(u.get("total_tokens", 0) for u in all_usage),
+        }
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
         update_task_status(task_id, "FAILED", error=error_msg)
@@ -602,9 +577,11 @@ IMPORTANT: Use real numbers from the data. Format amounts as numbers (not string
     if not budget.get("ok"):
         return {"summary": "Presupuesto agotado. Resultados parciales disponibles.", "excel_data": {"sheets": []}}
 
-    response = completion(
+    response = traced_completion(
         model_id=model_id,
         messages=[{"role": "user", "content": synthesis_prompt}],
+        step="synthesis",
+        task_id=task_id,
         temperature=0.1,
     )
 
@@ -787,6 +764,89 @@ def _process_uploads(
 
 
 # ---------------------------------------------------------------------------
+# Task-specific guidance for the AI planner
+# ---------------------------------------------------------------------------
+def _get_task_guidance(task_type: str) -> str:
+    """Return task-specific instructions for the AI planner."""
+    guidance = {
+        "cash_flow_forecast": """\
+TASK-SPECIFIC GUIDANCE — CASH FLOW FORECAST:
+The cash flow forecast MUST be built primarily from Bank_Reconciliations (real bank movements).
+This table contains ALL actual money movements: amount<0 = outflow, amount>0 = inflow.
+
+Steps:
+1. Fetch ALL bank transactions from Bank_Reconciliations (PK=locationId, query by PK directly).
+   Extract: bookingDate, amount, description, merchant, ai_enrichment.payment_type
+2. In run_analysis, classify transactions into categories using ai_enrichment.payment_type
+   (vendor_payment, payroll, social_security, bank_fee, tax_payment) and amount sign.
+   Group by week and category to find historical patterns (weekly averages for inflows/outflows).
+3. Project 13 weeks forward based on historical weekly averages per category.
+   Calculate: opening_balance (last known bank position), weekly inflows, weekly outflows, closing_balance.
+   Identify liquidity alerts (weeks where projected balance goes negative).
+4. IMPORTANT: Call generate_file to create a professional Excel with:
+   - Sheet 1: 13-week forecast table with weekly columns (inflows, outflows, net, cumulative balance)
+   - Sheet 2: Historical analysis (weekly actuals by category)
+   - Sheet 3: Executive summary with key metrics and alerts
+   - Include a line chart showing projected balance over 13 weeks
+   Pass the computed forecast data as data_json.
+
+DO NOT use User_Expenses or User_Invoice_Incomes as primary data for cash flow.
+Bank_Reconciliations IS the source of truth for actual cash movements.
+You MUST generate an Excel file — this is a report task, not just a data query.""",
+
+        "pack_reporting": """\
+TASK-SPECIFIC GUIDANCE — PACK REPORTING:
+Build a monthly financial reporting pack (P&L + KPIs).
+1. Query User_Expenses via UserIdPnlDateIndex for the current month's expenses.
+2. Query User_Invoice_Incomes via UserIdPnlDateIndex for income in the same period.
+3. Query Payroll_Slips for salary costs in the period.
+4. Build P&L in run_analysis: Revenue - COGS - Operating Expenses - Payroll = Operating Profit.
+5. IMPORTANT: Call generate_file to create Excel with P&L sheet, KPIs sheet, and charts.
+You MUST generate an Excel file — this is a report task.""",
+
+        "modelo_303": """\
+TASK-SPECIFIC GUIDANCE — MODELO 303 (IVA TRIMESTRAL):
+Build a quarterly VAT return draft.
+1. Query User_Expenses via UserIdPnlDateIndex for the quarter.
+   Extract: ivas[] array, vatDeductibleAmount, vatNonDeductibleAmount, vatOperationType.
+2. Query User_Invoice_Incomes via UserIdPnlDateIndex for the same quarter.
+3. Calculate in run_analysis: Bases imponibles por tipo, cuotas soportadas deducibles, cuotas repercutidas.
+4. IMPORTANT: Call generate_file to create Excel with the Modelo 303 draft.
+You MUST generate an Excel file — this is a report task.""",
+
+        "aging_analysis": """\
+TASK-SPECIFIC GUIDANCE — AGING ANALYSIS:
+Classify outstanding debts by age buckets (0-30d, 31-60d, 61-90d, >90d).
+1. Query User_Invoice_Incomes by PK, filter unpaid in run_analysis.
+2. Query User_Expenses by PK, filter unpaid.
+3. Bucket by age, identify top debtors/creditors.
+4. IMPORTANT: Call generate_file to create Excel with aging report.
+You MUST generate an Excel file — this is a report task.""",
+
+        "client_profitability": """\
+TASK-SPECIFIC GUIDANCE — RENTABILIDAD POR CLIENTE:
+1. Query User_Invoice_Incomes by PK, group by client_cif to get total revenue per client.
+2. Query User_Expenses by PK, try to associate costs with clients (by project/concept).
+3. Calculate margin per client: Revenue - Direct Costs. Rank by profitability.""",
+
+        "modelo_347": """\
+TASK-SPECIFIC GUIDANCE — MODELO 347:
+List all third parties (suppliers + clients) with annual totals > 3,005€.
+1. Query User_Expenses by PK, group by supplier_cif summing total for the year.
+2. Query User_Invoice_Incomes by PK, group by client_cif summing total for the year.
+3. Filter those with annual total > 3005€. Include: CIF, name, annual total.""",
+
+        "three_way_matching": """\
+TASK-SPECIFIC GUIDANCE — THREE-WAY MATCHING:
+Cross-reference invoices, delivery notes, and purchase orders.
+1. Query User_Expenses by PK to get invoices with supplier_cif and all_products.
+2. Query Delivery_Notes by PK for delivery notes.
+3. Match by supplier_cif + product descriptions. Flag discrepancies.""",
+    }
+    return guidance.get(task_type, "")
+
+
+# ---------------------------------------------------------------------------
 # Internal: custom plan via LLM
 # ---------------------------------------------------------------------------
 def _create_custom_plan(
@@ -801,30 +861,66 @@ def _create_custom_plan(
     """Use LLM to create a custom execution plan."""
     emit("task_progress", {"task_id": task_id, "progress": 5, "step": "Planificando tarea..."})
 
+    task_guidance = _get_task_guidance(task_type)
+
     prompt = f"""You are planning a financial analysis task. Create an execution plan.
 
 TASK TYPE: {task_type}
 DESCRIPTION: {description}
 {"DOCUMENT CONTEXT: " + doc_context[:2000] if doc_context else ""}
+TODAY: 2026-03-21
 
-Available tables: User_Expenses, User_Invoice_Incomes, Bank_Reconciliations, Payroll_Slips, Delivery_Notes, Employees, Providers, Customers, Daily_Stats, Monthly_Stats.
+AVAILABLE TABLES (DynamoDB):
+1. User_Expenses — PK=userId, SK=categoryDate (CATEGORY#YYYY-MM-DD#UUID)
+   GSIs: UserIdInvoiceDateIndex(sk=invoice_date), UserIdSupplierCifIndex(sk=supplier_cif), UserIdPnlDateIndex(sk=pnl_date)
+   Fields: total, importe, ivas[], supplier, supplier_cif, invoice_date, due_date, category, concept, reconciled (None/False=unpaid), accountingEntries[], all_products[]
+   NOTE: For unpaid invoices, query by PK and filter reconciled=None/False in run_analysis (the UserByReconStateDate GSI may not have data)
+
+2. User_Invoice_Incomes — PK=userId, SK=categoryDate. Same pattern as expenses but with client_name/client_cif.
+   GSIs: UserIdInvoiceDateIndex, UserIdClientCifIndex(sk=client_cif)
+
+3. Bank_Reconciliations — PK=locationId, SK=MTXN#bookingDate#type#id
+   Fields: amount (negative=outflow, positive=inflow), bookingDate, description, merchant, status (PENDING/MATCHED),
+   ai_enrichment (Map with payment_type, vendor_name, vendor_cif, account_type)
+   payment_type values: vendor_payment, payroll, social_security, bank_fee, tax_payment
+   NOTE: Query by PK directly (no GSI needed). GSI LocationByStatusDate: PK=locationId, SK=status_date (status#bookingDate)
+
+4. Payroll_Slips — PK=locationId, SK=categoryDate(date#nif). Fields: payroll_info.gross_amount, net_amount, company_ss_contribution
+
+5. Providers — PK=locationId, SK=cif. Fields: nombre, cif, trade_name, facturas
+6. Customers — PK=locationId, SK=cif
+7. Employees — PK=locationId, SK=employeeNif
+8. Daily_Stats — PK=locationId, SK=dayKey
+9. Monthly_Stats — PK=locationId, SK=monthKey
+
+{task_guidance}
+
+IMPORTANT QUERY TIPS:
+- Each sub-agent has dynamo_query (DynamoDB), run_analysis (Python code), and generate_file (AI code execution) tools.
+- Always use PK queries (never scans). For date ranges, use GSIs with SK conditions.
+- If a GSI returns 0 results, try querying by PK directly and filtering with run_analysis.
+- The sub-agent should always finish with run_analysis to return structured data.
+- Bank_Reconciliations contains the REAL money movements. amount<0 = outflow, amount>0 = inflow.
 
 Create 2-5 steps. Each step runs as a sub-agent that can query DynamoDB and run Python analysis.
 Steps with the same parallel_group number run concurrently.
+Put independent data-fetching steps in the same parallel_group so they run in parallel.
 
-Return JSON:
+Return JSON array:
 [
   {{
     "name": "step_name",
     "description": "Human-readable description (Spanish)",
     "parallel_group": 1,
-    "objective": "Detailed objective for the sub-agent including which table/index to query and what to extract"
+    "objective": "Detailed objective: what table to query, what PK/SK/GSI to use, what fields to extract, what to compute in run_analysis. Be specific."
   }}
 ]"""
 
-    response = completion(
+    response = traced_completion(
         model_id=model_id,
         messages=[{"role": "user", "content": prompt}],
+        step="planning",
+        task_id=task_id,
         temperature=0.2,
     )
 

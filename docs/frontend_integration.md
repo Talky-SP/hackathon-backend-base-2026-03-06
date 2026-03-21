@@ -8,20 +8,50 @@ python -m hackathon_backend.services.lambdas.agent.server --port 8000
 ```
 
 Server endpoints:
-- **WebSocket**: `ws://localhost:8000/ws/chat` (real-time chat with streaming)
-- **REST Chat**: `POST http://localhost:8000/api/chat` (send message)
+- **WebSocket Chat**: `ws://localhost:8000/ws/chat` — real-time chat with streaming events
+- **WebSocket Logs**: `ws://localhost:8000/ws/logs` — dev log panel (real-time)
+- **REST Chat**: `POST /api/chat` — single question (no streaming)
 - **Chat CRUD**: `GET/POST/DELETE /api/chats`, `GET /api/chats/{id}/messages`
-- **Chat Context**: `GET /api/chats/{id}/context` (current LLM context window)
-- **Chat Costs**: `GET /api/chats/{id}/costs` (AI cost breakdown per chat)
-- **User Costs**: `GET /api/costs?location_id=X` (AI cost summary per user)
-- **Model Pricing**: `GET /api/costs/models` (pricing table)
-- **Tasks**: `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/{id}`, `DELETE /api/tasks/{id}`
-- **Task Artifacts**: `GET /api/tasks/{id}/artifacts/{filename}` (download Excel/PDF)
-- **Task Types**: `GET /api/tasks/types` (available task types with budgets)
-- **Code Execution**: `POST /api/code-exec` (AI sandbox for Excel/chart generation)
-- **Models**: `GET http://localhost:8000/api/models`
-- **Health**: `GET http://localhost:8000/api/health`
+- **Chat Context**: `GET /api/chats/{id}/context` — current LLM context window
+- **Chat Costs**: `GET /api/chats/{id}/costs` — cost breakdown per chat
+- **Chat Traces**: `GET /api/chats/{id}/traces` — all LLM call traces for a chat
+- **User Costs**: `GET /api/costs?location_id=X` — cost summary per user
+- **Model Pricing**: `GET /api/costs/models` — pricing table
+- **Traces**: `GET /api/traces?location_id=X`, `GET /api/traces/{id}`
+- **Cancel**: `POST /api/chats/{id}/cancel`, `POST /api/tasks/{id}/cancel`
+- **Tasks**: `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/{id}`
+- **Task Traces**: `GET /api/tasks/{id}/traces`
+- **Task Artifacts**: `GET /api/tasks/{id}/artifacts/{filename}` — download Excel/PDF
+- **Task Types**: `GET /api/tasks/types`
+- **Code Execution**: `POST /api/code-exec` — AI sandbox for Excel/chart generation
+- **Dev Logs**: `GET /api/logs`, `ws://localhost:8000/ws/logs`
+- **Models**: `GET /api/models`
+- **Health**: `GET /api/health`
 - **Swagger**: `http://localhost:8000/docs`
+
+---
+
+## Architecture Overview
+
+The backend uses a **unified agent** — a single AI agent (Claude Sonnet) handles ALL queries. There is no classifier or orchestrator step. The agent decides on its own whether to:
+
+1. **Answer directly** — general knowledge questions (no tools called)
+2. **Query data + analyze** — fetches from DynamoDB, runs Python analysis, returns with chart
+3. **Generate files** — creates Excel/PDF reports via AI code execution sandbox
+
+For heavy tasks (cash flow forecast, Modelo 303, etc.), the system detects them by keyword and runs the agent as a **background task** with progress tracking and cost budgets.
+
+```
+User message → detect_heavy_task()
+  ├── null → Run agent inline (WebSocket streaming)
+  │          Agent tools: dynamo_query, run_analysis, generate_file
+  │          Response: answer + chart + sources + artifacts
+  │
+  └── "cash_flow_forecast" → Create background task
+                              Run same agent with task-specific guidance
+                              Stream progress events via WebSocket
+                              Response: answer + artifacts (Excel)
+```
 
 ---
 
@@ -35,20 +65,33 @@ const ws = new WebSocket('ws://localhost:8000/ws/chat');
 ### Send a message
 ```javascript
 ws.send(JSON.stringify({
-    question: "Cuanto me he gastado en total?",
-    location_id: "deloitte-84",       // Required: tenant ID
-    chat_id: "uuid-of-chat",          // Optional: null = new chat, string = continue chat
-    model: "claude-sonnet-4.5",        // Optional: orchestrator model
-    classifier_model: "gpt-5-mini",    // Optional: classifier model
-    request_id: "abc123"               // Optional: for tracking
+    type: "message",                    // Required
+    question: "Cuanto me he gastado en total?",  // Required
+    location_id: "deloitte-84",         // Required: tenant ID
+    chat_id: "uuid-of-chat",            // Optional: null = new chat
+    model: "claude-sonnet-4.5",         // Optional: AI model
+    request_id: "abc123"                // Optional: for tracking
 }));
 ```
 
-### Receive events (streaming feedback)
+### Cancel an in-progress operation
+```javascript
+// Via WebSocket (preferred — instant)
+ws.send(JSON.stringify({
+    type: "cancel",
+    chat_id: "uuid-of-chat"
+}));
 
-The server sends multiple messages during processing:
+// Via REST (alternative)
+await fetch(`/api/chats/${chatId}/cancel`, { method: 'POST' });
+await fetch(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+```
 
-#### Chat ID message (sent immediately)
+### Receive events
+
+The server sends multiple messages during processing. Here's every event type you'll receive:
+
+#### 1. `chat_id` — sent immediately after receiving a message
 ```json
 {
     "type": "chat_id",
@@ -56,81 +99,163 @@ The server sends multiple messages during processing:
     "request_id": "abc123"
 }
 ```
-Store this `chat_id` and send it back in subsequent messages to continue the conversation.
+Store this and send it back in subsequent messages to continue the conversation.
 
-#### Event messages (progress feedback)
+#### 2. `event` — progress feedback during agent processing
 ```json
 {
     "type": "event",
-    "event": "step",
+    "event": "querying",
     "request_id": "abc123",
-    "message": "Clasificando intencion..."
+    "message": "Consultando User Expenses...",
+    "table": "User_Expenses",
+    "query_key": "query_1"
 }
 ```
 
-**Event types and their meaning:**
+| Event | When | What to show |
+|-------|------|-------------|
+| `step` | Agent starts processing | Status: "Procesando..." |
+| `thinking` | Agent planning next action | Spinner: "Pensando..." |
+| `querying` | DynamoDB query executing | "Consultando [tabla]..." |
+| `query_result` | Query returned data | "Encontrados N registros" |
+| `analyzing` | Running Python analysis | "Ejecutando análisis..." |
+| `generating` | Creating Excel/PDF file | "Generando archivo..." |
+| `agent_done` | Agent finished | Hide spinner |
 
-| Event | Description | Show to user |
-|-------|-------------|--------------|
-| `step` | Pipeline step change (classify, orchestrate, query_agent, done) | Yes - as status |
-| `intent` | Intent classification result | Optional |
-| `agent_start` | Query agent started | Optional |
-| `thinking` | Agent is planning next step | Yes - as "thinking..." |
-| `querying` | Executing a DynamoDB query | Yes - show table being queried |
-| `query_result` | Query completed | Yes - show count |
-| `query_error` | Query failed (agent will retry) | Optional |
-| `analyzing` | Running code analysis on data | Yes - as "computing..." |
-| `agent_done` | Agent finished processing | Yes - hide spinner |
+#### 3. `response` — final answer for inline queries
+```json
+{
+    "type": "response",
+    "request_id": "abc123",
+    "chat_id": "45b57715-...",
+    "message_id": 42,
+    "answer": "Los 5 proveedores con mayor importe son...",
+    "chart": { "type": "bar", "title": "Top 5 Proveedores", "labels": [...], "datasets": [...] },
+    "sources": [ { "categoryDate": "COMPRAS#2025-01-15#uuid", "supplier": "Bio-Rad", "total": 695.30, ... } ],
+    "artifacts": [ { "filename": "report.xlsx", "url": "/api/tasks/chat_abc/artifacts/report.xlsx" } ],
+    "model_used": "claude-sonnet-4.5"
+}
+```
 
-**Suggested UX for events:**
+**This is the main response you render.** It contains:
+- `answer` — markdown text to display
+- `chart` — chart data for Chart.js (or null)
+- `sources` — referenced invoices/documents (or [])
+- `artifacts` — downloadable files like Excel (or [])
+
+#### 4. `task_created` — heavy task started in background
+```json
+{
+    "type": "task_created",
+    "request_id": "abc123",
+    "chat_id": "45b57715-...",
+    "task_id": "e81b91e5-...",
+    "task_type": "cash_flow_forecast",
+    "task_type_name": "Previsión de Tesorería (13 semanas)"
+}
+```
+
+#### 5. `task_progress` — background task progress
+```json
+{
+    "type": "task_progress",
+    "request_id": "abc123",
+    "task_id": "e81b91e5-...",
+    "progress": 45,
+    "step": "Consultando Bank_Reconciliations..."
+}
+```
+
+#### 6. `task_completed` — background task finished
+```json
+{
+    "type": "task_completed",
+    "request_id": "abc123",
+    "task_id": "e81b91e5-...",
+    "summary": "Previsión de tesorería generada...",
+    "artifacts": [
+        { "filename": "Prevision_Tesoreria_13_Semanas.xlsx", "url": "/api/tasks/e81b91e5-.../artifacts/..." }
+    ],
+    "cost_usd": 0.40
+}
+```
+
+#### 7. `task_failed` / `task_cancelled` / `cancelled`
+```json
+{ "type": "task_failed", "task_id": "...", "error": "Budget exceeded" }
+{ "type": "task_cancelled", "task_id": "..." }
+{ "type": "cancelled", "id": "..." }
+```
+
+### Complete WebSocket handler
 ```javascript
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
 
-    if (msg.type === 'event') {
-        switch (msg.event) {
-            case 'step':
-                showStatus(msg.message);  // "Clasificando intencion..."
-                break;
-            case 'thinking':
-                showSpinner("Pensando...");
-                break;
-            case 'querying':
-                showSpinner(msg.message); // "Consultando User Expenses..."
-                break;
-            case 'query_result':
-                showToast(msg.message);   // "Encontrados 23 registros"
-                break;
-            case 'analyzing':
-                showSpinner("Calculando metricas...");
-                break;
-            case 'agent_done':
-                hideSpinner();
-                break;
-        }
-    }
+    switch (msg.type) {
+        // Store chat ID for follow-up messages
+        case 'chat_id':
+            currentChatId = msg.chat_id;
+            break;
 
-    if (msg.type === 'result') {
-        hideSpinner();
-        renderResult(msg.data);
+        // Progress events (show status indicators)
+        case 'event':
+            if (['querying', 'analyzing', 'generating', 'thinking'].includes(msg.event)) {
+                showSpinner(msg.message);
+            }
+            if (msg.event === 'query_result') {
+                showToast(msg.message);  // "Encontrados 230 registros"
+            }
+            if (msg.event === 'agent_done') {
+                hideSpinner();
+            }
+            break;
+
+        // Final response (inline queries)
+        case 'response':
+            hideSpinner();
+            renderAnswer(msg.answer);          // Markdown text
+            renderChart(msg.chart);             // Chart.js chart (if any)
+            renderSources(msg.sources);         // Invoice references (if any)
+            renderArtifacts(msg.artifacts);     // Download buttons (if any)
+            break;
+
+        // Background task lifecycle
+        case 'task_created':
+            showTaskCard(msg.task_id, msg.task_type_name);
+            showCancelButton(msg.task_id);
+            break;
+        case 'task_progress':
+            updateProgressBar(msg.task_id, msg.progress, msg.step);
+            break;
+        case 'task_completed':
+            hideProgressBar(msg.task_id);
+            renderAnswer(msg.summary);
+            renderArtifacts(msg.artifacts);     // Download Excel
+            showCostBadge(msg.cost_usd);
+            break;
+        case 'task_failed':
+            showError(msg.error);
+            break;
+
+        // Final result for background tasks (sent after task_completed)
+        case 'result':
+            const d = msg.data;
+            renderAnswer(d.answer);
+            renderChart(d.chart);
+            renderSources(d.sources);
+            renderArtifacts(d.artifacts);
+            break;
+
+        // Cancellation confirmation
+        case 'cancelled':
+        case 'task_cancelled':
+            hideSpinner();
+            showStatus("Cancelado");
+            break;
     }
 };
-```
-
-#### Result message (final response)
-```json
-{
-    "type": "result",
-    "request_id": "abc123",
-    "data": {
-        "type": "direct_answer | full_answer | complex_task",
-        "answer": "Texto de la respuesta...",
-        "chart": { ... } | null,
-        "sources": [ ... ],
-        "intent": "fast_chat",
-        "model_used": "claude-sonnet-4.5"
-    }
-}
 ```
 
 ---
@@ -144,39 +269,34 @@ const response = await fetch('http://localhost:8000/api/chat', {
     body: JSON.stringify({
         question: "Cuantos proveedores tengo?",
         location_id: "deloitte-84",
-        model: "claude-sonnet-4.5",
-        classifier_model: "gpt-5-mini"
+        model: "claude-sonnet-4.5"
     })
 });
 const data = await response.json();
+// data = { type, answer, chart, sources, artifacts, model_used, chat_id, ... }
 ```
 
-Response format is the same as the WebSocket `result.data` object.
+> **Note:** For heavy tasks (cash flow, modelo 303, etc.), the REST API returns immediately with `type: "complex_task"`. The task runs in background — use `GET /api/tasks/{id}` to poll for results, or use WebSocket for real-time updates.
 
 ---
 
-## 3. Response Types
+## 3. Response Fields Reference
 
-### `direct_answer`
-The AI answered without needing database data (general knowledge).
-- `answer`: Text response
-- `chart`: Always `null`
-- `sources`: Always `[]`
+Every response (WebSocket `response` or REST) contains these fields:
 
-### `full_answer`
-The AI queried DynamoDB and computed an answer.
-- `answer`: Text response with financial data
-- `chart`: Chart configuration (see below) or `null`
-- `sources`: List of referenced documents (see below)
-
-### `complex_task`
-The question requires background processing (not yet implemented).
+| Field | Type | Description |
+|-------|------|-------------|
+| `answer` | `string` | Markdown text response. Always present. |
+| `chart` | `object \| null` | Chart data for Chart.js. See Section 4. |
+| `sources` | `array` | Referenced invoices/bank transactions. See Section 5. |
+| `artifacts` | `array` | Downloadable files (Excel, PDF). See Section 6. |
+| `model_used` | `string` | AI model that generated the response. |
 
 ---
 
-## 4. Chart Format
+## 4. Charts
 
-When the AI suggests a chart, the `chart` field contains:
+When the AI decides a visual would help, `chart` contains data compatible with [Chart.js](https://www.chartjs.org/):
 
 ```typescript
 interface Chart {
@@ -190,7 +310,7 @@ interface Chart {
 }
 ```
 
-### Chart.js Integration (bar, line, pie)
+### Rendering with Chart.js
 
 ```javascript
 import { Chart } from 'chart.js/auto';
@@ -198,13 +318,14 @@ import { Chart } from 'chart.js/auto';
 function renderChart(chartData, canvasElement) {
     if (!chartData) return;
 
+    // Special handling for table type
     if (chartData.type === 'table') {
-        renderTable(chartData);
+        renderDataTable(chartData);
         return;
     }
 
     new Chart(canvasElement, {
-        type: chartData.type,  // "bar", "line", "pie"
+        type: chartData.type,
         data: {
             labels: chartData.labels,
             datasets: chartData.datasets.map((ds, i) => ({
@@ -231,15 +352,12 @@ const COLORS = [
     'rgba(245, 158, 11, 0.5)',   // yellow
     'rgba(239, 68, 68, 0.5)',    // red
     'rgba(139, 92, 246, 0.5)',   // purple
-    'rgba(236, 72, 153, 0.5)',   // pink
-    'rgba(20, 184, 166, 0.5)',   // teal
-    'rgba(249, 115, 22, 0.5)',   // orange
 ];
 ```
 
-### Table Chart Type
+### Table chart type
 
-When `chart.type === "table"`, the data structure is:
+When `chart.type === "table"`, render as HTML:
 ```json
 {
     "type": "table",
@@ -255,105 +373,413 @@ When `chart.type === "table"`, the data structure is:
 }
 ```
 
-Render as an HTML table:
-```javascript
-function renderTable(chartData) {
-    const headers = chartData.labels;
-    const rows = chartData.datasets[0].data;
-
-    return `
-        <table>
-            <thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-            <tbody>${rows.map(row =>
-                `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`
-            ).join('')}</tbody>
-        </table>
-    `;
-}
-```
-
-### Chart Types by Query
+### When charts appear
 
 | Query type | Chart type | Example |
 |-----------|------------|---------|
-| Gastos por categoria | `bar` or `pie` | "Dame un grafico de gastos por categoria" |
+| Gastos por categoría | `bar` or `pie` | "Dame un gráfico de gastos por categoría" |
 | Top proveedores | `bar` | "Top 5 proveedores por gasto" |
-| Evolucion temporal | `line` | "Evolucion de gastos mensuales" |
+| Evolución temporal | `line` | "Evolución de gastos mensuales" |
 | Detalle facturas | `table` | "Facturas de Bio-Rad" |
-| Prevision | `line` | "Prevision de gastos" |
 | Comparativa | `bar` (multi-dataset) | "Ingresos vs gastos por mes" |
 
 ---
 
-## 5. Sources Format (Document References)
+## 5. Sources (Document References)
 
-Each source is a "paper reference" — a document the AI used to generate the answer.
+Sources are invoices, bank transactions, or other documents the AI used to answer. Use them to let users click through to the original document.
 
 ```typescript
 interface Source {
-    // Document ID — use this to link to the invoice in the frontend
-    categoryDate: string;  // e.g. "COMPRAS#2024-08-29#b7aedbcb-33b5-4de4-93ec-dbe84b7938c4"
+    // Document ID — use this to link to the invoice in your app
+    categoryDate: string;  // "COMPRAS#2024-08-29#uuid" (invoices) or "MTXN#..." (bank)
 
     // Who
-    supplier: string;       // Supplier or client name
-    supplier_cif: string;   // Tax ID (CIF/NIF)
+    supplier: string;       // Supplier/client/merchant name
+    supplier_cif?: string;  // Tax ID (CIF/NIF) — invoices only
 
     // When
-    invoice_date: string;   // "YYYY-MM-DD"
-    due_date: string;       // "YYYY-MM-DD" (payment deadline)
+    invoice_date: string;   // "YYYY-MM-DD" — issue date or booking date
 
     // How much
-    total: number;          // Total amount (EUR)
-    importe: number;        // Tax base amount (EUR)
+    total: number;          // Amount in EUR (negative for bank outflows)
+    importe?: number;       // Tax base — invoices only
 
     // Status
-    reconciled: boolean;    // true = paid, false = unpaid
+    reconciled: boolean;    // true = paid/matched, false = pending
 
     // Classification
-    category: string;       // "COMPRAS", "I+D", "SERVICIOS PROFESIONALES", etc.
-    concept: string;        // Sub-category
+    category: string;       // "COMPRAS", "SERVICIOS", "BANK", etc.
+    concept?: string;       // Sub-category — invoices only
 
     // Visual reference (for highlighting on PDF)
-    total_bounding_box?: {
-        Height: number;
-        Left: number;
-        Top: number;
-        Width: number;
-    };
+    total_bounding_box?: { Height: number; Left: number; Top: number; Width: number };
 }
 ```
 
-### Rendering sources as clickable references
+### Two types of sources
+
+1. **Invoice sources** (from `User_Expenses` / `User_Invoice_Incomes`):
+   - `categoryDate` = `"COMPRAS#2024-08-29#uuid"` — this is the document PK
+   - Has `supplier_cif`, `importe`, `concept`, `due_date`
+
+2. **Bank transaction sources** (from `Bank_Reconciliations`):
+   - `categoryDate` = `"MTXN#2025-01-15#txn_id"` — the bank transaction SK
+   - `category` = `"BANK"`
+   - `total` can be negative (outflow) or positive (inflow)
+
+### Rendering sources
 ```javascript
 function renderSources(sources) {
-    return sources.map(s => `
-        <div class="source-card" onclick="openInvoice('${s.categoryDate}')">
-            <div class="source-supplier">${s.supplier}</div>
-            <div class="source-amount">${formatEUR(s.total)}</div>
-            <div class="source-date">${s.invoice_date}</div>
-            <div class="source-status ${s.reconciled ? 'paid' : 'unpaid'}">
+    if (!sources?.length) return;
+
+    return sources.slice(0, 10).map(s => `
+        <div class="source-card" onclick="openDocument('${s.categoryDate}')">
+            <span class="source-name">${s.supplier}</span>
+            <span class="source-amount ${s.total < 0 ? 'negative' : ''}">${formatEUR(s.total)}</span>
+            <span class="source-date">${s.invoice_date}</span>
+            <span class="source-status ${s.reconciled ? 'paid' : 'unpaid'}">
                 ${s.reconciled ? 'Pagada' : 'Pendiente'}
-            </div>
+            </span>
         </div>
     `).join('');
 }
 
-// The categoryDate is the document PK — use it to navigate to the invoice detail
-function openInvoice(categoryDate) {
-    // Navigate to invoice detail page
-    router.push(`/invoices/${encodeURIComponent(categoryDate)}`);
+function formatEUR(amount) {
+    return new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(amount);
+}
+
+function openDocument(categoryDate) {
+    if (categoryDate.startsWith('MTXN#')) {
+        router.push(`/bank/${encodeURIComponent(categoryDate)}`);
+    } else {
+        router.push(`/invoices/${encodeURIComponent(categoryDate)}`);
+    }
 }
 ```
 
 ---
 
-## 6. Available Models
+## 6. Artifacts (Downloadable Files)
+
+Artifacts are files generated by the AI — Excel reports, CSV exports, chart images, etc.
+
+```typescript
+interface Artifact {
+    filename: string;  // "Prevision_Tesoreria_13_Semanas.xlsx"
+    url: string;       // "/api/tasks/{task_id}/artifacts/{filename}"
+}
+```
+
+### When artifacts appear
+
+- **Inline responses**: When user asks "Exporta mis gastos a Excel" → agent calls `generate_file` → artifact in `response.artifacts`
+- **Background tasks**: Cash flow forecast, Modelo 303, etc. → artifact in `task_completed.artifacts` and `result.data.artifacts`
+
+### Downloading artifacts
+```javascript
+function renderArtifacts(artifacts) {
+    if (!artifacts?.length) return;
+
+    return artifacts.map(a => {
+        const icon = a.filename.endsWith('.xlsx') ? '📊' :
+                     a.filename.endsWith('.pdf') ? '📄' : '📁';
+        return `
+            <a href="${a.url}" download="${a.filename}" class="artifact-btn">
+                ${icon} ${a.filename}
+            </a>
+        `;
+    }).join('');
+}
+```
+
+### Inline Excel preview (optional, with SheetJS)
+```javascript
+import * as XLSX from 'xlsx';
+
+async function previewExcel(url) {
+    const buffer = await fetch(url).then(r => r.arrayBuffer());
+    const workbook = XLSX.read(buffer, { type: 'array' });
+
+    // Sheet tabs
+    const sheets = workbook.SheetNames;
+    // e.g. ["Previsión 13 Semanas", "Detalle por Categoría", "Análisis Histórico", "Resumen Ejecutivo"]
+
+    // Render first sheet as HTML table
+    const html = XLSX.utils.sheet_to_html(workbook.Sheets[sheets[0]]);
+    document.querySelector('.excel-preview').innerHTML = html;
+}
+```
+
+### Artifact URL pattern
+All artifacts are served at:
+```
+GET /api/tasks/{task_id}/artifacts/{filename}
+```
+
+For inline-generated files (from chat, not a background task), the `task_id` is auto-generated as `chat_{uuid}`.
+
+---
+
+## 7. Background Tasks (Heavy Reports)
+
+Some queries trigger background processing with cost tracking and progress updates.
+
+### What triggers a background task
+
+These keywords in the user's message trigger a background task:
+
+| Keywords | Task Type | Output |
+|----------|-----------|--------|
+| "previsión de tesorería", "cash flow", "flujo de caja" | `cash_flow_forecast` | 13-week Excel forecast |
+| "pack reporting", "P&L mensual", "cuenta resultados" | `pack_reporting` | Multi-sheet P&L Excel |
+| "modelo 303", "IVA trimestral" | `modelo_303` | VAT return draft Excel |
+| "aging", "antigüedad", "cobros pendientes" | `aging_analysis` | Aging matrix Excel |
+| "rentabilidad por cliente" | `client_profitability` | Client margin Excel |
+| "modelo 347" | `modelo_347` | Third-party declaration Excel |
+
+**Exception**: informational questions are NOT tasks. "¿Qué es el Modelo 303?" → direct answer (no task).
+
+### WebSocket task flow
+```
+1. User sends "Genera previsión de tesorería"
+2. ← task_created { task_id, task_type: "cash_flow_forecast" }
+3. ← task_progress { progress: 5, step: "Iniciando agente..." }
+4. ← task_progress { step: "Consultando Bank Reconciliations..." }
+5. ← task_progress { step: "Ejecutando análisis..." }
+6. ← task_progress { step: "Generando archivo..." }
+7. ← task_completed { summary, artifacts: [{filename, url}], cost_usd }
+8. ← result { data: { answer, chart, sources, artifacts } }
+```
+
+### Create a task via REST
+```javascript
+const task = await fetch('/api/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        task_type: "cash_flow_forecast",
+        description: "Previsión de tesorería 13 semanas",
+        location_id: "deloitte-84",
+        model: "claude-sonnet-4.5"
+    })
+}).then(r => r.json());
+// Poll with GET /api/tasks/{task.task_id}
+```
+
+### Poll task status
+```javascript
+const task = await fetch(`/api/tasks/${taskId}`).then(r => r.json());
+// task = { task_id, status, progress, result_summary, artifacts, cost_usd, ... }
+// status: PENDING → RUNNING → COMPLETED | FAILED | CANCELLED
+```
+
+### Cost budgets per task type
+
+| Task Type | Budget | Timeout |
+|-----------|--------|---------|
+| Cash Flow Forecast | $3.00 | 10 min |
+| Pack Reporting | $3.00 | 10 min |
+| Modelo 303 | $2.00 | 10 min |
+| Aging Analysis | $1.50 | 5 min |
+| Client Profitability | $2.50 | 10 min |
+| Custom | $5.00 | 10 min |
+
+If budget is exceeded, the task stops gracefully and returns partial results.
+
+---
+
+## 8. Chat Management
+
+### Multi-turn conversations
+```javascript
+let chatId = null;
+
+// Turn 1: new chat (no chat_id)
+ws.send(JSON.stringify({ type: "message", question: "Cuantos proveedores tengo?", location_id: "deloitte-84" }));
+// → Receives chat_id event → store it
+
+// Turn 2: follow-up (with chat_id)
+ws.send(JSON.stringify({ type: "message", question: "Y cual tiene más facturas?", location_id: "deloitte-84", chat_id: chatId }));
+// → Agent uses conversation history for context
+```
+
+### Chat CRUD
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/chats?location_id=X` | Create new chat |
+| `GET /api/chats?location_id=X` | List chats |
+| `GET /api/chats/{id}` | Get chat metadata |
+| `GET /api/chats/{id}/messages` | Get message history |
+| `PATCH /api/chats/{id}?title=X` | Update title |
+| `DELETE /api/chats/{id}` | Delete chat |
+
+### Context window
+- Server keeps full history, builds a context window (max 20 messages, 30K chars)
+- Older messages are summarized automatically
+- Frontend just sends `chat_id` — no need to manage context
+
+---
+
+## 9. AI Cost Tracking
+
+### Per-chat costs
+```
+GET /api/chats/{chat_id}/costs
+```
+```json
+{
+    "summary": { "total_calls": 3, "total_tokens": 15000, "total_cost_usd": 0.05 },
+    "by_step": [
+        { "step": "agent_iter_1", "total_tokens": 3000, "cost_usd": 0.01 },
+        { "step": "agent_iter_2", "total_tokens": 8000, "cost_usd": 0.03 },
+        { "step": "agent_iter_3", "total_tokens": 4000, "cost_usd": 0.01 }
+    ]
+}
+```
+
+### Per-user costs
+```
+GET /api/costs?location_id=deloitte-84&days=30
+```
+
+### Model pricing
+```
+GET /api/costs/models
+```
+```json
+{
+    "pricing_per_1m_tokens_usd": {
+        "gemini-3.0-flash":  { "input": 0.10, "output": 0.40 },
+        "gpt-5-mini":        { "input": 0.15, "output": 0.60 },
+        "claude-sonnet-4.5": { "input": 3.00, "output": 15.00 },
+        "claude-opus-4.6":   { "input": 15.00, "output": 75.00 }
+    }
+}
+```
+
+### Typical costs
+
+| Query type | LLM calls | Cost |
+|-----------|-----------|------|
+| Knowledge question | 1 | ~$0.01 |
+| Data query + chart | 2-3 | ~$0.03-0.08 |
+| Cash flow forecast (task) | 5-8 | ~$0.30-0.50 |
+| Modelo 303 (task) | 4-6 | ~$0.20-0.40 |
+
+---
+
+## 10. AI Traces (Debugging)
+
+Every LLM call is traced. Use traces to debug issues, audit AI decisions, and optimize costs.
+
+### Endpoints
+```
+GET /api/chats/{chatId}/traces     → traces for a chat
+GET /api/tasks/{taskId}/traces     → traces for a task
+GET /api/traces/{traceId}          → single trace detail
+GET /api/traces?location_id=X      → aggregated stats
+```
+
+### Trace object
+```json
+{
+    "trace_id": "uuid",
+    "step": "agent_iter_1",
+    "model": "claude-sonnet-4.5",
+    "input_data": { "message_count": 3, "last_user_message": "Top 5 proveedores" },
+    "output_data": { "text": "...", "finish_reason": "tool_calls" },
+    "tool_calls": [
+        { "id": "call_xxx", "name": "dynamo_query", "arguments": "{\"table_name\":\"User_Expenses\"}" }
+    ],
+    "prompt_tokens": 1200,
+    "completion_tokens": 350,
+    "total_tokens": 1550,
+    "cost_usd": 0.008,
+    "latency_ms": 2340,
+    "status": "ok"
+}
+```
+
+### Trace steps explained
+
+| Step | Description |
+|------|-------------|
+| `agent_iter_1` | First agent iteration (planning + first tool call) |
+| `agent_iter_2` | Second iteration (usually analysis after data fetch) |
+| `agent_iter_N` | Subsequent iterations |
+
+---
+
+## 11. Code Execution API
+
+Direct access to the AI code execution sandbox for custom file generation.
+
+```javascript
+const result = await fetch('/api/code-exec', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        prompt: "Create an Excel with monthly revenue breakdown",
+        model: "claude-sonnet-4.5",
+        data: JSON.stringify(myData),
+        container_id: null  // or reuse from previous call
+    })
+}).then(r => r.json());
+
+// result = {
+//   success: true,
+//   text: "Created the report...",
+//   files: [{ filename: "report.xlsx", url: "/api/tasks/task_abc/artifacts/report.xlsx" }],
+//   container_id: "container_011..."  // reuse for follow-up calls (~4.5 min TTL)
+// }
+```
+
+---
+
+## 12. Dev Logs Panel
+
+Real-time log streaming for debugging.
+
+### WebSocket (live)
+```javascript
+const logsWs = new WebSocket('ws://localhost:8000/ws/logs');
+logsWs.onmessage = (event) => {
+    const log = JSON.parse(event.data);
+    // log = { ts, level, logger, message }
+    appendToLogPanel(log);
+};
+```
+
+### REST (polling)
+```
+GET /api/logs?limit=100
+```
+
+### Log panel CSS
+```css
+#log-panel {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    background: #1e1e1e;
+    color: #d4d4d4;
+    padding: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+.log-INFO .log-level { color: #4fc1ff; }
+.log-WARNING .log-level { color: #ffd700; }
+.log-ERROR .log-level { color: #f44747; }
+```
+
+---
+
+## 13. Available Models
 
 ```
 GET /api/models
 ```
-
-Response:
 ```json
 {
     "models": [
@@ -363,21 +789,53 @@ Response:
         { "id": "claude-sonnet-4.5", "provider": "Azure AI (Anthropic)" },
         { "id": "claude-opus-4.6",   "provider": "Azure AI (Anthropic)" }
     ],
-    "default_orchestrator": "claude-sonnet-4.5",
-    "default_classifier": "gpt-5-mini"
+    "default_orchestrator": "claude-sonnet-4.5"
 }
 ```
 
-### Model selection UI suggestion
-- Let users pick the orchestrator model from a dropdown
-- Default to `claude-sonnet-4.5` (best balance of speed/quality)
-- `claude-opus-4.6` for complex analysis
-- `gemini-3.0-flash` for fast/cheap queries
-- Classifier always uses `gpt-5-mini` (fast, cheap, good enough)
+Recommended:
+- **claude-sonnet-4.5** — best balance (default)
+- **gemini-3.0-flash** — fastest and cheapest
+- **claude-opus-4.6** — most capable, for complex analysis
 
 ---
 
-## 7. Full React Example
+## 14. Example Queries
+
+| Query | What happens | Response includes |
+|-------|-------------|-------------------|
+| "¿Qué es el Modelo 303?" | Direct answer (no DB) | `answer` only |
+| "Cuánto me he gastado en total?" | Query + analysis | `answer` + `chart` + `sources` |
+| "Top 5 proveedores por importe" | Query + analysis + chart | `answer` + `chart` (bar) + `sources` |
+| "Transacciones bancarias de enero" | Query + analysis | `answer` + `chart` (line) + `sources` (bank) |
+| "Exporta mis gastos a Excel" | Query + generate_file | `answer` + `artifacts` (Excel) |
+| "Genera previsión de tesorería" | Background task | Task events → `artifacts` (Excel 5 sheets) |
+| "Borrador Modelo 303 Q1" | Background task | Task events → `artifacts` (Excel) |
+| "Análisis de antigüedad" | Background task | Task events → `artifacts` (Excel) |
+
+---
+
+## 15. Error Handling
+
+```javascript
+// WebSocket reconnection
+ws.onclose = () => setTimeout(() => connectWebSocket(), 3000);
+
+// REST errors
+try {
+    const response = await fetch('/api/chat', { ... });
+    if (!response.ok) {
+        const error = await response.json();
+        showError(error.detail || 'Error del servidor');
+    }
+} catch (e) {
+    showError('No se pudo conectar al servidor');
+}
+```
+
+---
+
+## 16. Complete React Example
 
 ```tsx
 import { useState, useEffect, useRef } from 'react';
@@ -387,37 +845,64 @@ function CFOChat({ locationId }) {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
     const [status, setStatus] = useState('');
-    const [model, setModel] = useState('claude-sonnet-4.5');
-    const [models, setModels] = useState([]);
+    const [chatId, setChatId] = useState(null);
+    const [taskProgress, setTaskProgress] = useState(null);
     const wsRef = useRef(null);
-    const chartRef = useRef(null);
 
     useEffect(() => {
-        // Load models
-        fetch('/api/models').then(r => r.json()).then(d => setModels(d.models));
-
-        // Connect WebSocket
         const ws = new WebSocket(`ws://${window.location.host}/ws/chat`);
+
         ws.onmessage = (event) => {
             const msg = JSON.parse(event.data);
 
-            if (msg.type === 'event') {
-                setStatus(msg.message || msg.event);
-            }
+            switch (msg.type) {
+                case 'chat_id':
+                    setChatId(msg.chat_id);
+                    break;
 
-            if (msg.type === 'result') {
-                setStatus('');
-                setMessages(prev => [...prev, {
-                    role: 'assistant',
-                    ...msg.data
-                }]);
+                case 'event':
+                    if (['querying', 'analyzing', 'generating', 'thinking'].includes(msg.event))
+                        setStatus(msg.message);
+                    if (msg.event === 'agent_done')
+                        setStatus('');
+                    break;
 
-                // Render chart if present
-                if (msg.data.chart && chartRef.current) {
-                    renderChart(msg.data.chart, chartRef.current);
-                }
+                case 'response':
+                    setStatus('');
+                    setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        answer: msg.answer,
+                        chart: msg.chart,
+                        sources: msg.sources,
+                        artifacts: msg.artifacts,
+                    }]);
+                    break;
+
+                case 'task_created':
+                    setTaskProgress({ id: msg.task_id, name: msg.task_type_name, progress: 0, step: '' });
+                    break;
+
+                case 'task_progress':
+                    setTaskProgress(prev => prev ? { ...prev, progress: msg.progress, step: msg.step } : null);
+                    break;
+
+                case 'task_completed':
+                    setTaskProgress(null);
+                    setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        answer: msg.summary,
+                        artifacts: msg.artifacts,
+                        cost: msg.cost_usd,
+                    }]);
+                    break;
+
+                case 'task_failed':
+                    setTaskProgress(null);
+                    setMessages(prev => [...prev, { role: 'error', answer: msg.error }]);
+                    break;
             }
         };
+
         wsRef.current = ws;
         return () => ws.close();
     }, []);
@@ -426,39 +911,31 @@ function CFOChat({ locationId }) {
         if (!input.trim()) return;
         setMessages(prev => [...prev, { role: 'user', answer: input }]);
         wsRef.current?.send(JSON.stringify({
+            type: 'message',
             question: input,
             location_id: locationId,
-            model: model,
+            chat_id: chatId,
         }));
         setInput('');
     };
 
     return (
         <div className="cfo-chat">
-            <select value={model} onChange={e => setModel(e.target.value)}>
-                {models.map(m => (
-                    <option key={m.id} value={m.id}>{m.id} ({m.provider})</option>
-                ))}
-            </select>
-
             <div className="messages">
                 {messages.map((msg, i) => (
-                    <div key={i} className={`message ${msg.role}`}>
-                        <div className="answer">{msg.answer}</div>
-                        {msg.sources?.length > 0 && (
-                            <div className="sources">
-                                {msg.sources.map((s, j) => (
-                                    <SourceCard key={j} source={s} />
-                                ))}
-                            </div>
-                        )}
-                    </div>
+                    <Message key={i} {...msg} />
                 ))}
             </div>
 
             {status && <div className="status-bar">{status}</div>}
 
-            <canvas ref={chartRef} />
+            {taskProgress && (
+                <div className="task-progress">
+                    <div className="task-name">{taskProgress.name}</div>
+                    <progress value={taskProgress.progress} max={100} />
+                    <div className="task-step">{taskProgress.step}</div>
+                </div>
+            )}
 
             <div className="input-bar">
                 <input value={input} onChange={e => setInput(e.target.value)}
@@ -469,733 +946,58 @@ function CFOChat({ locationId }) {
         </div>
     );
 }
-```
 
----
+function Message({ role, answer, chart, sources, artifacts, cost }) {
+    const chartRef = useRef(null);
 
-## 8. Chat Management API
-
-The server supports persistent multi-turn conversations. Each chat has a unique `chat_id` and stores full message history.
-
-### Create a new chat
-```
-POST /api/chats?location_id=deloitte-84&model=claude-sonnet-4.5
-```
-Response:
-```json
-{
-    "chat_id": "45b57715-a6d8-472b-854d-8e155ee29fd6",
-    "location_id": "deloitte-84",
-    "title": "",
-    "model": "claude-sonnet-4.5",
-    "created_at": 1711036800.0,
-    "updated_at": 1711036800.0,
-    "message_count": 0
-}
-```
-
-### List chats
-```
-GET /api/chats?location_id=deloitte-84&limit=50
-```
-Response:
-```json
-{
-    "chats": [
-        {
-            "chat_id": "45b57715-...",
-            "location_id": "deloitte-84",
-            "title": "Cuanto me he gastado en total?",
-            "model": "claude-sonnet-4.5",
-            "created_at": 1711036800.0,
-            "updated_at": 1711036900.0,
-            "message_count": 4
+    useEffect(() => {
+        if (chart && chartRef.current && chart.type !== 'table') {
+            new Chart(chartRef.current, {
+                type: chart.type,
+                data: { labels: chart.labels, datasets: chart.datasets },
+                options: { plugins: { title: { display: true, text: chart.title } } },
+            });
         }
-    ]
-}
-```
-
-### Get chat metadata
-```
-GET /api/chats/{chat_id}
-```
-
-### Get chat messages (full history)
-```
-GET /api/chats/{chat_id}/messages?limit=200
-```
-Response:
-```json
-{
-    "chat_id": "45b57715-...",
-    "messages": [
-        {
-            "id": 1,
-            "chat_id": "45b57715-...",
-            "role": "user",
-            "content": "Cuantos proveedores tengo?",
-            "timestamp": 1711036800.0,
-            "metadata": {}
-        },
-        {
-            "id": 2,
-            "chat_id": "45b57715-...",
-            "role": "assistant",
-            "content": "Tienes 49 proveedores registrados...",
-            "timestamp": 1711036810.0,
-            "metadata": {
-                "type": "full_answer",
-                "chart": true,
-                "sources_count": 49,
-                "model": "claude-sonnet-4.5"
-            }
-        }
-    ]
-}
-```
-
-### Update chat (title or model)
-```
-PATCH /api/chats/{chat_id}?title=Mi+conversacion&model=claude-opus-4.6
-```
-
-### Delete chat
-```
-DELETE /api/chats/{chat_id}
-```
-Response: `{"deleted": true}`
-
----
-
-## 9. Multi-Turn Conversation Flow
-
-The agent supports follow-up questions with automatic context. Here's the recommended frontend flow:
-
-### Flow diagram
-```
-1. User opens app → no chat_id yet
-2. User sends first message → send with chat_id: null
-3. Server returns chat_id event → store it
-4. User sends follow-up → send with stored chat_id
-5. Server uses conversation history for context
-```
-
-### Example multi-turn conversation
-```javascript
-let currentChatId = null;
-
-// Turn 1: "Cuantos proveedores tengo?"
-ws.send(JSON.stringify({
-    question: "Cuantos proveedores tengo?",
-    location_id: "deloitte-84",
-    chat_id: null  // new chat
-}));
-// → Receives chat_id event, store it
-// → Result: "Tienes 49 proveedores" + bar chart
-
-// Turn 2: "Y cual es el que mas facturas tiene?"
-ws.send(JSON.stringify({
-    question: "Y cual es el que mas facturas tiene?",
-    location_id: "deloitte-84",
-    chat_id: currentChatId  // continue same chat
-}));
-// → Agent understands context, answers from previous data
-
-// Turn 3: "Cuanto le debo a ese proveedor?"
-ws.send(JSON.stringify({
-    question: "Cuanto le debo a ese proveedor?",
-    location_id: "deloitte-84",
-    chat_id: currentChatId
-}));
-// → Agent resolves "ese proveedor" from history, queries DB for unpaid invoices
-```
-
-### Context window behavior
-- The server keeps full message history in storage
-- When calling the LLM, it builds a **context window** (max 20 messages, 30K chars)
-- Older messages are automatically **summarized** to save tokens
-- Recent messages are sent verbatim for accuracy
-- The frontend does NOT need to manage context — just send `chat_id`
-
-### Sidebar: loading previous chats
-```javascript
-// Load chat list for sidebar
-const { chats } = await fetch('/api/chats?location_id=deloitte-84').then(r => r.json());
-
-// When user clicks a chat, load its messages
-const { messages } = await fetch(`/api/chats/${chatId}/messages`).then(r => r.json());
-
-// Resume conversation by sending chat_id with new messages
-ws.send(JSON.stringify({
-    question: "Nueva pregunta...",
-    location_id: "deloitte-84",
-    chat_id: chatId
-}));
-```
-
----
-
-## 10. Example Queries to Test
-
-| Query | What it tests |
-|-------|--------------|
-| "Cuanto me he gastado en total?" | Basic aggregation, pie chart |
-| "Facturas sin pagar" | Reconciliation filter (unpaid) |
-| "Cuanto gasto en Bio-Rad?" | Multi-step: find supplier CIF -> filter expenses |
-| "Top 5 proveedores por gasto" | Bar chart with ranking |
-| "Movimientos bancarios de enero" | Bank transactions, line chart |
-| "Prevision gastos mes que viene" | Trend analysis, forecast |
-| "Cuanto IVA he pagado en febrero?" | VAT calculation from ivas field |
-| "Cuentas contables de Bio-Rad" | AccountingEntries analysis |
-| "Productos de laboratorio" | all_products field search |
-| "Que es el modelo 303?" | Direct answer (no DB) |
-
----
-
-## 11. AI Cost Tracking.
-
-The server tracks token usage and estimated costs for every LLM call. Use these endpoints to build cost dashboards and monitor AI spend.
-
-### Get costs for a chat
-```
-GET /api/chats/{chat_id}/costs
-```
-Response:
-```json
-{
-    "chat_id": "e3b26017-...",
-    "summary": {
-        "total_calls": 5,
-        "prompt_tokens": 29761,
-        "completion_tokens": 1725,
-        "total_tokens": 31486,
-        "total_cost_usd": 0.0958
-    },
-    "by_model": [
-        {"model": "claude-sonnet-4.5", "calls": 4, "prompt_tokens": 27336, "completion_tokens": 1675, "total_tokens": 29011, "cost_usd": 0.0957},
-        {"model": "gpt-5-mini", "calls": 1, "prompt_tokens": 243, "completion_tokens": 50, "total_tokens": 293, "cost_usd": 0.0001}
-    ],
-    "by_step": [
-        {"step": "classifier", "calls": 1, "total_tokens": 293, "cost_usd": 0.0001},
-        {"step": "orchestrator", "calls": 1, "total_tokens": 3217, "cost_usd": 0.0113},
-        {"step": "query_agent_iter_1", "calls": 1, "total_tokens": 3152, "cost_usd": 0.0104},
-        {"step": "query_agent_iter_2", "calls": 1, "total_tokens": 3391, "cost_usd": 0.0122},
-        {"step": "query_agent_iter_3", "calls": 1, "total_tokens": 17576, "cost_usd": 0.0617}
-    ],
-    "details": [...]
-}
-```
-
-### Get costs for a user (location)
-```
-GET /api/costs?location_id=deloitte-84
-GET /api/costs?location_id=deloitte-84&days=30   // last 30 days only
-```
-Response:
-```json
-{
-    "location_id": "deloitte-84",
-    "summary": {
-        "total_calls": 7,
-        "prompt_tokens": 29761,
-        "completion_tokens": 1725,
-        "total_tokens": 31486,
-        "total_cost_usd": 0.1123
-    },
-    "by_model": [...],
-    "by_chat": [
-        {"chat_id": "e3b26017-...", "title": "Cuantos proveedores tengo?", "calls": 5, "total_tokens": 27628, "cost_usd": 0.0958},
-        {"chat_id": "bc024721-...", "title": "Que es el margen bruto?", "calls": 2, "total_tokens": 3858, "cost_usd": 0.0166}
-    ]
-}
-```
-
-### Get model pricing table
-```
-GET /api/costs/models
-```
-Response:
-```json
-{
-    "pricing_per_1m_tokens_usd": {
-        "gemini-3.0-flash":  {"input": 0.10, "output": 0.40},
-        "gemini-3.1-pro":    {"input": 1.25, "output": 5.00},
-        "gpt-5-mini":        {"input": 0.15, "output": 0.60},
-        "claude-sonnet-4.5": {"input": 3.00, "output": 15.00},
-        "claude-opus-4.6":   {"input": 15.00, "output": 75.00}
-    }
-}
-```
-
-### Get context window for a chat
-```
-GET /api/chats/{chat_id}/context
-```
-Response:
-```json
-{
-    "chat_id": "e3b26017-...",
-    "context_messages": 4,
-    "total_chars": 2150,
-    "messages": [
-        {"role": "user", "content": "Cuantos proveedores tengo?"},
-        {"role": "assistant", "content": "Tienes 49 proveedores..."},
-        {"role": "user", "content": "Y cual es el que mas facturas tiene?"},
-        {"role": "assistant", "content": "HOFFMANN EITLE..."}
-    ]
-}
-```
-
-### Cost dashboard example
-```javascript
-// Show cost per chat in sidebar
-async function loadChatCosts(locationId) {
-    const { by_chat, summary } = await fetch(
-        `/api/costs?location_id=${locationId}`
-    ).then(r => r.json());
-
-    return {
-        totalSpend: summary.total_cost_usd,
-        totalTokens: summary.total_tokens,
-        chats: by_chat.map(c => ({
-            id: c.chat_id,
-            title: c.title,
-            cost: c.cost_usd,
-            tokens: c.total_tokens,
-        })),
-    };
-}
-
-// Show detailed breakdown for a specific chat
-async function loadChatCostDetail(chatId) {
-    const data = await fetch(`/api/chats/${chatId}/costs`).then(r => r.json());
-    // data.by_step shows: classifier, orchestrator, query_agent_iter_N
-    // data.by_model shows cost per model used
-    return data;
-}
-```
-
-### Understanding the cost steps
-
-| Step | Description | Typical cost |
-|------|-------------|-------------|
-| `classifier` | Intent classification (fast_chat vs complex_task) | Very low (~$0.0001) |
-| `orchestrator` | Main brain decides if data needed + what to fetch | Low (~$0.01) |
-| `query_agent_iter_N` | Each query agent iteration (plan, query, analyze) | Medium (~$0.01-0.06) |
-
-- **Direct answers** (no DB): ~$0.02 total (classifier + orchestrator only)
-- **Data queries**: ~$0.05-0.15 total depending on complexity
-- **Using `gemini-3.0-flash`** instead of `claude-sonnet-4.5` reduces costs ~30x
-
----
-
-## 12. Complex Tasks (Deep Agent)
-
-For heavy tasks (Cash Flow Forecast, Modelo 303, reporting, audits), the system uses async background tasks with sub-agents.
-
-### How it works
-
-```
-1. User sends question → Classifier detects "complex_task"
-2. Server creates a Task → runs sub-agents in parallel
-3. Sub-agents query DynamoDB + analyze data
-4. Synthesizer produces final output
-5. Excel artifacts generated and downloadable
-```
-
-### Task types
-
-```
-GET /api/tasks/types
-```
-Response:
-```json
-{
-    "types": [
-        {"id": "cash_flow_forecast", "name": "Previsión de Tesorería (13 semanas)", "cost_budget_usd": 1.0, "max_agents": 4, "timeout_s": 300},
-        {"id": "pack_reporting", "name": "Pack Reporting Mensual", "cost_budget_usd": 1.5, "max_agents": 5, "timeout_s": 600},
-        {"id": "modelo_303", "name": "Borrador Modelo 303 (IVA)", "cost_budget_usd": 0.8, "max_agents": 3, "timeout_s": 300},
-        {"id": "aging_analysis", "name": "Análisis de Antigüedad (Aging)", "cost_budget_usd": 0.5, "max_agents": 2, "timeout_s": 180},
-        {"id": "client_profitability", "name": "Rentabilidad por Cliente", "cost_budget_usd": 1.0, "max_agents": 4, "timeout_s": 300},
-        {"id": "custom", "name": "Tarea Personalizada", "cost_budget_usd": 2.0, "max_agents": 5, "timeout_s": 600}
-    ]
-}
-```
-
-### Create a task (REST)
-
-```javascript
-const response = await fetch('/api/tasks', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-        task_type: "cash_flow_forecast",
-        description: "Genera la previsión de tesorería de las próximas 13 semanas",
-        location_id: "deloitte-84",
-        chat_id: "optional-chat-id",   // Link task to a chat
-        model: "claude-sonnet-4.5"
-    })
-});
-const task = await response.json();
-// task.task_id → use for polling
-```
-
-### Poll task status
-
-```javascript
-// Poll every 3-5 seconds while task is running
-const task = await fetch(`/api/tasks/${taskId}`).then(r => r.json());
-```
-
-Response:
-```json
-{
-    "task_id": "d6b9426b-...",
-    "task_type": "cash_flow_forecast",
-    "task_type_name": "Previsión de Tesorería (13 semanas)",
-    "status": "COMPLETED",
-    "progress": 100,
-    "cost_usd": 0.2378,
-    "cost_budget_usd": 1.0,
-    "total_tokens": 47639,
-    "result_summary": "Previsión de tesorería generada para las próximas 13 semanas...",
-    "artifacts": [
-        {"filename": "cash_flow_forecast_13w.xlsx", "type": "excel", "size_bytes": 7255}
-    ],
-    "steps": [
-        {"step_number": 1, "status": "COMPLETED", "description": "Consultar facturas pendientes de pago"},
-        {"step_number": 2, "status": "COMPLETED", "description": "Consultar facturas pendientes de cobro"},
-        {"step_number": 3, "status": "COMPLETED", "description": "Consultar nóminas recientes"},
-        {"step_number": 4, "status": "COMPLETED", "description": "Consultar transacciones bancarias"}
-    ]
-}
-```
-
-Task statuses: `PENDING` → `RUNNING` → `COMPLETED` | `FAILED` | `CANCELLED`
-
-### Download artifacts
-
-```javascript
-// List artifacts
-const { artifacts } = await fetch(`/api/tasks/${taskId}/artifacts`).then(r => r.json());
-
-// Download Excel
-const blob = await fetch(`/api/tasks/${taskId}/artifacts/${artifacts[0].filename}`).then(r => r.blob());
-const url = URL.createObjectURL(blob);
-const a = document.createElement('a');
-a.href = url;
-a.download = artifacts[0].filename;
-a.click();
-```
-
-### WebSocket task events
-
-When a complex task is triggered via WebSocket (user asks a question that's classified as `complex_task`), the server sends these events:
-
-```javascript
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-
-    // Task was created
-    if (msg.type === 'task_created') {
-        showTaskBanner(msg.task_id, msg.task_type_name);
-    }
-
-    // Progress updates (during task execution)
-    if (msg.type === 'task_progress') {
-        updateProgress(msg.task_id, msg.progress, msg.step);
-    }
-
-    // Task completed — result includes artifacts
-    if (msg.type === 'result' && msg.data.type === 'complex_task') {
-        hideProgress();
-        showAnswer(msg.data.answer);
-        // Show download buttons for artifacts
-        msg.data.artifacts.forEach(a => {
-            showDownloadButton(a.filename, a.url);
-        });
-        showCost(msg.data.cost_usd);
-    }
-
-    // Task failed
-    if (msg.type === 'task_failed') {
-        showError(msg.error);
-    }
-};
-```
-
-### List tasks for sidebar
-
-```javascript
-const { tasks } = await fetch('/api/tasks?location_id=deloitte-84').then(r => r.json());
-// tasks: [{task_id, task_type, task_type_name, status, progress, cost_usd, artifacts, ...}]
-```
-
-### Cancel a running task
-
-```javascript
-await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
-```
-
-### Get step-by-step trace
-
-```
-GET /api/tasks/{task_id}/steps
-```
-Returns detailed execution trace for each sub-agent step (useful for debugging/auditing).
-
-### Cost guardrails
-
-Each task type has a cost budget. If the budget is exceeded during execution, the task stops gracefully and returns partial results. The budgets are:
-
-| Task Type | Budget | Max Agents | Timeout |
-|-----------|--------|------------|---------|
-| Cash Flow Forecast | $1.00 | 4 | 5 min |
-| Pack Reporting | $1.50 | 5 | 10 min |
-| Modelo 303 | $0.80 | 3 | 5 min |
-| Aging Analysis | $0.50 | 2 | 3 min |
-| Client Profitability | $1.00 | 4 | 5 min |
-| Custom | $2.00 | 5 | 10 min |
-
-### Example queries that trigger complex tasks
-
-| Query | Task Type | Output |
-|-------|-----------|--------|
-| "Genera la previsión de tesorería" | cash_flow_forecast | Excel 13-week forecast |
-| "Prepara el pack reporting mensual" | pack_reporting | Multi-sheet Excel (P&L, KPIs) |
-| "Genera el borrador del Modelo 303" | modelo_303 | Excel matching official form |
-| "Análisis de antigüedad de cobros" | aging_analysis | Excel aging matrix |
-| "Rentabilidad por cliente" | client_profitability | Excel margin analysis |
-
----
-
-## 13. Code Execution & AI-Powered File Generation
-
-The backend uses **native AI code execution** (Claude's `code_execution_20250825` sandbox and Gemini's code execution) to dynamically generate Excel reports, charts, and analysis files. This replaces hardcoded templates — the LLM writes and runs Python code (openpyxl, pandas, matplotlib) in a sandboxed container.
-
-### How it works
-
-1. **Fast-chat**: The query agent has a `generate_file` tool. When the user asks for a report/export, the LLM calls this tool which triggers code execution.
-2. **Deep-agent tasks**: After sub-agents gather data and the synthesizer produces results, code execution generates the final Excel artifact.
-3. **Direct API**: `POST /api/code-exec` for custom code execution requests.
-
-### Direct Code Execution: `POST /api/code-exec`
-
-```javascript
-const response = await fetch('/api/code-exec', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-        prompt: "Create an Excel with monthly revenue breakdown",
-        model: "claude-sonnet-4.5",   // or "gemini-3.0-flash"
-        data: JSON.stringify(myData), // optional: data context
-        system_prompt: null,          // optional
-        task_id: null,                // optional: auto-generated if null
-        container_id: null            // optional: reuse Claude container
-    })
-});
-
-const result = await response.json();
-// {
-//   success: true,
-//   text: "I've created the Excel report with...",
-//   files: [
-//     { filename: "revenue_report.xlsx", url: "/api/tasks/task_abc/artifacts/revenue_report.xlsx" }
-//   ],
-//   container_id: "container_011...",  // for follow-up requests
-//   usage: { prompt_tokens: 5000, completion_tokens: 800, total_tokens: 5800 }
-// }
-```
-
-### Downloading generated files
-
-```javascript
-// Files from code execution (direct API)
-const fileUrl = result.files[0].url;  // "/api/tasks/{task_id}/artifacts/{filename}"
-window.open(fileUrl);
-
-// Files from deep-agent tasks (same endpoint)
-const taskArtifact = `/api/tasks/${taskId}/artifacts/${filename}`;
-window.open(taskArtifact);
-```
-
-### Provider fallback chain
-
-The system automatically falls back across providers:
-1. **Claude** (Azure AI Foundry) — preferred, supports container reuse
-2. **Gemini** (Vertex AI) — fallback, code re-executed locally for file capture
-3. **Template fallback** — last resort, uses predefined openpyxl templates
-
-### Prompt caching (automatic)
-
-For Claude models, the backend automatically applies **prompt caching** (`cache_control: {"type": "ephemeral"}`) to system messages and large conversation history. This reduces API costs by up to 90% on cache hits. No frontend action needed.
-
-### Multi-step container reuse
-
-For complex tasks, pass `container_id` from a previous response to reuse the same Claude sandbox (files and state persist ~4.5 minutes):
-
-```javascript
-// Step 1: Generate data
-const step1 = await fetch('/api/code-exec', {
-    method: 'POST',
-    body: JSON.stringify({ prompt: "Load and clean this data...", data: rawData })
-}).then(r => r.json());
-
-// Step 2: Reuse container to generate chart from the same data
-const step2 = await fetch('/api/code-exec', {
-    method: 'POST',
-    body: JSON.stringify({
-        prompt: "Now create a chart from the cleaned data",
-        container_id: step1.container_id  // reuse sandbox
-    })
-}).then(r => r.json());
-```
-
-### Files in WebSocket chat (fast-chat flow)
-
-When the user asks for a file in the chat (e.g., "Exporta mis gastos a Excel"), the response arrives via WebSocket with `files` in the final message:
-
-```javascript
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-
-    if (msg.type === 'final') {
-        // msg.data.files is an array of generated files (may be empty)
-        const files = msg.data.files || [];
-        files.forEach(file => {
-            // file = { filename: "gastos_export.xlsx", url: "/api/tasks/chat_abc/artifacts/gastos_export.xlsx", type: "excel" }..
-            renderDownloadButton(file);
-        });
-
-        // msg.data.answer is the AI's text response
-        renderMarkdown(msg.data.answer);
-    }
-};
-```
-
-### Rendering file downloads in the UI
-
-```javascript
-function renderDownloadButton(file) {
-    const icon = {
-        excel: 'table-cells',       // .xlsx files
-        csv: 'file-csv',            // .csv files
-        image: 'chart-bar',         // .png charts
-        pdf: 'file-pdf',            // .pdf files
-    }[file.type] || 'file';
-
-    const btn = document.createElement('a');
-    btn.href = file.url;
-    btn.download = file.filename;
-    btn.className = 'download-btn';
-    btn.innerHTML = `<i class="fa fa-${icon}"></i> ${file.filename}`;
-    document.querySelector('.chat-files').appendChild(btn);
-}
-```
-
-### Files in deep-agent tasks
-
-Task artifacts appear in the task completion event and in the task detail API:
-
-```javascript
-// Via WebSocket (real-time)
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === 'task_complete') {
-        // msg.data.artifacts = [{ filename, type, size_bytes }]
-        msg.data.artifacts.forEach(artifact => {
-            const url = `/api/tasks/${msg.data.task_id}/artifacts/${artifact.filename}`;
-            renderDownloadButton({ ...artifact, url });
-        });
-    }
-};
-
-// Via REST API (polling)
-const task = await fetch(`/api/tasks/${taskId}`).then(r => r.json());
-if (task.status === 'completed' && task.artifacts?.length) {
-    task.artifacts.forEach(artifact => {
-        const url = `/api/tasks/${taskId}/artifacts/${artifact.filename}`;
-        // Trigger download or show preview
-        window.open(url, '_blank');
-    });
-}
-```
-
-### Excel preview with SheetJS (optional)
-
-For inline Excel preview without downloading:
-
-```javascript
-import * as XLSX from 'xlsx';
-
-async function previewExcel(url) {
-    const response = await fetch(url);
-    const buffer = await response.arrayBuffer();
-    const workbook = XLSX.read(buffer, { type: 'array' });
-
-    // Get all sheet names
-    const sheets = workbook.SheetNames; // ["Cash Flow Forecast", "Detalle Cobros", ...]
-
-    // Convert first sheet to HTML table
-    const html = XLSX.utils.sheet_to_html(workbook.Sheets[sheets[0]]);
-    document.querySelector('.excel-preview').innerHTML = html;
-
-    // Or convert to JSON for custom rendering
-    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheets[0]]);
-    renderTable(data);
-}
-```
-
-### Chart images in chat
-
-When the AI generates chart images (.png), they appear in the `files` array:
-
-```javascript
-files.forEach(file => {
-    if (file.type === 'image') {
-        const img = document.createElement('img');
-        img.src = file.url;
-        img.alt = file.filename;
-        img.className = 'chart-image';
-        document.querySelector('.chat-charts').appendChild(img);
-    }
-});
-```
-
-### Available models for code execution
-
-| Model | Provider | Speed | Best for |
-|-------|----------|-------|----------|
-| `claude-sonnet-4.5` | Azure AI Foundry | ~30-60s | Complex multi-sheet Excel, container reuse |
-| `gemini-3.0-flash` | Vertex AI | ~15-20s | Fast generation, charts, simple reports |
-
-GPT models automatically fall back to Gemini for code execution.
-
----
-
-## 14. Error Handling
-
-```javascript
-ws.onerror = (error) => {
-    console.error('WebSocket error:', error);
-    showToast('Error de conexion');
-};
-
-ws.onclose = () => {
-    // Reconnect after 3 seconds
-    setTimeout(() => connectWebSocket(), 3000);
-};
-```
-
-For REST API errors:
-```javascript
-try {
-    const response = await fetch('/api/chat', { ... });
-    if (!response.ok) {
-        const error = await response.json();
-        showError(error.detail || 'Error del servidor');
-    }
-} catch (e) {
-    showError('No se pudo conectar al servidor');
+    }, [chart]);
+
+    return (
+        <div className={`message ${role}`}>
+            <div className="answer" dangerouslySetInnerHTML={{ __html: markdownToHtml(answer) }} />
+
+            {chart && chart.type !== 'table' && <canvas ref={chartRef} />}
+
+            {chart?.type === 'table' && (
+                <table>
+                    <thead><tr>{chart.labels.map(h => <th key={h}>{h}</th>)}</tr></thead>
+                    <tbody>{chart.datasets[0].data.map((row, i) =>
+                        <tr key={i}>{row.map((cell, j) => <td key={j}>{cell}</td>)}</tr>
+                    )}</tbody>
+                </table>
+            )}
+
+            {sources?.length > 0 && (
+                <div className="sources">
+                    <h4>Referencias ({sources.length})</h4>
+                    {sources.slice(0, 5).map((s, i) => (
+                        <div key={i} className="source-chip">
+                            {s.supplier} — {formatEUR(s.total)}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {artifacts?.length > 0 && (
+                <div className="artifacts">
+                    {artifacts.map((a, i) => (
+                        <a key={i} href={a.url} download={a.filename} className="download-btn">
+                            📊 {a.filename}
+                        </a>
+                    ))}
+                </div>
+            )}
+
+            {cost && <span className="cost-badge">${cost.toFixed(2)}</span>}
+        </div>
+    );
 }
 ```

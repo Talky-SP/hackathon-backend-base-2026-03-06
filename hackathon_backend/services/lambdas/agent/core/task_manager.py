@@ -33,15 +33,15 @@ from typing import Any
 # Cost budgets per task type
 # ---------------------------------------------------------------------------
 TASK_COST_LIMITS: dict[str, dict] = {
-    "cash_flow_forecast":    {"max_usd": 1.00, "max_tokens": 500_000, "max_agents": 4, "timeout_s": 300},
-    "pack_reporting":        {"max_usd": 1.50, "max_tokens": 750_000, "max_agents": 5, "timeout_s": 600},
-    "modelo_303":            {"max_usd": 0.80, "max_tokens": 400_000, "max_agents": 3, "timeout_s": 300},
-    "aging_analysis":        {"max_usd": 0.50, "max_tokens": 300_000, "max_agents": 2, "timeout_s": 180},
-    "client_profitability":  {"max_usd": 1.00, "max_tokens": 500_000, "max_agents": 4, "timeout_s": 300},
-    "modelo_347":            {"max_usd": 0.80, "max_tokens": 400_000, "max_agents": 3, "timeout_s": 300},
-    "three_way_matching":    {"max_usd": 0.60, "max_tokens": 300_000, "max_agents": 2, "timeout_s": 180},
-    "document_analysis":     {"max_usd": 0.50, "max_tokens": 200_000, "max_agents": 2, "timeout_s": 120},
-    "custom":                {"max_usd": 2.00, "max_tokens": 1_000_000, "max_agents": 5, "timeout_s": 600},
+    "cash_flow_forecast":    {"max_usd": 3.00, "max_tokens": 1_500_000, "max_agents": 5, "timeout_s": 600},
+    "pack_reporting":        {"max_usd": 3.00, "max_tokens": 1_500_000, "max_agents": 5, "timeout_s": 600},
+    "modelo_303":            {"max_usd": 2.00, "max_tokens": 1_000_000, "max_agents": 4, "timeout_s": 600},
+    "aging_analysis":        {"max_usd": 1.50, "max_tokens": 750_000, "max_agents": 3, "timeout_s": 300},
+    "client_profitability":  {"max_usd": 2.50, "max_tokens": 1_200_000, "max_agents": 5, "timeout_s": 600},
+    "modelo_347":            {"max_usd": 2.00, "max_tokens": 1_000_000, "max_agents": 4, "timeout_s": 600},
+    "three_way_matching":    {"max_usd": 1.50, "max_tokens": 750_000, "max_agents": 3, "timeout_s": 300},
+    "document_analysis":     {"max_usd": 1.00, "max_tokens": 500_000, "max_agents": 2, "timeout_s": 180},
+    "custom":                {"max_usd": 5.00, "max_tokens": 2_000_000, "max_agents": 5, "timeout_s": 600},
 }
 
 # Friendly names for task types

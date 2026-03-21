@@ -15,7 +15,7 @@ from typing import Any
 
 from langfuse import observe
 
-from hackathon_backend.services.lambdas.agent.core.config import completion
+from hackathon_backend.services.lambdas.agent.core.config import traced_completion
 from hackathon_backend.services.lambdas.agent.core.prompts import get_prompt
 from hackathon_backend.services.lambdas.agent.core.schemas import get_schemas_summary
 from hackathon_backend.services.lambdas.agent.core.db_tools import TOOLS
@@ -65,9 +65,11 @@ def orchestrate(
         messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
 
-    response = completion(
+    response = traced_completion(
         model_id=model_id,
         messages=messages,
+        step="orchestrator",
+        location_id=location_id,
         tools=TOOLS,
         temperature=0.2,
     )

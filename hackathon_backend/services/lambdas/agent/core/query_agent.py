@@ -23,7 +23,7 @@ import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from langfuse import observe
 
-from hackathon_backend.services.lambdas.agent.core.config import completion
+from hackathon_backend.services.lambdas.agent.core.config import traced_completion, is_cancelled, CancelledError
 from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
 )
@@ -556,6 +556,7 @@ def run_query_agent(
     model_id: str = "claude-sonnet-4.5",
     chart_suggestion: dict | None = None,
     on_event: EventCallback | None = None,
+    chat_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Run the query agent: plans queries, executes them, analyzes results.
@@ -604,11 +605,18 @@ def run_query_agent(
     usage_records: list[dict] = []
 
     for iteration in range(max_iterations):
+        # Check cancellation
+        if chat_id and is_cancelled(chat_id):
+            raise CancelledError(f"Chat {chat_id} cancelled")
+
         emit("thinking", {"step": iteration + 1, "message": "Planificando siguiente paso..." if iteration == 0 else "Analizando resultados..."})
 
-        response = completion(
+        response = traced_completion(
             model_id=model_id,
             messages=messages,
+            step=f"query_agent_iter_{iteration + 1}",
+            chat_id=chat_id,
+            location_id=location_id,
             tools=QUERY_AGENT_TOOLS,
             temperature=0.1,
         )

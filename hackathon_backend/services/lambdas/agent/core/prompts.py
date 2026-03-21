@@ -20,17 +20,22 @@ Respond with a JSON object and NOTHING else:
 {"intent": "fast_chat"} or {"intent": "complex_task"}
 
 Rules:
-- "fast_chat": Simple questions, quick lookups, summaries, charts, KPI queries,
-  comparisons, or anything that can be answered with a single database query
-  or a few queries and a direct response.
-  Examples: "¿Cuánto facturé en marzo?", "Top 5 proveedores por gasto",
-  "Muéstrame un gráfico de ingresos vs gastos", "¿Cuántas facturas pendientes tengo?"
+- "fast_chat": Simple questions that need a quick text answer or a single chart.
+  Examples: "Cuanto facture en marzo?", "Top 5 proveedores", "Que es el IVA?"
 
-- "complex_task": Multi-step tasks that require background processing, heavy
-  computation, report generation, tax form drafting, audits, reconciliations,
-  or anything that would take significant time.
-  Examples: "Genera el borrador del Modelo 303", "Haz el cierre contable de marzo",
-  "Prepara el pack de reporting mensual", "Analiza la rentabilidad de todos mis clientes"
+- "complex_task": ANY of these signals means complex_task:
+  * Generating reports, Excel files, PDFs, exports, or downloads
+  * Forecasting, projections, predictions (cash flow, treasury, budget)
+  * Tax forms (Modelo 303, 347, etc.)
+  * Multi-dimensional analysis (profitability by client, aging, reconciliation)
+  * Pack reporting, monthly close, P&L
+  * Keywords: "genera", "prepara", "crea informe", "exporta", "descarga"
+  * Keywords: "prevision", "forecast", "proyeccion", "tesoreria"
+  Examples: "Genera prevision de tesoreria", "Haz el Modelo 303",
+  "Exporta facturas a Excel", "Analiza rentabilidad por cliente",
+  "Prevision de caja", "Dame un Excel con los gastos"
+
+When in doubt, classify as "complex_task".
 """
 
 # ============================================================================

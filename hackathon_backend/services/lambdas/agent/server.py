@@ -33,21 +33,23 @@ from pydantic import BaseModel
 from hackathon_backend.services.lambdas.agent.core.config import (
     init_all,
     AVAILABLE_MODELS,
+    request_cancel,
+    clear_cancel,
+    is_cancelled,
+    CancelledError,
 )
 from hackathon_backend.services.lambdas.agent.core.prompts import sync_prompts_to_langfuse
-from hackathon_backend.services.lambdas.agent.core.classifier import classify_intent, detect_task_type
-from hackathon_backend.services.lambdas.agent.core.orchestrator import orchestrate
-from hackathon_backend.services.lambdas.agent.core.query_agent import run_query_agent
+from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, detect_heavy_task
 from hackathon_backend.services.lambdas.agent.core.chat_store import (
     create_chat, get_chat, list_chats, delete_chat, update_chat,
     add_message, get_messages, build_context_window,
     record_llm_cost, get_chat_costs, get_location_costs,
+    get_chat_traces, get_task_traces, get_trace, get_location_traces,
 )
 from hackathon_backend.services.lambdas.agent.core.task_manager import (
     create_task, get_task, list_tasks, update_task_status, cancel_task,
     get_task_steps, TASK_TYPE_NAMES, TASK_COST_LIMITS,
 )
-from hackathon_backend.services.lambdas.agent.core.task_executor import execute_task
 from hackathon_backend.services.lambdas.agent.core.tools.excel_gen import list_artifacts, get_artifact_path
 from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution, CODE_EXEC_SYSTEM, collect_sandbox_files, ARTIFACTS_DIR,
@@ -75,6 +77,7 @@ _initialized = False
 def _ensure_init():
     global _initialized
     if not _initialized:
+        _setup_dev_logging()
         print("Initializing models and Langfuse...")
         init_all()
         sync_prompts_to_langfuse()
@@ -89,7 +92,6 @@ class ChatRequest(BaseModel):
     question: str
     location_id: str = DEFAULT_LOCATION_ID
     model: str = "claude-sonnet-4.5"
-    classifier_model: str = "gpt-5-mini"
     chat_id: str | None = None  # None = create new chat
 
 
@@ -112,95 +114,59 @@ class ChatResponse(BaseModel):
 def _run_pipeline(
     question: str,
     location_id: str,
-    orchestrator_model: str,
-    classifier_model: str,
+    model: str = "claude-sonnet-4.5",
     conversation_history: list[dict] | None = None,
     on_event=None,
+    chat_id: str | None = None,
+    task_id: str | None = None,
+    extra_system: str = "",
 ) -> dict:
-    """Full pipeline: classify -> orchestrate -> query agent."""
-    emit = on_event or (lambda e, d: None)
+    """Unified pipeline: single agent handles everything."""
+    def emit(event, data):
+        _dev_log_event(event, data)
+        if on_event:
+            on_event(event, data)
 
-    all_usage: list[dict] = []
-
-    # Step 1: Classify (use full question + recent context for better classification)
-    classify_text = question
-    if conversation_history and len(conversation_history) >= 2:
-        # Include last exchange for context-aware classification
-        last_pair = conversation_history[-2:]
-        context_hint = " | ".join(m["content"][:100] for m in last_pair)
-        classify_text = f"[Contexto previo: {context_hint}] {question}"
-
-    emit("step", {"step": "classify", "message": "Clasificando intencion..."})
-    intent, classifier_usage = classify_intent(classify_text, model_id=classifier_model)
-    all_usage.append(classifier_usage)
-    emit("intent", {"intent": intent})
-
-    if intent == "complex_task":
-        # Detect specific task type
-        task_type = detect_task_type(question) or "custom"
+    # Check if this should be a background task
+    heavy_task_type = detect_heavy_task(question)
+    if heavy_task_type and not task_id:
+        # Signal the caller to create a background task.
+        emit("step", {"step": "detect", "message": f"Tarea compleja detectada: {heavy_task_type}"})
         return {
             "type": "complex_task",
             "answer": (
                 f"Esta tarea requiere procesamiento en segundo plano. "
-                f"Tipo detectado: {TASK_TYPE_NAMES.get(task_type, task_type)}. "
-                f"Se creará una tarea asíncrona automáticamente."
+                f"Tipo detectado: {TASK_TYPE_NAMES.get(heavy_task_type, heavy_task_type)}."
             ),
-            "intent": intent,
-            "task_type": task_type,
+            "task_type": heavy_task_type,
             "chart": None,
             "sources": [],
-            "model_used": classifier_model,
-            "usage": all_usage,
+            "artifacts": [],
+            "model_used": model,
+            "usage": [],
         }
 
-    # Step 2: Orchestrate (with conversation history for follow-ups)
-    emit("step", {"step": "orchestrate", "message": "Analizando pregunta..."})
-    orch_result = orchestrate(
+    emit("step", {"step": "agent", "message": "Procesando..."})
+
+    agent_result = run_agent(
         user_message=question,
         location_id=location_id,
-        model_id=orchestrator_model,
+        model_id=model,
         conversation_history=conversation_history,
-    )
-
-    all_usage.extend(orch_result.get("usage", []))
-
-    if orch_result["type"] == "direct_answer":
-        emit("step", {"step": "done", "message": "Respuesta directa"})
-        return {
-            "type": "direct_answer",
-            "answer": orch_result["answer"],
-            "chart": None,
-            "sources": [],
-            "intent": intent,
-            "model_used": orchestrator_model,
-            "usage": all_usage,
-        }
-
-    # Step 3: Query agent
-    data_requests = orch_result.get("data_requests", [])
-    chart_suggestion = orch_result.get("chart_suggestion")
-    emit("step", {"step": "query_agent", "message": f"Consultando datos ({len(data_requests)} solicitudes)...",
-                   "data_requests": [{"table": r["table"], "description": r.get("description", "")} for r in data_requests]})
-
-    agent_result = run_query_agent(
-        user_question=question,
-        data_requests=data_requests,
-        location_id=location_id,
-        model_id=orchestrator_model,
-        chart_suggestion=chart_suggestion,
         on_event=on_event,
+        chat_id=chat_id,
+        task_id=task_id,
+        extra_system=extra_system,
     )
-
-    all_usage.extend(agent_result.get("usage", []))
 
     return {
         "type": "full_answer",
-        "answer": agent_result["answer"],
+        "answer": agent_result.get("answer", ""),
         "chart": agent_result.get("chart"),
-        "sources": agent_result.get("sources", []),
-        "intent": intent,
-        "model_used": orchestrator_model,
-        "usage": all_usage,
+        "sources": agent_result.get("sources") or [],
+        "artifacts": agent_result.get("artifacts", []),
+        "model_used": model,
+        "usage": agent_result.get("usage", []),
     }
 
 
@@ -281,8 +247,9 @@ async def chat(req: ChatRequest):
     result = await loop.run_in_executor(
         None,
         lambda: _run_pipeline(
-            req.question, req.location_id, req.model, req.classifier_model,
+            req.question, req.location_id, req.model,
             conversation_history=history if history else None,
+            chat_id=chat_id,
         ),
     )
 
@@ -290,7 +257,7 @@ async def chat(req: ChatRequest):
     msg = add_message(chat_id, "assistant", result.get("answer", ""), metadata={
         "type": result.get("type"),
         "chart": result.get("chart") is not None,
-        "sources_count": len(result.get("sources", [])),
+        "sources_count": len(result.get("sources") or []),
         "model": result.get("model_used"),
     })
 
@@ -400,6 +367,60 @@ async def api_model_pricing():
 
 
 # ---------------------------------------------------------------------------
+# AI Trace endpoints — full LLM call tracing (like Langfuse, self-hosted)
+# ---------------------------------------------------------------------------
+@app.get("/api/chats/{chat_id}/traces")
+async def api_chat_traces(chat_id: str, limit: int = 200):
+    """Get all AI traces for a chat — every LLM call with inputs, outputs, tokens, latency."""
+    traces = get_chat_traces(chat_id, limit=limit)
+    return {"chat_id": chat_id, "traces": traces, "count": len(traces)}
+
+
+@app.get("/api/tasks/{task_id}/traces")
+async def api_task_traces(task_id: str, limit: int = 200):
+    """Get all AI traces for a task."""
+    traces = get_task_traces(task_id, limit=limit)
+    return {"task_id": task_id, "traces": traces, "count": len(traces)}
+
+
+@app.get("/api/traces/{trace_id}")
+async def api_get_trace(trace_id: str):
+    """Get a single trace by ID with full details."""
+    trace = get_trace(trace_id)
+    if not trace:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return trace
+
+
+@app.get("/api/traces")
+async def api_location_traces(location_id: str = DEFAULT_LOCATION_ID, days: int | None = None, limit: int = 100):
+    """Get aggregated trace stats for a location — total calls, tokens, costs, latency by model."""
+    since = None
+    if days:
+        since = time.time() - (days * 86400)
+    return get_location_traces(location_id, since=since, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# Cancel endpoints — abort in-progress chat or task operations
+# ---------------------------------------------------------------------------
+@app.post("/api/chats/{chat_id}/cancel")
+async def api_cancel_chat(chat_id: str):
+    """Cancel an in-progress chat operation. The current LLM call will stop at next iteration."""
+    request_cancel(chat_id)
+    return {"cancelled": True, "chat_id": chat_id}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def api_cancel_task_operation(task_id: str):
+    """Cancel a running task. Sub-agents stop at the next iteration checkpoint."""
+    request_cancel(task_id)
+    cancel_task(task_id)
+    return {"cancelled": True, "task_id": task_id}
+
+
+# ---------------------------------------------------------------------------
 # Task endpoints — async complex task management
 # ---------------------------------------------------------------------------
 # Track active WebSocket connections for task notifications
@@ -454,17 +475,25 @@ async def api_create_task(req: TaskRequest):
 
     # Run task in background thread
     loop = asyncio.get_event_loop()
-    loop.run_in_executor(
-        None,
-        lambda: execute_task(
-            task_id=task_id,
-            location_id=req.location_id,
-            task_type=req.task_type,
-            description=req.description,
-            model_id=req.model,
-            on_event=on_task_event,
-        ),
-    )
+    from hackathon_backend.services.lambdas.agent.core.task_executor import _get_task_guidance
+    task_guidance = _get_task_guidance(req.task_type)
+
+    def _run_task():
+        try:
+            update_task_status(task_id, "RUNNING", progress=0)
+            result = _run_pipeline(
+                req.description or f"Ejecutar tarea: {req.task_type}",
+                req.location_id, req.model,
+                on_event=on_task_event,
+                task_id=task_id,
+                extra_system=task_guidance,
+            )
+            update_task_status(task_id, "COMPLETED", progress=100,
+                               result_summary=result.get("answer", "")[:500])
+        except Exception as e:
+            update_task_status(task_id, "FAILED", error=str(e))
+
+    loop.run_in_executor(None, _run_task)
 
     return task
 
@@ -613,6 +642,11 @@ async def ws_chat(ws: WebSocket):
     await ws.accept()
     _ensure_init()
 
+    # Track active operation IDs for this connection (for cancel support)
+    _active_ops: set[str] = set()
+    # Lock for concurrent WebSocket writes (multiple parallel queries)
+    _ws_lock = asyncio.Lock()
+
     try:
         while True:
             raw = await ws.receive_text()
@@ -622,6 +656,14 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_json({"type": "error", "message": "Invalid JSON"})
                 continue
 
+            # Handle cancel command
+            if msg.get("type") == "cancel":
+                cancel_id = msg.get("chat_id") or msg.get("task_id")
+                if cancel_id:
+                    request_cancel(cancel_id)
+                    await ws.send_json({"type": "cancelled", "id": cancel_id})
+                continue
+
             question = msg.get("question", "").strip()
             if not question:
                 await ws.send_json({"type": "error", "message": "Missing 'question' field"})
@@ -629,7 +671,6 @@ async def ws_chat(ws: WebSocket):
 
             location_id = msg.get("location_id", DEFAULT_LOCATION_ID)
             model = msg.get("model", "claude-sonnet-4.5")
-            classifier_model = msg.get("classifier_model", "gpt-5-mini")
             request_id = msg.get("request_id", str(uuid.uuid4())[:8])
             chat_id = msg.get("chat_id")
 
@@ -651,76 +692,108 @@ async def ws_chat(ws: WebSocket):
             if history and history[-1]["role"] == "user":
                 history = history[:-1]
 
+            # Clear any previous cancel flag and track this operation
+            clear_cancel(chat_id)
+            _active_ops.add(chat_id)
+
+            # Thread-safe send helper (prevents interleaved JSON on concurrent queries)
+            async def _send(data: dict):
+                async with _ws_lock:
+                    await ws.send_json(data)
+
             # Send chat_id back immediately
-            await ws.send_json({"type": "chat_id", "chat_id": chat_id, "request_id": request_id})
+            await _send({"type": "chat_id", "chat_id": chat_id, "request_id": request_id})
+
+            # Capture all per-message state now (avoid closure-in-loop bug)
+            _history = history if history else None
+            _chat_id = chat_id
+            _request_id = request_id
+            _question = question
+            _location_id = location_id
+            _model = model
 
             # Event queue for async->sync bridge
             event_queue: asyncio.Queue = asyncio.Queue()
 
-            def on_event(event: str, data: dict):
+            def on_event(event: str, data: dict, _rid=_request_id):
                 """Called from sync thread — puts events on the async queue."""
                 try:
-                    event_queue.put_nowait({"type": "event", "event": event, "request_id": request_id, **data})
+                    event_queue.put_nowait({"type": "event", "event": event, "request_id": _rid, **data})
                 except Exception:
                     pass
-
-            # Capture for closure
-            _history = history if history else None
-            _chat_id = chat_id
 
             # Run pipeline in thread, forward events to WebSocket
             loop = asyncio.get_event_loop()
 
-            async def run_and_send():
+            async def run_and_send(
+                _rid=_request_id, _cid=_chat_id, _q=_question,
+                _loc=_location_id, _mdl=_model, _hist=_history,
+                _eq=event_queue, _on_evt=on_event,
+            ):
                 # Start pipeline in background thread
                 future = loop.run_in_executor(
                     None,
                     lambda: _run_pipeline(
-                        question, location_id, model, classifier_model,
-                        conversation_history=_history, on_event=on_event,
+                        _q, _loc, _mdl,
+                        conversation_history=_hist, on_event=_on_evt,
+                        chat_id=_cid,
                     ),
                 )
 
                 # Forward events while pipeline runs
                 while not future.done():
                     try:
-                        event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
-                        await ws.send_json(event)
+                        event = await asyncio.wait_for(_eq.get(), timeout=0.1)
+                        await _send(event)
                     except asyncio.TimeoutError:
                         continue
                     except Exception:
                         break
 
                 # Drain remaining events
-                while not event_queue.empty():
+                while not _eq.empty():
                     try:
-                        event = event_queue.get_nowait()
-                        await ws.send_json(event)
+                        event = _eq.get_nowait()
+                        await _send(event)
                     except Exception:
                         break
 
                 # Get result and send final response
-                result = await future
+                try:
+                    result = await future
+                except CancelledError:
+                    clear_cancel(_cid)
+                    _active_ops.discard(_cid)
+                    await _send({
+                        "type": "cancelled",
+                        "request_id": _rid,
+                        "chat_id": _cid,
+                        "message": "Operacion cancelada",
+                    })
+                    return
+
+                clear_cancel(_cid)
+                _active_ops.discard(_cid)
 
                 # Handle complex_task: create and run async task
                 if result.get("type") == "complex_task":
                     task_type = result.get("task_type", "custom")
                     task = create_task(
-                        location_id=location_id,
+                        location_id=_loc,
                         task_type=task_type,
-                        description=question,
-                        chat_id=_chat_id,
+                        description=_q,
+                        chat_id=_cid,
                     )
                     task_id = task["task_id"]
 
                     # Store classifier costs
-                    _store_pipeline_costs(result, _chat_id, location_id, None)
+                    _store_pipeline_costs(result, _cid, _loc, None)
 
                     # Notify frontend about task creation
-                    await ws.send_json({
+                    await _send({
                         "type": "task_created",
-                        "request_id": request_id,
-                        "chat_id": _chat_id,
+                        "request_id": _rid,
+                        "chat_id": _cid,
                         "task_id": task_id,
                         "task_type": task_type,
                         "task_type_name": TASK_TYPE_NAMES.get(task_type, task_type),
@@ -729,29 +802,59 @@ async def ws_chat(ws: WebSocket):
                     # Run task in background, streaming events to WS
                     task_event_queue: asyncio.Queue = asyncio.Queue()
 
-                    def on_task_event(event: str, data: dict):
+                    def on_task_event(event: str, data: dict, _r=_rid):
                         try:
-                            task_event_queue.put_nowait({"type": event, "request_id": request_id, **data})
+                            task_event_queue.put_nowait({"type": event, "request_id": _r, **data})
                         except Exception:
                             pass
 
-                    task_future = loop.run_in_executor(
-                        None,
-                        lambda: execute_task(
-                            task_id=task_id,
-                            location_id=location_id,
-                            task_type=task_type,
-                            description=question,
-                            model_id=model,
-                            on_event=on_task_event,
-                        ),
-                    )
+                    # Get task-specific guidance for the agent
+                    from hackathon_backend.services.lambdas.agent.core.task_executor import _get_task_guidance
+                    task_guidance = _get_task_guidance(task_type)
+
+                    # Mark task as running
+                    update_task_status(task_id, "RUNNING", progress=0)
+
+                    def _run_task_agent():
+                        try:
+                            on_task_event("task_progress", {"task_id": task_id, "progress": 5, "step": "Iniciando agente..."})
+                            result = _run_pipeline(
+                                _q, _loc, _mdl,
+                                conversation_history=_hist,
+                                on_event=on_task_event,
+                                chat_id=_cid,
+                                task_id=task_id,
+                                extra_system=task_guidance,
+                            )
+                            # Mark complete
+                            answer = result.get("answer", "")
+                            cost_info = check_budget(task_id) if True else {}
+                            update_task_status(task_id, "COMPLETED", progress=100, result_summary=answer[:500])
+                            on_task_event("task_completed", {
+                                "task_id": task_id,
+                                "summary": answer[:500],
+                                "artifacts": result.get("artifacts", []),
+                                "cost_usd": cost_info.get("cost_usd", 0),
+                            })
+                            return result
+                        except CancelledError:
+                            update_task_status(task_id, "CANCELLED")
+                            on_task_event("task_cancelled", {"task_id": task_id})
+                            return {"answer": "Tarea cancelada", "artifacts": [], "sources": []}
+                        except Exception as e:
+                            update_task_status(task_id, "FAILED", error=str(e))
+                            on_task_event("task_failed", {"task_id": task_id, "error": str(e)})
+                            return {"answer": "", "error": str(e), "artifacts": [], "sources": []}
+
+                    from hackathon_backend.services.lambdas.agent.core.task_manager import check_budget
+
+                    task_future = loop.run_in_executor(None, _run_task_agent)
 
                     # Forward task events to WebSocket
                     while not task_future.done():
                         try:
                             evt = await asyncio.wait_for(task_event_queue.get(), timeout=0.2)
-                            await ws.send_json(evt)
+                            await _send(evt)
                         except asyncio.TimeoutError:
                             continue
                         except Exception:
@@ -761,73 +864,73 @@ async def ws_chat(ws: WebSocket):
                     while not task_event_queue.empty():
                         try:
                             evt = task_event_queue.get_nowait()
-                            await ws.send_json(evt)
+                            await _send(evt)
                         except Exception:
                             break
 
                     task_result = await task_future
 
                     # Store assistant message
-                    answer = task_result.get("summary", result.get("answer", ""))
-                    assistant_msg = add_message(_chat_id, "assistant", answer, metadata={
+                    answer = task_result.get("answer", result.get("answer", ""))
+                    assistant_msg = add_message(_cid, "assistant", answer, metadata={
                         "type": "complex_task",
                         "task_id": task_id,
                         "task_type": task_type,
                         "artifacts": len(task_result.get("artifacts", [])),
                     })
 
-                    # Send final result with artifacts
-                    await ws.send_json({
+                    # Send final result
+                    await _send({
                         "type": "result",
-                        "request_id": request_id,
-                        "chat_id": _chat_id,
+                        "request_id": _rid,
+                        "chat_id": _cid,
                         "message_id": assistant_msg["id"],
                         "data": {
                             "type": "complex_task",
                             "answer": answer,
-                            "chart": None,
-                            "sources": task_result.get("sources", [])[:20],
-                            "intent": "complex_task",
-                            "model_used": model,
+                            "chart": task_result.get("chart"),
+                            "sources": (task_result.get("sources") or [])[:20],
+                            "model_used": _mdl,
                             "task_id": task_id,
                             "artifacts": [
-                                {"filename": a["filename"], "url": f"/api/tasks/{task_id}/artifacts/{a['filename']}"}
+                                {"filename": a.get("filename", ""), "url": a.get("url", f"/api/tasks/{task_id}/artifacts/{a.get('filename', '')}")}
                                 for a in task_result.get("artifacts", [])
                             ],
-                            "cost_usd": task_result.get("cost_usd", 0),
                         },
                     })
                 else:
                     # Normal fast_chat result
                     # Store assistant response
-                    assistant_msg = add_message(_chat_id, "assistant", result.get("answer", ""), metadata={
+                    assistant_msg = add_message(_cid, "assistant", result.get("answer", ""), metadata={
                         "type": result.get("type"),
                         "chart": result.get("chart") is not None,
-                        "sources_count": len(result.get("sources", [])),
+                        "sources_count": len(result.get("sources") or []),
                         "model": result.get("model_used"),
                     })
 
                     # Store LLM costs
-                    _store_pipeline_costs(result, _chat_id, location_id, assistant_msg["id"])
+                    _store_pipeline_costs(result, _cid, _loc, assistant_msg["id"])
 
-                    await ws.send_json({
-                        "type": "result",
-                        "request_id": request_id,
-                        "chat_id": _chat_id,
+                    await _send({
+                        "type": "response",
+                        "request_id": _rid,
+                        "chat_id": _cid,
                         "message_id": assistant_msg["id"],
-                        "data": {
-                            "type": result.get("type", ""),
-                            "answer": result.get("answer", ""),
-                            "chart": result.get("chart"),
-                            "sources": result.get("sources", []),
-                            "intent": result.get("intent", ""),
-                            "model_used": result.get("model_used", ""),
-                        },
+                        "answer": result.get("answer", ""),
+                        "chart": result.get("chart"),
+                        "sources": result.get("sources") or [],
+                        "artifacts": [
+                            {"filename": a.get("filename", ""), "url": a.get("url", "")}
+                            for a in (result.get("artifacts") or [])
+                        ],
+                        "model_used": result.get("model_used", ""),
                     })
 
                 _get_langfuse_client().flush()
 
-            await run_and_send()
+            # Run as background task so the WS loop can accept new messages
+            # in parallel (multiple concurrent queries on the same connection)
+            asyncio.create_task(run_and_send())
 
     except WebSocketDisconnect:
         pass
@@ -836,6 +939,106 @@ async def ws_chat(ws: WebSocket):
             await ws.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Dev Logs — real-time log stream via WebSocket for debugging
+# ---------------------------------------------------------------------------
+import logging
+
+# In-memory log buffer for dev panel (circular buffer, last 500 entries)
+_log_buffer: list[dict] = []
+_log_subscribers: list[asyncio.Queue] = []
+_MAX_LOG_BUFFER = 500
+
+
+class _WSLogHandler(logging.Handler):
+    """Logging handler that broadcasts to WebSocket subscribers and buffers."""
+    def emit(self, record):
+        try:
+            entry = {
+                "ts": record.created,
+                "level": record.levelname,
+                "logger": record.name,
+                "message": self.format(record),
+            }
+            _log_buffer.append(entry)
+            if len(_log_buffer) > _MAX_LOG_BUFFER:
+                _log_buffer.pop(0)
+            for q in _log_subscribers:
+                try:
+                    q.put_nowait(entry)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _setup_dev_logging():
+    """Attach the WS log handler to the root logger and key modules."""
+    handler = _WSLogHandler()
+    handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    handler.setLevel(logging.DEBUG)
+    # Attach to root and key loggers
+    for name in ("", "hackathon_backend", "litellm", "uvicorn"):
+        logging.getLogger(name).addHandler(handler)
+
+
+# Emit pipeline events to the dev log system too
+_original_noop = lambda e, d: None
+
+
+def _dev_log_event(event: str, data: dict):
+    """Write pipeline events to the dev log stream."""
+    entry = {
+        "ts": time.time(),
+        "level": "INFO",
+        "logger": "pipeline",
+        "message": f"[{event}] {data.get('message', data.get('step', json.dumps(data, default=str)[:200]))}",
+        "event": event,
+        "data": {k: v for k, v in data.items() if isinstance(v, (str, int, float, bool, type(None)))},
+    }
+    _log_buffer.append(entry)
+    if len(_log_buffer) > _MAX_LOG_BUFFER:
+        _log_buffer.pop(0)
+    for q in _log_subscribers:
+        try:
+            q.put_nowait(entry)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/logs")
+async def ws_logs(ws: WebSocket):
+    """Dev-only WebSocket: streams real-time logs for the debug panel.
+
+    On connect, sends the last 100 buffered log entries, then streams new ones.
+    """
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue()
+    _log_subscribers.append(queue)
+
+    try:
+        # Send buffered history
+        for entry in _log_buffer[-100:]:
+            await ws.send_json(entry)
+
+        # Stream new logs
+        while True:
+            entry = await queue.get()
+            await ws.send_json(entry)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _log_subscribers.remove(queue)
+
+
+@app.get("/api/logs")
+async def api_get_logs(limit: int = 100):
+    """Get recent log entries (for polling instead of WebSocket)."""
+    return {"logs": _log_buffer[-limit:], "count": len(_log_buffer)}
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,39 @@ def _get_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_costs_location ON llm_costs(location_id, timestamp)
     """)
+    # --- AI Trace Store ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ai_traces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            chat_id TEXT,
+            task_id TEXT,
+            location_id TEXT NOT NULL,
+            parent_trace_id TEXT,
+            step TEXT NOT NULL,
+            model TEXT,
+            provider TEXT,
+            input TEXT NOT NULL DEFAULT '{}',
+            output TEXT NOT NULL DEFAULT '{}',
+            tool_calls TEXT DEFAULT '[]',
+            tool_results TEXT DEFAULT '[]',
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            cost_usd REAL DEFAULT 0.0,
+            latency_ms INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'ok',
+            error TEXT,
+            metadata TEXT DEFAULT '{}',
+            started_at REAL NOT NULL,
+            completed_at REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_chat ON ai_traces(chat_id, started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_task ON ai_traces(task_id, started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_location ON ai_traces(location_id, started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON ai_traces(trace_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_parent ON ai_traces(parent_trace_id)")
     conn.commit()
     return conn
 
@@ -321,6 +354,179 @@ def get_chat_costs(chat_id: str) -> dict:
         "by_step": [dict(r) for r in by_step],
         "details": details,
     }
+
+
+# ---------------------------------------------------------------------------
+# AI Trace Store — records every LLM call with full inputs/outputs/tool calls
+# ---------------------------------------------------------------------------
+def record_trace(
+    step: str,
+    location_id: str,
+    *,
+    trace_id: str | None = None,
+    chat_id: str | None = None,
+    task_id: str | None = None,
+    parent_trace_id: str | None = None,
+    model: str = "",
+    provider: str = "",
+    input_data: dict | str | None = None,
+    output_data: dict | str | None = None,
+    tool_calls: list | None = None,
+    tool_results: list | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    cost_usd: float = 0.0,
+    latency_ms: int = 0,
+    status: str = "ok",
+    error: str | None = None,
+    metadata: dict | None = None,
+    started_at: float | None = None,
+    completed_at: float | None = None,
+) -> dict:
+    """Record a single AI trace (LLM call, tool call, or processing step)."""
+    now = time.time()
+    tid = trace_id or str(uuid.uuid4())
+
+    def _safe_json(obj):
+        if obj is None:
+            return "{}"
+        if isinstance(obj, str):
+            return obj
+        return json.dumps(obj, ensure_ascii=False, default=str)
+
+    # Truncate large inputs/outputs to keep DB manageable
+    input_str = _safe_json(input_data)
+    output_str = _safe_json(output_data)
+    if len(input_str) > 50000:
+        input_str = input_str[:50000] + "...[truncated]"
+    if len(output_str) > 50000:
+        output_str = output_str[:50000] + "...[truncated]"
+
+    if total_tokens == 0:
+        total_tokens = prompt_tokens + completion_tokens
+    if cost_usd == 0.0 and model and prompt_tokens > 0:
+        cost_usd = _estimate_cost(model, prompt_tokens, completion_tokens)
+
+    db = _get_db()
+    db.execute(
+        "INSERT INTO ai_traces (trace_id, chat_id, task_id, location_id, parent_trace_id, "
+        "step, model, provider, input, output, tool_calls, tool_results, "
+        "prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms, "
+        "status, error, metadata, started_at, completed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, chat_id, task_id, location_id, parent_trace_id,
+         step, model, provider, input_str, output_str,
+         _safe_json(tool_calls), _safe_json(tool_results),
+         prompt_tokens, completion_tokens, total_tokens, cost_usd, latency_ms,
+         status, error, _safe_json(metadata),
+         started_at or now, completed_at or now),
+    )
+    db.commit()
+    db.close()
+    return {"trace_id": tid, "step": step}
+
+
+def get_chat_traces(chat_id: str, limit: int = 200) -> list[dict]:
+    """Get all AI traces for a chat, ordered by time."""
+    db = _get_db()
+    rows = db.execute(
+        "SELECT * FROM ai_traces WHERE chat_id = ? ORDER BY started_at ASC LIMIT ?",
+        (chat_id, limit),
+    ).fetchall()
+    db.close()
+    return [_parse_trace_row(r) for r in rows]
+
+
+def get_task_traces(task_id: str, limit: int = 200) -> list[dict]:
+    """Get all AI traces for a task."""
+    db = _get_db()
+    rows = db.execute(
+        "SELECT * FROM ai_traces WHERE task_id = ? ORDER BY started_at ASC LIMIT ?",
+        (task_id, limit),
+    ).fetchall()
+    db.close()
+    return [_parse_trace_row(r) for r in rows]
+
+
+def get_trace(trace_id: str) -> dict | None:
+    """Get a single trace by ID."""
+    db = _get_db()
+    row = db.execute("SELECT * FROM ai_traces WHERE trace_id = ?", (trace_id,)).fetchone()
+    db.close()
+    return _parse_trace_row(row) if row else None
+
+
+def get_trace_children(parent_trace_id: str) -> list[dict]:
+    """Get child traces of a parent trace."""
+    db = _get_db()
+    rows = db.execute(
+        "SELECT * FROM ai_traces WHERE parent_trace_id = ? ORDER BY started_at ASC",
+        (parent_trace_id,),
+    ).fetchall()
+    db.close()
+    return [_parse_trace_row(r) for r in rows]
+
+
+def get_location_traces(location_id: str, since: float | None = None, limit: int = 100) -> dict:
+    """Get aggregated trace stats for a location."""
+    db = _get_db()
+    where = "WHERE location_id = ?"
+    params: list = [location_id]
+    if since:
+        where += " AND started_at >= ?"
+        params.append(since)
+
+    agg = db.execute(
+        f"SELECT COUNT(*) as total_calls, SUM(prompt_tokens) as prompt_tokens, "
+        f"SUM(completion_tokens) as completion_tokens, SUM(total_tokens) as total_tokens, "
+        f"SUM(cost_usd) as total_cost_usd, AVG(latency_ms) as avg_latency_ms "
+        f"FROM ai_traces {where}", params
+    ).fetchone()
+
+    by_step = db.execute(
+        f"SELECT step, COUNT(*) as calls, SUM(total_tokens) as total_tokens, "
+        f"SUM(cost_usd) as cost_usd, AVG(latency_ms) as avg_latency_ms "
+        f"FROM ai_traces {where} GROUP BY step ORDER BY cost_usd DESC", params
+    ).fetchall()
+
+    by_model = db.execute(
+        f"SELECT model, COUNT(*) as calls, SUM(total_tokens) as total_tokens, "
+        f"SUM(cost_usd) as cost_usd, AVG(latency_ms) as avg_latency_ms "
+        f"FROM ai_traces {where} AND model != '' GROUP BY model ORDER BY cost_usd DESC", params
+    ).fetchall()
+
+    recent = db.execute(
+        f"SELECT * FROM ai_traces {where} ORDER BY started_at DESC LIMIT ?",
+        params + [limit],
+    ).fetchall()
+
+    db.close()
+    return {
+        "location_id": location_id,
+        "summary": {
+            "total_calls": agg["total_calls"] or 0,
+            "prompt_tokens": agg["prompt_tokens"] or 0,
+            "completion_tokens": agg["completion_tokens"] or 0,
+            "total_tokens": agg["total_tokens"] or 0,
+            "total_cost_usd": round(agg["total_cost_usd"] or 0, 6),
+            "avg_latency_ms": round(agg["avg_latency_ms"] or 0, 1),
+        },
+        "by_step": [dict(r) for r in by_step],
+        "by_model": [dict(r) for r in by_model],
+        "recent": [_parse_trace_row(r) for r in recent],
+    }
+
+
+def _parse_trace_row(row) -> dict:
+    """Parse a trace row from SQLite into a dict with JSON fields decoded."""
+    d = dict(row)
+    for field in ("input", "output", "tool_calls", "tool_results", "metadata"):
+        try:
+            d[field] = json.loads(d.get(field, "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return d
 
 
 def get_location_costs(location_id: str, since: float | None = None) -> dict:

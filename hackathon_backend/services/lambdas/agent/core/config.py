@@ -237,9 +237,10 @@ def _apply_cache_control(model_id: str, messages: list[dict]) -> list[dict]:
                     }
                 ]
             elif isinstance(content, list):
-                # Already in blocks format — add cache_control to last block
+                # Already in blocks format — preserve existing cache_control,
+                # ensure at least the last block has it
                 blocks = [dict(b) for b in content]
-                if blocks:
+                if blocks and "cache_control" not in blocks[-1]:
                     blocks[-1]["cache_control"] = {"type": "ephemeral"}
                 msg_copy["content"] = blocks
 
@@ -259,6 +260,168 @@ def _apply_cache_control(model_id: str, messages: list[dict]) -> list[dict]:
         result.append(msg_copy)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Traced completion — auto-records every LLM call to the trace store
+# ---------------------------------------------------------------------------
+def traced_completion(
+    model_id: str,
+    messages: list[dict],
+    *,
+    step: str = "llm_call",
+    chat_id: str | None = None,
+    task_id: str | None = None,
+    location_id: str = "",
+    parent_trace_id: str | None = None,
+    trace_metadata: dict | None = None,
+    **kwargs,
+) -> Any:
+    """
+    Like completion(), but records a full trace (input/output/tool_calls/latency).
+    Use this instead of completion() for traceable calls.
+    """
+    import logging as _logging
+    import time as _time
+    import uuid as _uuid
+
+    _log = _logging.getLogger("hackathon_backend.traced")
+
+    trace_id = str(_uuid.uuid4())
+    t0 = _time.time()
+
+    _log.info(f"[{step}] Starting LLM call: model={model_id}, msgs={len(messages)}")
+
+    # Check if cancelled
+    if chat_id and is_cancelled(chat_id):
+        raise CancelledError(f"Chat {chat_id} was cancelled")
+    if task_id and is_cancelled(task_id):
+        raise CancelledError(f"Task {task_id} was cancelled")
+
+    # Extract input for trace (compact: just last user message + tool count)
+    input_summary = _extract_input_summary(messages, kwargs.get("tools"))
+
+    try:
+        response = completion(model_id, messages, **kwargs)
+
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        _log.info(f"[{step}] Completed: {elapsed_ms}ms, model={model_id}")
+        u = getattr(response, "usage", None)
+        prompt_tokens = getattr(u, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(u, "completion_tokens", 0) or 0
+        total_tokens = getattr(u, "total_tokens", 0) or 0
+
+        choice = response.choices[0] if response.choices else None
+        output_text = (choice.message.content or "")[:2000] if choice else ""
+
+        # Extract tool calls
+        tool_calls_data = []
+        if choice and choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                tool_calls_data.append({
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments[:500],
+                })
+
+        # Record trace (lazy import to avoid circular)
+        from hackathon_backend.services.lambdas.agent.core.chat_store import record_trace
+        record_trace(
+            step=step,
+            location_id=location_id,
+            trace_id=trace_id,
+            chat_id=chat_id,
+            task_id=task_id,
+            parent_trace_id=parent_trace_id,
+            model=model_id,
+            provider=AVAILABLE_MODELS.get(model_id, {}).get("model", ""),
+            input_data=input_summary,
+            output_data={"text": output_text, "finish_reason": choice.finish_reason if choice else ""},
+            tool_calls=tool_calls_data if tool_calls_data else None,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            latency_ms=elapsed_ms,
+            status="ok",
+            metadata=trace_metadata,
+            started_at=t0,
+            completed_at=_time.time(),
+        )
+
+        return response
+
+    except CancelledError:
+        raise
+    except Exception as e:
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        from hackathon_backend.services.lambdas.agent.core.chat_store import record_trace
+        record_trace(
+            step=step,
+            location_id=location_id,
+            trace_id=trace_id,
+            chat_id=chat_id,
+            task_id=task_id,
+            parent_trace_id=parent_trace_id,
+            model=model_id,
+            input_data=input_summary,
+            output_data={"error": str(e)},
+            latency_ms=elapsed_ms,
+            status="error",
+            error=str(e),
+            started_at=t0,
+            completed_at=_time.time(),
+        )
+        raise
+
+
+def _extract_input_summary(messages: list[dict], tools: list | None = None) -> dict:
+    """Extract a compact summary of the input for trace recording."""
+    summary: dict[str, Any] = {"message_count": len(messages)}
+    if tools:
+        summary["tool_count"] = len(tools)
+    # Last user message (truncated)
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content", "")
+            if isinstance(content, str):
+                summary["last_user_message"] = content[:500]
+            break
+    # System prompt (truncated)
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content", "")
+            if isinstance(content, str):
+                summary["system_prompt_len"] = len(content)
+            elif isinstance(content, list):
+                summary["system_prompt_len"] = sum(len(b.get("text", "")) for b in content if isinstance(b, dict))
+            break
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Cancellation registry — allows aborting in-progress operations
+# ---------------------------------------------------------------------------
+class CancelledError(Exception):
+    """Raised when an operation is cancelled by the user."""
+    pass
+
+
+_cancelled: set[str] = set()
+
+
+def request_cancel(operation_id: str):
+    """Mark an operation (chat_id or task_id) as cancelled."""
+    _cancelled.add(operation_id)
+
+
+def is_cancelled(operation_id: str) -> bool:
+    """Check if an operation has been cancelled."""
+    return operation_id in _cancelled
+
+
+def clear_cancel(operation_id: str):
+    """Clear the cancel flag for an operation."""
+    _cancelled.discard(operation_id)
 
 
 # ---------------------------------------------------------------------------
