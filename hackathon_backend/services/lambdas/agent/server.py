@@ -120,6 +120,8 @@ def _run_pipeline(
     chat_id: str | None = None,
     task_id: str | None = None,
     extra_system: str = "",
+    attachments: list[dict] | None = None,
+    chat_artifacts: list[dict] | None = None,
 ) -> dict:
     """Unified pipeline: single agent handles everything."""
     def emit(event, data):
@@ -157,6 +159,8 @@ def _run_pipeline(
         chat_id=chat_id,
         task_id=task_id,
         extra_system=extra_system,
+        attachments=attachments,
+        chat_artifacts=chat_artifacts,
     )
 
     return {
@@ -170,9 +174,28 @@ def _run_pipeline(
     }
 
 
+def _collect_chat_artifacts(chat_id: str) -> list[dict]:
+    """Collect all artifacts generated in previous messages of this chat."""
+    msgs = get_messages(chat_id)
+    artifacts = []
+    for m in msgs:
+        meta = m.get("metadata") or {}
+        # Artifacts stored by assistant messages
+        for a in meta.get("artifacts_list", []):
+            artifacts.append(a)
+    return artifacts
+
+
 def _store_pipeline_costs(result: dict, chat_id: str, location_id: str, message_id: int | None = None):
     """Store all LLM usage records from a pipeline run."""
     for usage in result.get("usage", []):
+        cache_read = usage.get("cache_read_tokens", 0)
+        cache_creation = usage.get("cache_creation_tokens", 0)
+        cache_meta = {}
+        if cache_read:
+            cache_meta["cache_read_tokens"] = cache_read
+        if cache_creation:
+            cache_meta["cache_creation_tokens"] = cache_creation
         record_llm_cost(
             chat_id=chat_id,
             location_id=location_id,
@@ -182,6 +205,7 @@ def _store_pipeline_costs(result: dict, chat_id: str, location_id: str, message_
             completion_tokens=usage.get("completion_tokens", 0),
             total_tokens=usage.get("total_tokens", 0),
             message_id=message_id,
+            metadata=cache_meta if cache_meta else None,
         )
 
 
@@ -674,6 +698,9 @@ async def ws_chat(ws: WebSocket):
             request_id = msg.get("request_id", str(uuid.uuid4())[:8])
             chat_id = msg.get("chat_id")
 
+            # Parse attachments: [{filename, mime_type, data (base64)}]
+            attachments = msg.get("attachments") or []
+
             # Resolve or create chat
             if not chat_id:
                 chat_data = create_chat(location_id, model=model)
@@ -684,8 +711,17 @@ async def ws_chat(ws: WebSocket):
                     chat_data = create_chat(location_id, model=model)
                     chat_id = chat_data["chat_id"]
 
-            # Store user message
-            add_message(chat_id, "user", question)
+            # Store user message (with attachment filenames in metadata, not the data)
+            user_meta = {}
+            if attachments:
+                user_meta["attachments"] = [
+                    {"filename": a.get("filename", ""), "mime_type": a.get("mime_type", "")}
+                    for a in attachments
+                ]
+            add_message(chat_id, "user", question, metadata=user_meta if user_meta else None)
+
+            # Collect artifacts from previous messages in this chat
+            chat_artifacts = _collect_chat_artifacts(chat_id)
 
             # Build conversation context (exclude the message we just added)
             history = build_context_window(chat_id)
@@ -711,6 +747,8 @@ async def ws_chat(ws: WebSocket):
             _question = question
             _location_id = location_id
             _model = model
+            _attachments = attachments if attachments else None
+            _chat_artifacts = chat_artifacts if chat_artifacts else None
 
             # Event queue for async->sync bridge
             event_queue: asyncio.Queue = asyncio.Queue()
@@ -729,6 +767,7 @@ async def ws_chat(ws: WebSocket):
                 _rid=_request_id, _cid=_chat_id, _q=_question,
                 _loc=_location_id, _mdl=_model, _hist=_history,
                 _eq=event_queue, _on_evt=on_event,
+                _att=_attachments, _cart=_chat_artifacts,
             ):
                 # Start pipeline in background thread
                 future = loop.run_in_executor(
@@ -737,6 +776,7 @@ async def ws_chat(ws: WebSocket):
                         _q, _loc, _mdl,
                         conversation_history=_hist, on_event=_on_evt,
                         chat_id=_cid,
+                        attachments=_att, chat_artifacts=_cart,
                     ),
                 )
 
@@ -825,6 +865,7 @@ async def ws_chat(ws: WebSocket):
                                 chat_id=_cid,
                                 task_id=task_id,
                                 extra_system=task_guidance,
+                                attachments=_att, chat_artifacts=_cart,
                             )
                             # Mark complete
                             answer = result.get("answer", "")
@@ -870,14 +911,21 @@ async def ws_chat(ws: WebSocket):
 
                     task_result = await task_future
 
-                    # Store assistant message
+                    # Store assistant message (include artifacts_list for edit-back)
                     answer = task_result.get("answer", result.get("answer", ""))
-                    assistant_msg = add_message(_cid, "assistant", answer, metadata={
+                    task_artifacts = task_result.get("artifacts") or []
+                    task_meta = {
                         "type": "complex_task",
                         "task_id": task_id,
                         "task_type": task_type,
-                        "artifacts": len(task_result.get("artifacts", [])),
-                    })
+                        "artifacts": len(task_artifacts),
+                    }
+                    if task_artifacts:
+                        task_meta["artifacts_list"] = [
+                            {"filename": a.get("filename", ""), "task_id": a.get("task_id", ""), "url": a.get("url", "")}
+                            for a in task_artifacts
+                        ]
+                    assistant_msg = add_message(_cid, "assistant", answer, metadata=task_meta)
 
                     # Send final result
                     await _send({
@@ -900,13 +948,20 @@ async def ws_chat(ws: WebSocket):
                     })
                 else:
                     # Normal fast_chat result
-                    # Store assistant response
-                    assistant_msg = add_message(_cid, "assistant", result.get("answer", ""), metadata={
+                    # Store assistant response (include artifacts_list for edit-back)
+                    result_artifacts = result.get("artifacts") or []
+                    assistant_meta = {
                         "type": result.get("type"),
                         "chart": result.get("chart") is not None,
                         "sources_count": len(result.get("sources") or []),
                         "model": result.get("model_used"),
-                    })
+                    }
+                    if result_artifacts:
+                        assistant_meta["artifacts_list"] = [
+                            {"filename": a.get("filename", ""), "task_id": a.get("task_id", ""), "url": a.get("url", "")}
+                            for a in result_artifacts
+                        ]
+                    assistant_msg = add_message(_cid, "assistant", result.get("answer", ""), metadata=assistant_meta)
 
                     # Store LLM costs
                     _store_pipeline_costs(result, _cid, _loc, assistant_msg["id"])

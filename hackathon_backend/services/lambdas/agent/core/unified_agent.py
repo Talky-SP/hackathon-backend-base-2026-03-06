@@ -169,11 +169,18 @@ TOOLS:
 - `dynamo_query`: Query DynamoDB tables. locationId is auto-enforced.
 - `run_analysis`: Execute Python code on fetched data. Access `data` dict with query results.
 - `generate_file`: Generate Excel/CSV/chart files via AI code execution sandbox.
+- `edit_file`: Edit a previously generated file (Excel, etc.). Needs task_id + filename from context.
+
+MULTIMODAL INPUT:
+- Users can attach images (PNG, JPG) and PDFs. They are sent natively — you can see and analyze them.
+- For attached invoices/receipts: extract key data (amounts, dates, supplier, line items).
+- For attached PDFs: read and analyze the full document content.
 
 WORKFLOW:
 1. Simple questions (what is X, explain Y): Answer directly, no tools needed.
 2. Data questions (how much, top N, list of): Query DB → run_analysis → return answer with chart.
 3. Complex tasks (forecast, reports, modelo 303): Query DB → run_analysis → generate_file for Excel.
+4. Edit previous file: User asks to modify a generated Excel → use edit_file with the task_id/filename.
 
 RULES:
 - Use GSIs, never full scans. Date queries → UserIdInvoiceDateIndex. Supplier → UserIdSupplierCifIndex.
@@ -204,7 +211,9 @@ result = {
 }
 ```
 
-For file generation (Excel, reports), call generate_file with a detailed prompt and the data as JSON.
+IMPORTANT: When user asks for a downloadable file (Excel, CSV, PDF), you MUST call generate_file \
+directly with the data. Do NOT use run_analysis to produce an "answer" — that will end the \
+conversation without creating a file. Instead: dynamo_query → generate_file (pass data as data_json).
 
 NUMBER FORMATTING: Use Spanish format in answer text (1.234,56 EUR). Keep raw numbers in chart data.
 TODAY'S DATE: 2026-03-21."""
@@ -566,7 +575,7 @@ def run_agent(
         if task_id:
             from hackathon_backend.services.lambdas.agent.core.chat_store import _estimate_cost
             from hackathon_backend.services.lambdas.agent.core.task_manager import add_task_cost, check_budget
-            cost = _estimate_cost(model_id, prompt_tokens, completion_tokens)
+            cost = _estimate_cost(model_id, prompt_tokens, completion_tokens, cache_read, cache_creation)
             add_task_cost(task_id, total_tokens, cost)
             budget = check_budget(task_id)
             if not budget.get("ok"):
@@ -782,6 +791,105 @@ def run_agent(
                     emit("file_generated", {
                         "message": "Error generando archivo, reintentando...",
                         "success": False,
+                    })
+
+                messages.append({
+                    "role": "tool", "tool_call_id": tool_call.id,
+                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
+                })
+
+            elif fn_name == "edit_file":
+                edit_task_id = args.get("task_id", "")
+                edit_filename = args.get("filename", "")
+                edit_prompt = args.get("prompt", "")
+
+                emit("generating", {
+                    "message": f"Editando archivo {edit_filename}...",
+                    "detail": edit_prompt[:100],
+                    "model": model_id,
+                })
+
+                # Find the existing file on disk
+                existing_path = os.path.join(ARTIFACTS_DIR, edit_task_id, edit_filename)
+                if not os.path.isfile(existing_path):
+                    messages.append({
+                        "role": "tool", "tool_call_id": tool_call.id,
+                        "content": json.dumps({
+                            "error": f"File not found: {edit_filename} (task_id={edit_task_id})"
+                        }),
+                    })
+                    continue
+
+                # Read existing file as base64 for the code sandbox
+                import base64 as _b64
+                with open(existing_path, "rb") as fh:
+                    file_b64 = _b64.b64encode(fh.read()).decode()
+                file_size = os.path.getsize(existing_path)
+
+                # Build prompt for code execution: edit the existing file
+                edit_code_prompt = (
+                    f"You are editing an EXISTING file: {edit_filename} ({file_size} bytes).\n"
+                    f"The file is provided as base64 in the variable EXISTING_FILE_B64.\n"
+                    f"First decode it and load it, then apply the following edits:\n\n"
+                    f"{edit_prompt}\n\n"
+                    f"Save the modified file with the SAME filename."
+                )
+
+                emit("code_exec_start", {
+                    "message": f"Editando {edit_filename} con AI code execution...",
+                    "task_id": edit_task_id,
+                })
+
+                code_result = _native_code_exec(
+                    prompt=edit_code_prompt,
+                    model_id=model_id,
+                    data_context=json.dumps({
+                        "EXISTING_FILE_B64": file_b64,
+                        "filename": edit_filename,
+                        **(json.loads(args["data_json"]) if args.get("data_json") else {}),
+                    }),
+                    task_id=edit_task_id,
+                    system_prompt=CODE_EXEC_SYSTEM,
+                )
+
+                # Track usage
+                if code_result.get("usage"):
+                    cu = code_result["usage"]
+                    if isinstance(cu, dict):
+                        usage_records.append(cu)
+                    elif isinstance(cu, list):
+                        usage_records.extend(cu)
+
+                # Collect edited artifacts
+                file_response = {
+                    "success": code_result.get("success", False),
+                    "files": [],
+                    "text": code_result.get("text", "")[:500],
+                    "edited": True,
+                }
+                for f in code_result.get("files", []):
+                    artifact = {
+                        "filename": f["filename"],
+                        "path": f["path"],
+                        "task_id": edit_task_id,
+                        "type": f.get("type", "excel"),
+                        "size_bytes": f.get("size_bytes", 0),
+                        "url": f"/api/tasks/{edit_task_id}/artifacts/{f['filename']}",
+                        "edited": True,
+                    }
+                    artifacts.append(artifact)
+                    file_response["files"].append({
+                        "filename": f["filename"],
+                        "url": artifact["url"],
+                    })
+
+                if code_result.get("files"):
+                    fnames = [f["filename"] for f in code_result["files"]]
+                    emit("file_generated", {
+                        "message": f"Archivo editado: {', '.join(fnames)}",
+                        "files": fnames,
+                        "success": True,
+                        "edited": True,
                     })
 
                 messages.append({

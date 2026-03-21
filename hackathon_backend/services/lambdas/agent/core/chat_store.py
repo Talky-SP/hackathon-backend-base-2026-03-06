@@ -266,13 +266,35 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
 }
 
 
-def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Estimate USD cost from token counts."""
+def _estimate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
+    """Estimate USD cost from token counts, accounting for Anthropic cache pricing.
+
+    Cache read: 90% discount (0.1x input price)
+    Cache write: 25% premium (1.25x input price)
+    Non-cached input: standard price
+    """
     pricing = MODEL_PRICING.get(model, {"input": 1.0, "output": 5.0})
-    return round(
-        (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1_000_000,
-        6,
-    )
+    input_price = pricing["input"]
+
+    # Separate cached vs non-cached input tokens
+    non_cached_input = prompt_tokens - cache_read_tokens - cache_creation_tokens
+    if non_cached_input < 0:
+        non_cached_input = 0
+
+    input_cost = (
+        non_cached_input * input_price
+        + cache_read_tokens * input_price * 0.1       # 90% discount
+        + cache_creation_tokens * input_price * 1.25   # 25% premium
+    ) / 1_000_000
+    output_cost = completion_tokens * pricing["output"] / 1_000_000
+
+    return round(input_cost + output_cost, 6)
 
 
 def record_llm_cost(
