@@ -6,6 +6,7 @@ from aws_cdk import (
 from constructs import Construct
 from hackathon_backend.config.environments import Config
 from hackathon_backend.constructs.api_gateway.trial_api import TrialApi
+from hackathon_backend.constructs.api_gateway.agent_api import AgentRestApi, AgentWebSocketApi
 from hackathon_backend.services.api_gateway.trial.trial_api_service import TrialApiService
 
 
@@ -22,7 +23,7 @@ class ApiStack(Stack):
 
         self.config = config
 
-        # Create API
+        # --- Trial API (REST API v1) ---
         trial_api = TrialApi(self, "TrialApi", config=config)
 
         # Cognito authorizer (cross-account import)
@@ -37,7 +38,7 @@ class ApiStack(Stack):
                 authorizer_name=config.resource_name("CognitoAuth"),
             )
 
-        # Wire routes
+        # Wire trial routes
         get_fn = getattr(lambda_stack, "get_items_function", None)
         create_fn = getattr(lambda_stack, "create_item_function", None)
 
@@ -50,3 +51,20 @@ class ApiStack(Stack):
         )
 
         self.api = trial_api.api
+
+        # --- Agent APIs ---
+        agent_fn = getattr(lambda_stack, "agent_function", None)
+        if agent_fn:
+            # REST API (HTTP API v2) for /api/* endpoints
+            self.agent_rest_api = AgentRestApi(
+                self, "AgentRestApi",
+                config=config,
+                handler=agent_fn,
+            )
+
+            # WebSocket API for real-time chat
+            self.agent_ws_api = AgentWebSocketApi(
+                self, "AgentWsApi",
+                config=config,
+                handler=agent_fn,
+            )

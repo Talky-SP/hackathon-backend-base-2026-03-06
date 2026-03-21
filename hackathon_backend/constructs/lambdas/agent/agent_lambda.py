@@ -1,0 +1,107 @@
+"""
+Agent Lambda construct — Docker-based Lambda for the AI CFO Agent.
+
+Uses ECR container image built from the agent Dockerfile.
+Needs access to: DynamoDB (data tables + agent store + WS connections),
+                  S3 (artifacts), Secrets Manager (API keys).
+"""
+from aws_cdk import (
+    Duration,
+    Tags,
+    aws_lambda as _lambda,
+    aws_ecr_assets as ecr_assets,
+    aws_iam as iam,
+    aws_s3 as s3,
+    aws_dynamodb as dynamodb,
+    aws_logs as logs,
+)
+from constructs import Construct
+from hackathon_backend.config.environments import Config
+
+
+class AgentLambda(Construct):
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        config: Config,
+        agent_table: dynamodb.ITable,
+        ws_connections_table: dynamodb.ITable,
+        artifacts_bucket: s3.IBucket,
+        data_table_names: dict[str, str],
+    ):
+        super().__init__(scope, construct_id)
+
+        self.config = config
+
+        # Docker image from the agent Dockerfile
+        docker_image = _lambda.DockerImageCode.from_image_asset(
+            directory=".",  # Root of the project (contains Dockerfile and hackathon_backend/)
+            file="hackathon_backend/services/lambdas/agent/Dockerfile",
+            platform=ecr_assets.Platform.LINUX_AMD64,
+        )
+
+        # Environment variables
+        env_vars = {
+            "AGENT_TABLE_NAME": agent_table.table_name,
+            "WS_CONNECTIONS_TABLE": ws_connections_table.table_name,
+            "ARTIFACTS_BUCKET": artifacts_bucket.bucket_name,
+            "AWS_REGION_NAME": config.region,
+            "ENV": config.stage,
+            "LOG_LEVEL": config.log_level,
+            # Data table names (for DynamoDB queries)
+            **{f"TABLE_{k.upper()}": v for k, v in data_table_names.items()},
+        }
+
+        self.function = _lambda.DockerImageFunction(
+            self, "AgentFunction",
+            code=docker_image,
+            function_name=config.resource_name("Agent"),
+            memory_size=2048,  # Agent needs more memory for LLM processing
+            timeout=Duration.seconds(config.lambda_timeout_seconds),  # 15 min
+            environment=env_vars,
+            log_retention=logs.RetentionDays.TWO_WEEKS,
+            architecture=_lambda.Architecture.X86_64,
+        )
+
+        # Grant DynamoDB permissions
+        agent_table.grant_read_write_data(self.function)
+        ws_connections_table.grant_read_write_data(self.function)
+
+        # Grant S3 permissions
+        artifacts_bucket.grant_read_write(self.function)
+
+        # Grant Secrets Manager read access (for API keys)
+        self.function.add_to_role_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["secretsmanager:GetSecretValue"],
+            resources=[
+                f"arn:aws:secretsmanager:{config.region}:{config.account_id}:secret:talky/*",
+                f"arn:aws:secretsmanager:{config.region}:{config.account_id}:secret:Azure/*",
+            ],
+        ))
+
+        # Grant DynamoDB read on all data tables (for the agent to query)
+        self.function.add_to_role_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=[
+                "dynamodb:GetItem",
+                "dynamodb:Query",
+                "dynamodb:Scan",
+                "dynamodb:BatchGetItem",
+            ],
+            resources=[
+                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{config.resource_name('*')}",
+                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{config.resource_name('*')}/index/*",
+            ],
+        ))
+
+        # Grant API Gateway management (for WebSocket post_to_connection)
+        self.function.add_to_role_policy(iam.PolicyStatement(
+            effect=iam.Effect.ALLOW,
+            actions=["execute-api:ManageConnections"],
+            resources=["arn:aws:execute-api:*:*:*/@connections/*"],
+        ))
+
+        for k, v in config.get_tags().items():
+            Tags.of(self.function).add(k, v)

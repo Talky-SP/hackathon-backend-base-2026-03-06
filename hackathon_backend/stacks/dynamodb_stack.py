@@ -18,6 +18,8 @@ from hackathon_backend.constructs.databases.user_invoice_category_configs import
 from hackathon_backend.constructs.databases.document_ibans import DocumentIbansTable
 from hackathon_backend.constructs.databases.daily_stats import DailyStatsTable
 from hackathon_backend.constructs.databases.monthly_stats import MonthlyStatsTable
+from hackathon_backend.constructs.databases.agent_store import AgentStoreTable
+from hackathon_backend.constructs.databases.ws_connections import WsConnectionsTable
 
 
 class DynamoDBStack(Stack):
@@ -93,3 +95,14 @@ class DynamoDBStack(Stack):
         # 16. Monthly_Stats
         monthly_stats = MonthlyStatsTable(self, "MonthlyStatsTable", config=config)
         self.monthly_stats_table = monthly_stats.table
+
+        # ---------------------------------------------------------------------------
+        # Agent tables
+        # ---------------------------------------------------------------------------
+        # 17. Agent_Store — single-table for chats, messages, costs, traces, tasks
+        agent_store = AgentStoreTable(self, "AgentStoreTable", config=config)
+        self.agent_store_table = agent_store.table
+
+        # 18. WS_Connections — WebSocket connection tracking
+        ws_connections = WsConnectionsTable(self, "WsConnectionsTable", config=config)
+        self.ws_connections_table = ws_connections.table

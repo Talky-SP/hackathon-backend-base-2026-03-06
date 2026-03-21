@@ -1,0 +1,12 @@
+# Agent Lambda runtime dependencies
+boto3>=1.34.0
+botocore>=1.34.0
+litellm>=1.30.0
+langfuse>=4.0.0
+fastapi>=0.110.0
+mangum>=0.17.0
+pydantic>=2.0.0
+openpyxl>=3.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
