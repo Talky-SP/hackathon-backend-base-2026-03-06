@@ -15,6 +15,9 @@ Server endpoints:
 - **Chat Costs**: `GET /api/chats/{id}/costs` (AI cost breakdown per chat)
 - **User Costs**: `GET /api/costs?location_id=X` (AI cost summary per user)
 - **Model Pricing**: `GET /api/costs/models` (pricing table)
+- **Tasks**: `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/{id}`, `DELETE /api/tasks/{id}`
+- **Task Artifacts**: `GET /api/tasks/{id}/artifacts/{filename}` (download Excel/PDF)
+- **Task Types**: `GET /api/tasks/types` (available task types with budgets)
 - **Models**: `GET http://localhost:8000/api/models`
 - **Health**: `GET http://localhost:8000/api/health`
 - **Swagger**: `http://localhost:8000/docs`
@@ -785,7 +788,187 @@ async function loadChatCostDetail(chatId) {
 
 ---
 
-## 12. Error Handling
+## 12. Complex Tasks (Deep Agent)
+
+For heavy tasks (Cash Flow Forecast, Modelo 303, reporting, audits), the system uses async background tasks with sub-agents.
+
+### How it works
+
+```
+1. User sends question → Classifier detects "complex_task"
+2. Server creates a Task → runs sub-agents in parallel
+3. Sub-agents query DynamoDB + analyze data
+4. Synthesizer produces final output
+5. Excel artifacts generated and downloadable
+```
+
+### Task types
+
+```
+GET /api/tasks/types
+```
+Response:
+```json
+{
+    "types": [
+        {"id": "cash_flow_forecast", "name": "Previsión de Tesorería (13 semanas)", "cost_budget_usd": 1.0, "max_agents": 4, "timeout_s": 300},
+        {"id": "pack_reporting", "name": "Pack Reporting Mensual", "cost_budget_usd": 1.5, "max_agents": 5, "timeout_s": 600},
+        {"id": "modelo_303", "name": "Borrador Modelo 303 (IVA)", "cost_budget_usd": 0.8, "max_agents": 3, "timeout_s": 300},
+        {"id": "aging_analysis", "name": "Análisis de Antigüedad (Aging)", "cost_budget_usd": 0.5, "max_agents": 2, "timeout_s": 180},
+        {"id": "client_profitability", "name": "Rentabilidad por Cliente", "cost_budget_usd": 1.0, "max_agents": 4, "timeout_s": 300},
+        {"id": "custom", "name": "Tarea Personalizada", "cost_budget_usd": 2.0, "max_agents": 5, "timeout_s": 600}
+    ]
+}
+```
+
+### Create a task (REST)
+
+```javascript
+const response = await fetch('/api/tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        task_type: "cash_flow_forecast",
+        description: "Genera la previsión de tesorería de las próximas 13 semanas",
+        location_id: "deloitte-84",
+        chat_id: "optional-chat-id",   // Link task to a chat
+        model: "claude-sonnet-4.5"
+    })
+});
+const task = await response.json();
+// task.task_id → use for polling
+```
+
+### Poll task status
+
+```javascript
+// Poll every 3-5 seconds while task is running
+const task = await fetch(`/api/tasks/${taskId}`).then(r => r.json());
+```
+
+Response:
+```json
+{
+    "task_id": "d6b9426b-...",
+    "task_type": "cash_flow_forecast",
+    "task_type_name": "Previsión de Tesorería (13 semanas)",
+    "status": "COMPLETED",
+    "progress": 100,
+    "cost_usd": 0.2378,
+    "cost_budget_usd": 1.0,
+    "total_tokens": 47639,
+    "result_summary": "Previsión de tesorería generada para las próximas 13 semanas...",
+    "artifacts": [
+        {"filename": "cash_flow_forecast_13w.xlsx", "type": "excel", "size_bytes": 7255}
+    ],
+    "steps": [
+        {"step_number": 1, "status": "COMPLETED", "description": "Consultar facturas pendientes de pago"},
+        {"step_number": 2, "status": "COMPLETED", "description": "Consultar facturas pendientes de cobro"},
+        {"step_number": 3, "status": "COMPLETED", "description": "Consultar nóminas recientes"},
+        {"step_number": 4, "status": "COMPLETED", "description": "Consultar transacciones bancarias"}
+    ]
+}
+```
+
+Task statuses: `PENDING` → `RUNNING` → `COMPLETED` | `FAILED` | `CANCELLED`
+
+### Download artifacts
+
+```javascript
+// List artifacts
+const { artifacts } = await fetch(`/api/tasks/${taskId}/artifacts`).then(r => r.json());
+
+// Download Excel
+const blob = await fetch(`/api/tasks/${taskId}/artifacts/${artifacts[0].filename}`).then(r => r.blob());
+const url = URL.createObjectURL(blob);
+const a = document.createElement('a');
+a.href = url;
+a.download = artifacts[0].filename;
+a.click();
+```
+
+### WebSocket task events
+
+When a complex task is triggered via WebSocket (user asks a question that's classified as `complex_task`), the server sends these events:
+
+```javascript
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    // Task was created
+    if (msg.type === 'task_created') {
+        showTaskBanner(msg.task_id, msg.task_type_name);
+    }
+
+    // Progress updates (during task execution)
+    if (msg.type === 'task_progress') {
+        updateProgress(msg.task_id, msg.progress, msg.step);
+    }
+
+    // Task completed — result includes artifacts
+    if (msg.type === 'result' && msg.data.type === 'complex_task') {
+        hideProgress();
+        showAnswer(msg.data.answer);
+        // Show download buttons for artifacts
+        msg.data.artifacts.forEach(a => {
+            showDownloadButton(a.filename, a.url);
+        });
+        showCost(msg.data.cost_usd);
+    }
+
+    // Task failed
+    if (msg.type === 'task_failed') {
+        showError(msg.error);
+    }
+};
+```
+
+### List tasks for sidebar
+
+```javascript
+const { tasks } = await fetch('/api/tasks?location_id=deloitte-84').then(r => r.json());
+// tasks: [{task_id, task_type, task_type_name, status, progress, cost_usd, artifacts, ...}]
+```
+
+### Cancel a running task
+
+```javascript
+await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+```
+
+### Get step-by-step trace
+
+```
+GET /api/tasks/{task_id}/steps
+```
+Returns detailed execution trace for each sub-agent step (useful for debugging/auditing).
+
+### Cost guardrails
+
+Each task type has a cost budget. If the budget is exceeded during execution, the task stops gracefully and returns partial results. The budgets are:
+
+| Task Type | Budget | Max Agents | Timeout |
+|-----------|--------|------------|---------|
+| Cash Flow Forecast | $1.00 | 4 | 5 min |
+| Pack Reporting | $1.50 | 5 | 10 min |
+| Modelo 303 | $0.80 | 3 | 5 min |
+| Aging Analysis | $0.50 | 2 | 3 min |
+| Client Profitability | $1.00 | 4 | 5 min |
+| Custom | $2.00 | 5 | 10 min |
+
+### Example queries that trigger complex tasks
+
+| Query | Task Type | Output |
+|-------|-----------|--------|
+| "Genera la previsión de tesorería" | cash_flow_forecast | Excel 13-week forecast |
+| "Prepara el pack reporting mensual" | pack_reporting | Multi-sheet Excel (P&L, KPIs) |
+| "Genera el borrador del Modelo 303" | modelo_303 | Excel matching official form |
+| "Análisis de antigüedad de cobros" | aging_analysis | Excel aging matrix |
+| "Rentabilidad por cliente" | client_profitability | Excel margin analysis |
+
+---
+
+## 13. Error Handling
 
 ```javascript
 ws.onerror = (error) => {

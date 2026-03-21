@@ -15,6 +15,27 @@ from hackathon_backend.services.lambdas.agent.core.prompts import get_prompt
 
 IntentType = Literal["fast_chat", "complex_task"]
 
+# Maps complex_task sub-types to task_type for the task executor
+COMPLEX_TASK_KEYWORDS: dict[str, list[str]] = {
+    "cash_flow_forecast": ["prevision tesoreria", "prevision de tesoreria", "cash flow", "flujo de caja", "prevision de caja", "13 semanas", "forecast tesoreria"],
+    "pack_reporting": ["pack reporting", "reporting mensual", "p&l mensual", "cuenta resultados", "balance mensual"],
+    "modelo_303": ["modelo 303", "iva trimestral", "liquidacion iva", "borrador 303"],
+    "aging_analysis": ["aging", "antiguedad", "cobros pendientes", "deuda por antiguedad", "facturas vencidas"],
+    "client_profitability": ["rentabilidad cliente", "rentabilidad por cliente", "margen por cliente"],
+    "modelo_347": ["modelo 347", "terceros 3005", "declaracion terceros"],
+    "three_way_matching": ["three way matching", "cruce tres vias", "albaranes facturas"],
+}
+
+
+def detect_task_type(user_message: str) -> str | None:
+    """Detect specific complex task type from keywords."""
+    msg_lower = user_message.lower()
+    for task_type, keywords in COMPLEX_TASK_KEYWORDS.items():
+        for kw in keywords:
+            if kw in msg_lower:
+                return task_type
+    return None
+
 
 @observe(name="classify_intent")
 def classify_intent(

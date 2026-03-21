@@ -89,6 +89,25 @@ def _extract_source(item: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 STAGE = os.getenv("TABLE_ENV_PREFIX", "Dev")
 
+# Fields to keep when sending DynamoDB items to LLM (strip heavy fields)
+KEEP_FIELDS = {
+    "userId", "locationId", "categoryDate", "category", "concept",
+    "total", "importe", "ivas", "supplier", "supplier_cif",
+    "client_name", "client_cif", "invoice_date", "due_date", "pnl_date",
+    "charge_date", "reconciled", "amount_due", "amount_paid",
+    "documentKind", "vatTotalAmount", "vatDeductibleAmount",
+    "vatNonDeductibleAmount", "vatOperationType", "retencion", "invoice_number",
+    "accountingEntries", "all_products",
+    "recon_state_date", "invoice_supplier_id",
+    "nombre", "cif", "trade_name", "facturas", "provincia",
+    "emails", "phones", "website",
+    "amount", "bookingDate", "description", "merchant", "status",
+    "transactionId", "SK", "matched_expense_id", "matched_invoice_id",
+    "employee_nif", "org_cif", "payroll_info", "payroll_date",
+    "employeeNif", "name", "position",
+    "dayKey", "monthKey",
+}
+
 
 @observe(name="dynamo_query")
 def _execute_query(
@@ -651,29 +670,6 @@ def run_query_agent(
                 else:
                     # Send items but truncate if too many
                     items_for_llm = result["items"][:50]
-                    # Strip heavy fields for the LLM context
-                    KEEP_FIELDS = {
-                        "userId", "locationId", "categoryDate", "category", "concept",
-                        "total", "importe", "ivas", "supplier", "supplier_cif",
-                        "client_name", "client_cif", "invoice_date", "due_date", "pnl_date",
-                        "charge_date", "reconciled", "amount_due", "amount_paid",
-                        "documentKind", "vatTotalAmount", "vatDeductibleAmount",
-                        "vatOperationType", "retencion", "invoice_number",
-                        "accountingEntries", "all_products",
-                        "recon_state_date", "invoice_supplier_id",
-                        # Providers/Customers
-                        "nombre", "cif", "trade_name", "facturas", "provincia",
-                        "emails", "phones", "website",
-                        # Bank
-                        "amount", "bookingDate", "description", "merchant", "status",
-                        "transactionId", "SK", "matched_expense_id", "matched_invoice_id",
-                        # Payroll
-                        "employee_nif", "org_cif", "payroll_info", "payroll_date",
-                        # Employees
-                        "employeeNif", "name", "position",
-                        # Stats
-                        "dayKey", "monthKey",
-                    }
                     slim_items = []
                     for it in items_for_llm:
                         slim = {k: v for k, v in it.items() if k in KEEP_FIELDS}

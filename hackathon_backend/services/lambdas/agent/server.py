@@ -35,7 +35,7 @@ from hackathon_backend.services.lambdas.agent.core.config import (
     AVAILABLE_MODELS,
 )
 from hackathon_backend.services.lambdas.agent.core.prompts import sync_prompts_to_langfuse
-from hackathon_backend.services.lambdas.agent.core.classifier import classify_intent
+from hackathon_backend.services.lambdas.agent.core.classifier import classify_intent, detect_task_type
 from hackathon_backend.services.lambdas.agent.core.orchestrator import orchestrate
 from hackathon_backend.services.lambdas.agent.core.query_agent import run_query_agent
 from hackathon_backend.services.lambdas.agent.core.chat_store import (
@@ -43,6 +43,12 @@ from hackathon_backend.services.lambdas.agent.core.chat_store import (
     add_message, get_messages, build_context_window,
     record_llm_cost, get_chat_costs, get_location_costs,
 )
+from hackathon_backend.services.lambdas.agent.core.task_manager import (
+    create_task, get_task, list_tasks, update_task_status, cancel_task,
+    get_task_steps, TASK_TYPE_NAMES, TASK_COST_LIMITS,
+)
+from hackathon_backend.services.lambdas.agent.core.task_executor import execute_task
+from hackathon_backend.services.lambdas.agent.core.tools.excel_gen import list_artifacts, get_artifact_path
 
 from langfuse import observe, get_client as _get_langfuse_client
 
@@ -127,13 +133,17 @@ def _run_pipeline(
     emit("intent", {"intent": intent})
 
     if intent == "complex_task":
+        # Detect specific task type
+        task_type = detect_task_type(question) or "custom"
         return {
             "type": "complex_task",
             "answer": (
-                "Esta es una tarea compleja que requiere procesamiento en segundo plano. "
-                "Por ahora, solo se soportan consultas rapidas (fast_chat)."
+                f"Esta tarea requiere procesamiento en segundo plano. "
+                f"Tipo detectado: {TASK_TYPE_NAMES.get(task_type, task_type)}. "
+                f"Se creará una tarea asíncrona automáticamente."
             ),
             "intent": intent,
+            "task_type": task_type,
             "chart": None,
             "sources": [],
             "model_used": classifier_model,
@@ -387,6 +397,148 @@ async def api_model_pricing():
 
 
 # ---------------------------------------------------------------------------
+# Task endpoints — async complex task management
+# ---------------------------------------------------------------------------
+# Track active WebSocket connections for task notifications
+_task_ws_connections: dict[str, list[WebSocket]] = {}
+
+
+class TaskRequest(BaseModel):
+    task_type: str
+    description: str = ""
+    location_id: str = DEFAULT_LOCATION_ID
+    chat_id: str | None = None
+    model: str = "claude-sonnet-4.5"
+
+
+@app.get("/api/tasks/types")
+async def api_task_types():
+    """List available task types with their cost budgets."""
+    return {
+        "types": [
+            {
+                "id": tid,
+                "name": TASK_TYPE_NAMES.get(tid, tid),
+                "cost_budget_usd": limits["max_usd"],
+                "max_agents": limits["max_agents"],
+                "timeout_s": limits["timeout_s"],
+            }
+            for tid, limits in TASK_COST_LIMITS.items()
+        ]
+    }
+
+
+@app.post("/api/tasks")
+async def api_create_task(req: TaskRequest):
+    """Create and start a complex task. Runs in background."""
+    _ensure_init()
+
+    task = create_task(
+        location_id=req.location_id,
+        task_type=req.task_type,
+        description=req.description,
+        chat_id=req.chat_id,
+    )
+    task_id = task["task_id"]
+
+    # Store user message in chat if chat_id provided
+    if req.chat_id:
+        add_message(req.chat_id, "user", req.description or f"[Tarea: {req.task_type}]")
+
+    # Event callback that forwards to WebSocket connections
+    def on_task_event(event: str, data: dict):
+        pass  # For REST, events are polled via GET /api/tasks/{id}
+
+    # Run task in background thread
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        None,
+        lambda: execute_task(
+            task_id=task_id,
+            location_id=req.location_id,
+            task_type=req.task_type,
+            description=req.description,
+            model_id=req.model,
+            on_event=on_task_event,
+        ),
+    )
+
+    return task
+
+
+@app.get("/api/tasks")
+async def api_list_tasks(location_id: str = DEFAULT_LOCATION_ID, limit: int = 50):
+    """List tasks for a location."""
+    return {"tasks": list_tasks(location_id, limit=limit)}
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_get_task(task_id: str):
+    """Get task status, progress, steps, and artifacts."""
+    task = get_task(task_id)
+    if not task:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.get("/api/tasks/{task_id}/steps")
+async def api_get_task_steps(task_id: str):
+    """Get detailed step-by-step trace for a task."""
+    return {"task_id": task_id, "steps": get_task_steps(task_id)}
+
+
+@app.get("/api/tasks/{task_id}/artifacts")
+async def api_list_task_artifacts(task_id: str):
+    """List downloadable artifacts for a task."""
+    return {"task_id": task_id, "artifacts": list_artifacts(task_id)}
+
+
+@app.get("/api/tasks/{task_id}/artifacts/{filename}")
+async def api_download_artifact(task_id: str, filename: str):
+    """Download a task artifact (Excel, PDF, etc.)."""
+    from fastapi.responses import FileResponse
+    path = get_artifact_path(task_id, filename)
+    if not path:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(
+        path=path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if filename.endswith(".xlsx") else "application/octet-stream",
+    )
+
+
+@app.delete("/api/tasks/{task_id}")
+async def api_cancel_task(task_id: str):
+    """Cancel a running task."""
+    cancelled = cancel_task(task_id)
+    return {"cancelled": cancelled}
+
+
+@app.post("/api/tasks/{task_id}/upload")
+async def api_upload_to_task(task_id: str):
+    """Upload a file (PDF/image) for task processing."""
+    from fastapi import UploadFile, File, HTTPException
+    # This needs to be a separate function due to FastAPI file upload handling
+    pass  # Implemented below
+
+
+# Override with proper file upload signature
+@app.post("/api/tasks/{task_id}/files")
+async def api_upload_file(task_id: str, file: Any = None):
+    """Upload a file for task processing. Use multipart/form-data."""
+    from fastapi import HTTPException, Request
+    from hackathon_backend.services.lambdas.agent.core.tools.pdf_reader import save_upload
+    # For now, accept raw body
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"message": "Use /api/tasks with uploaded_files parameter", "task_id": task_id}
+
+
+# ---------------------------------------------------------------------------
 # WebSocket endpoint — real-time streaming chat
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/chat")
@@ -483,31 +635,128 @@ async def ws_chat(ws: WebSocket):
                 # Get result and send final response
                 result = await future
 
-                # Store assistant response
-                assistant_msg = add_message(_chat_id, "assistant", result.get("answer", ""), metadata={
-                    "type": result.get("type"),
-                    "chart": result.get("chart") is not None,
-                    "sources_count": len(result.get("sources", [])),
-                    "model": result.get("model_used"),
-                })
+                # Handle complex_task: create and run async task
+                if result.get("type") == "complex_task":
+                    task_type = result.get("task_type", "custom")
+                    task = create_task(
+                        location_id=location_id,
+                        task_type=task_type,
+                        description=question,
+                        chat_id=_chat_id,
+                    )
+                    task_id = task["task_id"]
 
-                # Store LLM costs
-                _store_pipeline_costs(result, _chat_id, location_id, assistant_msg["id"])
+                    # Store classifier costs
+                    _store_pipeline_costs(result, _chat_id, location_id, None)
 
-                await ws.send_json({
-                    "type": "result",
-                    "request_id": request_id,
-                    "chat_id": _chat_id,
-                    "message_id": assistant_msg["id"],
-                    "data": {
-                        "type": result.get("type", ""),
-                        "answer": result.get("answer", ""),
-                        "chart": result.get("chart"),
-                        "sources": result.get("sources", []),
-                        "intent": result.get("intent", ""),
-                        "model_used": result.get("model_used", ""),
-                    },
-                })
+                    # Notify frontend about task creation
+                    await ws.send_json({
+                        "type": "task_created",
+                        "request_id": request_id,
+                        "chat_id": _chat_id,
+                        "task_id": task_id,
+                        "task_type": task_type,
+                        "task_type_name": TASK_TYPE_NAMES.get(task_type, task_type),
+                    })
+
+                    # Run task in background, streaming events to WS
+                    task_event_queue: asyncio.Queue = asyncio.Queue()
+
+                    def on_task_event(event: str, data: dict):
+                        try:
+                            task_event_queue.put_nowait({"type": event, "request_id": request_id, **data})
+                        except Exception:
+                            pass
+
+                    task_future = loop.run_in_executor(
+                        None,
+                        lambda: execute_task(
+                            task_id=task_id,
+                            location_id=location_id,
+                            task_type=task_type,
+                            description=question,
+                            model_id=model,
+                            on_event=on_task_event,
+                        ),
+                    )
+
+                    # Forward task events to WebSocket
+                    while not task_future.done():
+                        try:
+                            evt = await asyncio.wait_for(task_event_queue.get(), timeout=0.2)
+                            await ws.send_json(evt)
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            break
+
+                    # Drain remaining
+                    while not task_event_queue.empty():
+                        try:
+                            evt = task_event_queue.get_nowait()
+                            await ws.send_json(evt)
+                        except Exception:
+                            break
+
+                    task_result = await task_future
+
+                    # Store assistant message
+                    answer = task_result.get("summary", result.get("answer", ""))
+                    assistant_msg = add_message(_chat_id, "assistant", answer, metadata={
+                        "type": "complex_task",
+                        "task_id": task_id,
+                        "task_type": task_type,
+                        "artifacts": len(task_result.get("artifacts", [])),
+                    })
+
+                    # Send final result with artifacts
+                    await ws.send_json({
+                        "type": "result",
+                        "request_id": request_id,
+                        "chat_id": _chat_id,
+                        "message_id": assistant_msg["id"],
+                        "data": {
+                            "type": "complex_task",
+                            "answer": answer,
+                            "chart": None,
+                            "sources": task_result.get("sources", [])[:20],
+                            "intent": "complex_task",
+                            "model_used": model,
+                            "task_id": task_id,
+                            "artifacts": [
+                                {"filename": a["filename"], "url": f"/api/tasks/{task_id}/artifacts/{a['filename']}"}
+                                for a in task_result.get("artifacts", [])
+                            ],
+                            "cost_usd": task_result.get("cost_usd", 0),
+                        },
+                    })
+                else:
+                    # Normal fast_chat result
+                    # Store assistant response
+                    assistant_msg = add_message(_chat_id, "assistant", result.get("answer", ""), metadata={
+                        "type": result.get("type"),
+                        "chart": result.get("chart") is not None,
+                        "sources_count": len(result.get("sources", [])),
+                        "model": result.get("model_used"),
+                    })
+
+                    # Store LLM costs
+                    _store_pipeline_costs(result, _chat_id, location_id, assistant_msg["id"])
+
+                    await ws.send_json({
+                        "type": "result",
+                        "request_id": request_id,
+                        "chat_id": _chat_id,
+                        "message_id": assistant_msg["id"],
+                        "data": {
+                            "type": result.get("type", ""),
+                            "answer": result.get("answer", ""),
+                            "chart": result.get("chart"),
+                            "sources": result.get("sources", []),
+                            "intent": result.get("intent", ""),
+                            "model_used": result.get("model_used", ""),
+                        },
+                    })
 
                 _get_langfuse_client().flush()
 
