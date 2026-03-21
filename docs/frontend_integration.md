@@ -1051,6 +1051,126 @@ const step2 = await fetch('/api/code-exec', {
 }).then(r => r.json());
 ```
 
+### Files in WebSocket chat (fast-chat flow)
+
+When the user asks for a file in the chat (e.g., "Exporta mis gastos a Excel"), the response arrives via WebSocket with `files` in the final message:
+
+```javascript
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'final') {
+        // msg.data.files is an array of generated files (may be empty)
+        const files = msg.data.files || [];
+        files.forEach(file => {
+            // file = { filename: "gastos_export.xlsx", url: "/api/tasks/chat_abc/artifacts/gastos_export.xlsx", type: "excel" }
+            renderDownloadButton(file);
+        });
+
+        // msg.data.answer is the AI's text response
+        renderMarkdown(msg.data.answer);
+    }
+};
+```
+
+### Rendering file downloads in the UI
+
+```javascript
+function renderDownloadButton(file) {
+    const icon = {
+        excel: 'table-cells',       // .xlsx files
+        csv: 'file-csv',            // .csv files
+        image: 'chart-bar',         // .png charts
+        pdf: 'file-pdf',            // .pdf files
+    }[file.type] || 'file';
+
+    const btn = document.createElement('a');
+    btn.href = file.url;
+    btn.download = file.filename;
+    btn.className = 'download-btn';
+    btn.innerHTML = `<i class="fa fa-${icon}"></i> ${file.filename}`;
+    document.querySelector('.chat-files').appendChild(btn);
+}
+```
+
+### Files in deep-agent tasks
+
+Task artifacts appear in the task completion event and in the task detail API:
+
+```javascript
+// Via WebSocket (real-time)
+ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'task_complete') {
+        // msg.data.artifacts = [{ filename, type, size_bytes }]
+        msg.data.artifacts.forEach(artifact => {
+            const url = `/api/tasks/${msg.data.task_id}/artifacts/${artifact.filename}`;
+            renderDownloadButton({ ...artifact, url });
+        });
+    }
+};
+
+// Via REST API (polling)
+const task = await fetch(`/api/tasks/${taskId}`).then(r => r.json());
+if (task.status === 'completed' && task.artifacts?.length) {
+    task.artifacts.forEach(artifact => {
+        const url = `/api/tasks/${taskId}/artifacts/${artifact.filename}`;
+        // Trigger download or show preview
+        window.open(url, '_blank');
+    });
+}
+```
+
+### Excel preview with SheetJS (optional)
+
+For inline Excel preview without downloading:
+
+```javascript
+import * as XLSX from 'xlsx';
+
+async function previewExcel(url) {
+    const response = await fetch(url);
+    const buffer = await response.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+
+    // Get all sheet names
+    const sheets = workbook.SheetNames; // ["Cash Flow Forecast", "Detalle Cobros", ...]
+
+    // Convert first sheet to HTML table
+    const html = XLSX.utils.sheet_to_html(workbook.Sheets[sheets[0]]);
+    document.querySelector('.excel-preview').innerHTML = html;
+
+    // Or convert to JSON for custom rendering
+    const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheets[0]]);
+    renderTable(data);
+}
+```
+
+### Chart images in chat
+
+When the AI generates chart images (.png), they appear in the `files` array:
+
+```javascript
+files.forEach(file => {
+    if (file.type === 'image') {
+        const img = document.createElement('img');
+        img.src = file.url;
+        img.alt = file.filename;
+        img.className = 'chart-image';
+        document.querySelector('.chat-charts').appendChild(img);
+    }
+});
+```
+
+### Available models for code execution
+
+| Model | Provider | Speed | Best for |
+|-------|----------|-------|----------|
+| `claude-sonnet-4.5` | Azure AI Foundry | ~30-60s | Complex multi-sheet Excel, container reuse |
+| `gemini-3.0-flash` | Vertex AI | ~15-20s | Fast generation, charts, simple reports |
+
+GPT models automatically fall back to Gemini for code execution.
+
 ---
 
 ## 14. Error Handling
