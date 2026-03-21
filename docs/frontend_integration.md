@@ -648,7 +648,7 @@ ws.send(JSON.stringify({
 
 ---
 
-## 11. AI Cost Tracking
+## 11. AI Cost Tracking.
 
 The server tracks token usage and estimated costs for every LLM call. Use these endpoints to build cost dashboards and monitor AI spend.
 
