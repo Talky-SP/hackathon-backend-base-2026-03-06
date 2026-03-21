@@ -11,9 +11,9 @@ statistical analysis — anything, dynamically.
 
 Architecture:
 - run_code_execution() — main entry point, routes to provider
-- _claude_code_exec() — direct Anthropic SDK call with code_execution tool
-- _gemini_code_exec() — direct google.genai SDK call with code_execution tool
-- extract_files() — extracts generated files from responses
+- _claude_code_exec() — LiteLLM call with code_execution_20250825 tool
+- _gemini_code_exec() — google.genai SDK call with code_execution tool
+- _extract_b64_files() — extracts base64-encoded files from Claude stdout
 - Container reuse for multi-step within a task
 """
 from __future__ import annotations
@@ -134,8 +134,20 @@ def run_code_execution(
 
 
 # ---------------------------------------------------------------------------
-# Claude Code Execution (via Anthropic SDK → Azure AI Foundry)
+# Claude Code Execution (via LiteLLM → Azure AI Foundry)
 # ---------------------------------------------------------------------------
+
+# Instruct Claude to output file contents as base64 so we can capture them
+_FILE_CAPTURE_INSTRUCTION = """
+IMPORTANT: After saving any file, you MUST print its base64 encoding so the file
+can be captured. Use this exact pattern for EACH file:
+```
+python3 -c "import base64; data=open('<filepath>','rb').read(); print('FILE_B64_START:<filename>'); print(base64.b64encode(data).decode()); print('FILE_B64_END')"
+```
+Replace <filepath> with the full path and <filename> with just the filename.
+"""
+
+
 def _claude_code_exec(
     prompt: str,
     model_id: str,
@@ -144,30 +156,44 @@ def _claude_code_exec(
     max_tokens: int,
     system_prompt: str | None,
 ) -> dict:
-    """Execute code using Claude's native code_execution_20250825 tool."""
-    client = _get_anthropic_client()
+    """Execute code using Claude's native code_execution_20250825 tool via LiteLLM."""
+    from hackathon_backend.services.lambdas.agent.core.config import AVAILABLE_MODELS, init_models
 
-    from hackathon_backend.services.lambdas.agent.core.config import get_secret
-    sec = get_secret("claude_sonnet")
-    deployment = sec["AZURE_DEPLOYMENT_NAME"]
+    # Ensure models are registered
+    if not AVAILABLE_MODELS:
+        init_models()
 
-    messages = [{"role": "user", "content": prompt}]
+    # Resolve model config — use claude-sonnet-4.5 by default
+    cfg_key = "claude-sonnet-4.5"
+    if model_id in AVAILABLE_MODELS:
+        cfg_key = model_id
+    elif "opus" in model_id:
+        cfg_key = "claude-opus-4.6" if "claude-opus-4.6" in AVAILABLE_MODELS else "claude-sonnet-4.5"
 
-    kwargs: dict[str, Any] = {
-        "model": deployment,
-        "max_tokens": max_tokens,
+    cfg = AVAILABLE_MODELS[cfg_key]
+
+    # Build messages — inject file capture instruction into prompt
+    full_prompt = prompt + "\n" + _FILE_CAPTURE_INSTRUCTION
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": full_prompt})
+
+    litellm_kwargs: dict[str, Any] = {
+        "model": cfg["model"],
+        "api_key": cfg.get("api_key"),
+        "api_base": cfg.get("api_base"),
         "messages": messages,
         "tools": [{"type": "code_execution_20250825", "name": "code_execution"}],
+        "max_tokens": max_tokens,
     }
 
-    if system_prompt:
-        kwargs["system"] = system_prompt
-
+    # Container reuse
     if container_id:
-        kwargs["container"] = container_id
+        litellm_kwargs["container"] = container_id
 
     try:
-        response = client.messages.create(**kwargs)
+        response = litellm.completion(**litellm_kwargs)
     except Exception as e:
         return {
             "success": False,
@@ -178,109 +204,96 @@ def _claude_code_exec(
             "usage": {},
         }
 
-    # Parse response
-    text_parts = []
+    # Parse LiteLLM response (OpenAI-compatible format)
+    msg = response.choices[0].message
+    text = msg.content or ""
     code_blocks = []
     files = []
-    new_container_id = None
+    new_container_id = container_id
 
-    # Extract container ID for reuse
-    if hasattr(response, "container") and response.container:
-        new_container_id = response.container.id
+    # Extract provider-specific fields
+    psf = msg.provider_specific_fields or {}
 
+    # Container ID for reuse
+    container_info = psf.get("container", {})
+    if container_info and container_info.get("id"):
+        new_container_id = container_info["id"]
+
+    # Collect code blocks and stdout from tool results
+    all_stdout = ""
+    for tr in psf.get("tool_results", []):
+        tr_type = tr.get("type", "")
+        content = tr.get("content", {})
+        stdout = content.get("stdout", "") or ""
+        all_stdout += stdout
+
+        if "bash" in tr_type:
+            code_blocks.append({"type": "bash", "stdout": stdout})
+        elif "text_editor" in tr_type:
+            code_blocks.append({"type": "file_op"})
+
+    # Extract tool call code
+    for tc in (msg.tool_calls or []):
+        fn = tc.function
+        if fn.name == "bash_code_execution":
+            args = json.loads(fn.arguments) if fn.arguments else {}
+            code_blocks.append({"type": "bash", "code": args.get("command", "")})
+        elif fn.name == "text_editor_code_execution":
+            args = json.loads(fn.arguments) if fn.arguments else {}
+            code_blocks.append({
+                "type": "file_op",
+                "command": args.get("command", ""),
+                "path": args.get("path", ""),
+            })
+
+    # Extract base64-encoded files from stdout
+    if task_id and "FILE_B64_START:" in all_stdout:
+        files = _extract_b64_files(all_stdout, task_id)
+
+    # Usage
     usage = {}
-    if hasattr(response, "usage"):
+    if response.usage:
         u = response.usage
         usage = {
             "model": model_id,
             "step": "code_execution",
-            "prompt_tokens": getattr(u, "input_tokens", 0) or 0,
-            "completion_tokens": getattr(u, "output_tokens", 0) or 0,
-            "total_tokens": (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "output_tokens", 0) or 0),
+            "prompt_tokens": u.prompt_tokens or 0,
+            "completion_tokens": u.completion_tokens or 0,
+            "total_tokens": u.total_tokens or 0,
         }
-
-    # Handle pause_turn: keep going if model hasn't finished
-    while True:
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "server_tool_use":
-                if block.name == "bash_code_execution":
-                    code_blocks.append({
-                        "type": "bash",
-                        "code": block.input.get("command", ""),
-                    })
-                elif block.name == "text_editor_code_execution":
-                    code_blocks.append({
-                        "type": "file_op",
-                        "command": block.input.get("command", ""),
-                        "path": block.input.get("path", ""),
-                    })
-            elif block.type == "bash_code_execution_tool_result":
-                result_content = block.content
-                if hasattr(result_content, "type") and result_content.type == "bash_code_execution_result":
-                    # Check for generated files
-                    if hasattr(result_content, "content") and result_content.content:
-                        for file_ref in result_content.content:
-                            if hasattr(file_ref, "file_id") and file_ref.file_id:
-                                # Download file from Claude's Files API
-                                downloaded = _download_claude_file(
-                                    client, file_ref.file_id, task_id,
-                                )
-                                if downloaded:
-                                    files.append(downloaded)
-
-        # Check if we need to continue (pause_turn)
-        if response.stop_reason == "pause_turn":
-            try:
-                response = client.messages.create(
-                    model=deployment,
-                    max_tokens=max_tokens,
-                    messages=messages + [{"role": "assistant", "content": response.content}],
-                    tools=[{"type": "code_execution_20250825", "name": "code_execution"}],
-                    container=new_container_id or container_id,
-                )
-                # Accumulate usage
-                if hasattr(response, "usage"):
-                    u2 = response.usage
-                    usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + (getattr(u2, "input_tokens", 0) or 0)
-                    usage["completion_tokens"] = usage.get("completion_tokens", 0) + (getattr(u2, "output_tokens", 0) or 0)
-                    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-            except Exception:
-                break
-        else:
-            break
 
     return {
         "success": True,
-        "text": "\n".join(text_parts),
+        "text": text,
         "code_blocks": code_blocks,
         "files": files,
-        "container_id": new_container_id or container_id,
+        "container_id": new_container_id,
         "usage": usage,
     }
 
 
-def _download_claude_file(client, file_id: str, task_id: str) -> dict | None:
-    """Download a file from Claude's Files API and save locally."""
-    try:
-        file_metadata = client.beta.files.retrieve_metadata(file_id)
-        file_content = client.beta.files.download(file_id)
-        filename = getattr(file_metadata, "filename", f"file_{file_id}")
-
-        dir_path = _ensure_artifacts_dir(task_id)
-        filepath = os.path.join(dir_path, filename)
-        file_content.write_to_file(filepath)
-
-        return {
-            "filename": filename,
-            "path": filepath,
-            "size_bytes": os.path.getsize(filepath),
-            "type": _detect_file_type(filename),
-        }
-    except Exception as e:
-        print(f"Warning: Could not download Claude file {file_id}: {e}")
-        return None
+def _extract_b64_files(stdout: str, task_id: str) -> list[dict]:
+    """Extract base64-encoded files from Claude's stdout output."""
+    files = []
+    pattern = r"FILE_B64_START:(.+?)\n(.+?)\nFILE_B64_END"
+    for match in re.finditer(pattern, stdout, re.DOTALL):
+        filename = match.group(1).strip()
+        b64_data = match.group(2).strip()
+        try:
+            data = base64.b64decode(b64_data)
+            dir_path = _ensure_artifacts_dir(task_id)
+            filepath = os.path.join(dir_path, filename)
+            with open(filepath, "wb") as f:
+                f.write(data)
+            files.append({
+                "filename": filename,
+                "path": filepath,
+                "size_bytes": len(data),
+                "type": _detect_file_type(filename),
+            })
+        except Exception as e:
+            print(f"Warning: Could not decode file {filename}: {e}")
+    return files
 
 
 # ---------------------------------------------------------------------------

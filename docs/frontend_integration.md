@@ -969,7 +969,91 @@ Each task type has a cost budget. If the budget is exceeded during execution, th
 
 ---
 
-## 13. Error Handling
+## 13. Code Execution & AI-Powered File Generation
+
+The backend uses **native AI code execution** (Claude's `code_execution_20250825` sandbox and Gemini's code execution) to dynamically generate Excel reports, charts, and analysis files. This replaces hardcoded templates — the LLM writes and runs Python code (openpyxl, pandas, matplotlib) in a sandboxed container.
+
+### How it works
+
+1. **Fast-chat**: The query agent has a `generate_file` tool. When the user asks for a report/export, the LLM calls this tool which triggers code execution.
+2. **Deep-agent tasks**: After sub-agents gather data and the synthesizer produces results, code execution generates the final Excel artifact.
+3. **Direct API**: `POST /api/code-exec` for custom code execution requests.
+
+### Direct Code Execution: `POST /api/code-exec`
+
+```javascript
+const response = await fetch('/api/code-exec', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        prompt: "Create an Excel with monthly revenue breakdown",
+        model: "claude-sonnet-4.5",   // or "gemini-3.0-flash"
+        data: JSON.stringify(myData), // optional: data context
+        system_prompt: null,          // optional
+        task_id: null,                // optional: auto-generated if null
+        container_id: null            // optional: reuse Claude container
+    })
+});
+
+const result = await response.json();
+// {
+//   success: true,
+//   text: "I've created the Excel report with...",
+//   files: [
+//     { filename: "revenue_report.xlsx", url: "/api/tasks/task_abc/artifacts/revenue_report.xlsx" }
+//   ],
+//   container_id: "container_011...",  // for follow-up requests
+//   usage: { prompt_tokens: 5000, completion_tokens: 800, total_tokens: 5800 }
+// }
+```
+
+### Downloading generated files
+
+```javascript
+// Files from code execution (direct API)
+const fileUrl = result.files[0].url;  // "/api/tasks/{task_id}/artifacts/{filename}"
+window.open(fileUrl);
+
+// Files from deep-agent tasks (same endpoint)
+const taskArtifact = `/api/tasks/${taskId}/artifacts/${filename}`;
+window.open(taskArtifact);
+```
+
+### Provider fallback chain
+
+The system automatically falls back across providers:
+1. **Claude** (Azure AI Foundry) — preferred, supports container reuse
+2. **Gemini** (Vertex AI) — fallback, code re-executed locally for file capture
+3. **Template fallback** — last resort, uses predefined openpyxl templates
+
+### Prompt caching (automatic)
+
+For Claude models, the backend automatically applies **prompt caching** (`cache_control: {"type": "ephemeral"}`) to system messages and large conversation history. This reduces API costs by up to 90% on cache hits. No frontend action needed.
+
+### Multi-step container reuse
+
+For complex tasks, pass `container_id` from a previous response to reuse the same Claude sandbox (files and state persist ~4.5 minutes):
+
+```javascript
+// Step 1: Generate data
+const step1 = await fetch('/api/code-exec', {
+    method: 'POST',
+    body: JSON.stringify({ prompt: "Load and clean this data...", data: rawData })
+}).then(r => r.json());
+
+// Step 2: Reuse container to generate chart from the same data
+const step2 = await fetch('/api/code-exec', {
+    method: 'POST',
+    body: JSON.stringify({
+        prompt: "Now create a chart from the cleaned data",
+        container_id: step1.container_id  // reuse sandbox
+    })
+}).then(r => r.json());
+```
+
+---
+
+## 14. Error Handling
 
 ```javascript
 ws.onerror = (error) => {
