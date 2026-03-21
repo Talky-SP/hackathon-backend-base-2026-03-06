@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import traceback
+import uuid
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +24,9 @@ from boto3.dynamodb.conditions import Key, Attr
 from langfuse import observe
 
 from hackathon_backend.services.lambdas.agent.core.config import completion
+from hackathon_backend.services.lambdas.agent.core.code_runner import (
+    run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
+)
 
 AWS_PROFILE = os.getenv("AWS_PROFILE", "hackathon-equipo1")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-3")
@@ -389,6 +393,37 @@ QUERY_AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_file",
+            "description": (
+                "Generate a file (Excel, CSV, chart) using AI-powered code execution in a sandboxed environment. "
+                "The AI will write and execute Python code (openpyxl, pandas, matplotlib) to create the file. "
+                "Use this when the user asks for a downloadable report, export, or detailed Excel.\n\n"
+                "The sandbox has: openpyxl, pandas, numpy, matplotlib, scipy, scikit-learn.\n"
+                "Provide a detailed prompt describing what file to generate and the data to include."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "Detailed instructions for file generation. Include: "
+                            "what kind of file (Excel, chart), what sheets/columns, "
+                            "what data to include (reference query results), formatting preferences."
+                        ),
+                    },
+                    "data_json": {
+                        "type": "string",
+                        "description": "JSON string with the data to include in the file. Serialize your analysis results here.",
+                    },
+                },
+                "required": ["prompt", "data_json"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -401,6 +436,8 @@ You receive a user's question and must plan + execute the optimal queries to ans
 YOUR CAPABILITIES:
 1. `dynamo_query` — Execute DynamoDB queries using GSIs for optimal performance
 2. `run_analysis` — Run Python code to compute metrics, aggregations, and chart data
+3. `generate_file` — Generate Excel/CSV/chart files using AI code execution (openpyxl, pandas, matplotlib).
+   Use this when the user wants a downloadable report or export. The sandbox has all Python data libraries.
 
 TABLES AND QUERY PATTERNS:
 
@@ -707,6 +744,46 @@ def run_query_agent(
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+
+            elif fn_name == "generate_file":
+                emit("analyzing", {"message": "Generando archivo via code execution..."})
+                file_prompt = args.get("prompt", "")
+                data_json = args.get("data_json", "")
+
+                # Use a task_id based on request for artifact storage
+                file_task_id = f"chat_{str(uuid.uuid4())[:8]}"
+
+                code_result = _native_code_exec(
+                    prompt=file_prompt,
+                    model_id=model_id,
+                    data_context=data_json,
+                    task_id=file_task_id,
+                    system_prompt=CODE_EXEC_SYSTEM,
+                )
+
+                # Track usage from code execution
+                if code_result.get("usage"):
+                    u = code_result["usage"]
+                    if isinstance(u, dict):
+                        usage_records.append(u)
+                    elif isinstance(u, list):
+                        usage_records.extend(u)
+
+                file_response = {
+                    "success": code_result.get("success", False),
+                    "files": [
+                        {"filename": f["filename"], "task_id": file_task_id,
+                         "url": f"/api/tasks/{file_task_id}/artifacts/{f['filename']}"}
+                        for f in code_result.get("files", [])
+                    ],
+                    "text": code_result.get("text", "")[:500],
+                }
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
                 })
 
             else:

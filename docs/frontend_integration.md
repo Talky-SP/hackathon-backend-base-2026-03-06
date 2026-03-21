@@ -18,6 +18,7 @@ Server endpoints:
 - **Tasks**: `POST /api/tasks`, `GET /api/tasks`, `GET /api/tasks/{id}`, `DELETE /api/tasks/{id}`
 - **Task Artifacts**: `GET /api/tasks/{id}/artifacts/{filename}` (download Excel/PDF)
 - **Task Types**: `GET /api/tasks/types` (available task types with budgets)
+- **Code Execution**: `POST /api/code-exec` (AI sandbox for Excel/chart generation)
 - **Models**: `GET http://localhost:8000/api/models`
 - **Health**: `GET http://localhost:8000/api/health`
 - **Swagger**: `http://localhost:8000/docs`

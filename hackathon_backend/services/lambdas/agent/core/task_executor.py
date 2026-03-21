@@ -43,6 +43,10 @@ from hackathon_backend.services.lambdas.agent.core.tools.excel_gen import (
     generate_table_excel, generate_cash_flow_excel, generate_modelo_303_excel,
     list_artifacts,
 )
+from hackathon_backend.services.lambdas.agent.core.code_runner import (
+    run_code_execution, build_excel_prompt, collect_sandbox_files,
+    CODE_EXEC_SYSTEM,
+)
 
 EventCallback = Callable[[str, dict], None]
 
@@ -229,6 +233,40 @@ Focus ONLY on your objective — do not try to answer the full user question.
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
 
+            elif fn_name == "generate_file":
+                emit("task_progress", {
+                    "task_id": task_id,
+                    "message": "Sub-agent generando archivo...",
+                })
+                file_prompt = args.get("prompt", "")
+                data_json = args.get("data_json", "")
+
+                code_result = run_code_execution(
+                    prompt=file_prompt,
+                    model_id=model_id,
+                    data_context=data_json,
+                    task_id=task_id,
+                    system_prompt=CODE_EXEC_SYSTEM,
+                )
+
+                if code_result.get("usage"):
+                    u = code_result["usage"]
+                    if isinstance(u, dict):
+                        usage_records.append(u)
+                    elif isinstance(u, list):
+                        usage_records.extend(u)
+
+                file_response = {
+                    "success": code_result.get("success", False),
+                    "files": [f["filename"] for f in code_result.get("files", [])],
+                    "text": code_result.get("text", "")[:500],
+                }
+
+                messages.append({
+                    "role": "tool", "tool_call_id": tool_call.id,
+                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
+                })
+
             else:
                 messages.append({
                     "role": "tool", "tool_call_id": tool_call.id,
@@ -354,9 +392,11 @@ def execute_task(
             model_id, all_usage, emit,
         )
 
-        # Step 6: Generate Excel artifact
-        emit("task_progress", {"task_id": task_id, "progress": 85, "step": "Generando informe Excel..."})
-        artifacts = _generate_artifacts(task_id, task_type, synthesis, emit)
+        # Step 6: Generate Excel artifact via native code execution
+        emit("task_progress", {"task_id": task_id, "progress": 85, "step": "Generando informe Excel (code execution)..."})
+        artifacts = _generate_artifacts_with_code_exec(
+            task_id, task_type, synthesis, description, model_id, all_usage, emit,
+        )
 
         # Step 7: Complete
         summary = synthesis.get("summary", "Tarea completada")
@@ -587,14 +627,102 @@ IMPORTANT: Use real numbers from the data. Format amounts as numbers (not string
 
 
 # ---------------------------------------------------------------------------
-# Internal: generate artifacts from synthesis
+# Internal: generate artifacts via native code execution (primary)
 # ---------------------------------------------------------------------------
-def _generate_artifacts(task_id: str, task_type: str, synthesis: dict, emit: EventCallback) -> list[dict]:
-    """Generate Excel/PDF artifacts from synthesized results."""
+def _generate_artifacts_with_code_exec(
+    task_id: str,
+    task_type: str,
+    synthesis: dict,
+    description: str,
+    model_id: str,
+    all_usage: list,
+    emit: EventCallback,
+) -> list[dict]:
+    """
+    Generate Excel/PDF artifacts using the LLM's native code execution sandbox.
+
+    The LLM writes and runs openpyxl code to create professional Excel files
+    with charts, formatting, and multiple sheets — dynamically, based on data.
+
+    Falls back to template-based generation if code execution fails.
+    """
+    artifacts = []
+
+    # Check budget before code execution
+    budget = check_budget(task_id)
+    if not budget.get("ok"):
+        emit("task_progress", {"task_id": task_id, "step": "Budget exceeded, skipping artifact generation"})
+        return _generate_artifacts_fallback(task_id, task_type, synthesis, emit)
+
+    try:
+        # Build the prompt for code execution
+        prompt = build_excel_prompt(task_type, synthesis, description)
+
+        emit("task_progress", {
+            "task_id": task_id, "progress": 88,
+            "step": f"Ejecutando código para generar Excel ({model_id})...",
+        })
+
+        result = run_code_execution(
+            prompt=prompt,
+            model_id=model_id,
+            task_id=task_id,
+            system_prompt=CODE_EXEC_SYSTEM,
+        )
+
+        if result.get("usage"):
+            usage = result["usage"]
+            if isinstance(usage, list):
+                all_usage.extend(usage)
+            else:
+                all_usage.append(usage)
+            # Track cost
+            from hackathon_backend.services.lambdas.agent.core.chat_store import _estimate_cost
+            u = usage if isinstance(usage, dict) else (usage[0] if usage else {})
+            cost = _estimate_cost(
+                u.get("model", model_id),
+                u.get("prompt_tokens", 0),
+                u.get("completion_tokens", 0),
+            )
+            total_tokens = u.get("total_tokens", 0)
+            add_task_cost(task_id, total_tokens, cost)
+
+        if result.get("success") and result.get("files"):
+            # Files downloaded from sandbox
+            for f in result["files"]:
+                artifact = {
+                    "filename": f["filename"],
+                    "path": f["path"],
+                    "type": f.get("type", "excel"),
+                    "size_bytes": f.get("size_bytes", 0),
+                }
+                artifacts.append(artifact)
+                add_task_artifact(task_id, artifact)
+
+            emit("task_progress", {
+                "task_id": task_id, "progress": 92,
+                "step": f"Generados {len(artifacts)} archivos via code execution",
+            })
+        else:
+            # Code execution didn't produce files — fall back to templates
+            emit("task_progress", {
+                "task_id": task_id, "progress": 90,
+                "step": "Code execution sin archivos, usando plantillas...",
+            })
+            artifacts = _generate_artifacts_fallback(task_id, task_type, synthesis, emit)
+
+    except Exception as e:
+        emit("task_progress", {"task_id": task_id, "step": f"Code exec error: {e}, usando plantillas..."})
+        artifacts = _generate_artifacts_fallback(task_id, task_type, synthesis, emit)
+
+    return artifacts
+
+
+def _generate_artifacts_fallback(task_id: str, task_type: str, synthesis: dict, emit: EventCallback) -> list[dict]:
+    """Fallback: generate artifacts using hardcoded openpyxl templates."""
     artifacts = []
 
     try:
-        # Task-specific Excel generation
         if task_type == "cash_flow_forecast" and "cash_flow" in synthesis:
             cf = synthesis["cash_flow"]
             filepath = generate_cash_flow_excel(
@@ -616,7 +744,6 @@ def _generate_artifacts(task_id: str, task_type: str, synthesis: dict, emit: Eve
             artifacts.append(artifact)
             add_task_artifact(task_id, artifact)
 
-        # Generic Excel from excel_data
         excel_data = synthesis.get("excel_data", {})
         sheets = excel_data.get("sheets", [])
         if sheets:
@@ -628,7 +755,7 @@ def _generate_artifacts(task_id: str, task_type: str, synthesis: dict, emit: Eve
             add_task_artifact(task_id, artifact)
 
     except Exception as e:
-        emit("task_progress", {"task_id": task_id, "step": f"Error generando Excel: {e}"})
+        emit("task_progress", {"task_id": task_id, "step": f"Fallback Excel error: {e}"})
 
     return artifacts
 

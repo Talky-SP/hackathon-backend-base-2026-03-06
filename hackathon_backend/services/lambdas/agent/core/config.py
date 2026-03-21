@@ -170,6 +170,10 @@ def completion(model_id: str, messages: list[dict], **kwargs) -> Any:
     Call any registered model via LiteLLM.
     For Vertex AI models, tries fallback locations if the primary fails.
     Accepts the same kwargs as litellm.completion (tools, temperature, etc.)
+
+    Prompt caching:
+    - For Claude (azure_ai): adds cache_control to system messages automatically
+    - For Gemini: uses context caching via LiteLLM headers
     """
     if model_id not in AVAILABLE_MODELS:
         raise ValueError(
@@ -177,7 +181,11 @@ def completion(model_id: str, messages: list[dict], **kwargs) -> Any:
         )
 
     model_cfg = AVAILABLE_MODELS[model_id]
-    params = {**model_cfg, **kwargs, "messages": messages}
+
+    # Apply prompt caching for Anthropic models (Claude)
+    cached_messages = _apply_cache_control(model_id, messages)
+
+    params = {**model_cfg, **kwargs, "messages": cached_messages}
 
     # For Vertex AI models, try primary config then fallback chain
     fallbacks = _VERTEX_FALLBACK_CHAIN.get(model_id, [])
@@ -196,6 +204,61 @@ def completion(model_id: str, messages: list[dict], **kwargs) -> Any:
                 last_err = fb_err
                 continue
         raise last_err
+
+
+def _apply_cache_control(model_id: str, messages: list[dict]) -> list[dict]:
+    """
+    Apply prompt caching to messages for supported models.
+
+    Claude: Adds cache_control={"type": "ephemeral"} to system messages
+    and the last user message that's large enough (>1024 tokens ~ 4096 chars).
+    This tells Anthropic to cache that prefix, reducing costs by 90% on cache hits
+    and 25% write premium on cache misses. Cache TTL is 5 minutes.
+
+    Gemini: LiteLLM handles context caching automatically for Vertex AI.
+    """
+    if not model_id.startswith("claude"):
+        return messages
+
+    result = []
+    for i, msg in enumerate(messages):
+        msg_copy = dict(msg)
+
+        # Cache system messages (they're repeated every call)
+        if msg_copy.get("role") == "system":
+            content = msg_copy.get("content", "")
+            if isinstance(content, str) and len(content) > 500:
+                # Convert to content blocks format for cache_control
+                msg_copy["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            elif isinstance(content, list):
+                # Already in blocks format — add cache_control to last block
+                blocks = [dict(b) for b in content]
+                if blocks:
+                    blocks[-1]["cache_control"] = {"type": "ephemeral"}
+                msg_copy["content"] = blocks
+
+        # Cache large conversation history prefixes (user messages before the last one)
+        # Only cache if it's not the latest user message and it's big enough
+        elif msg_copy.get("role") == "user" and i < len(messages) - 1:
+            content = msg_copy.get("content", "")
+            if isinstance(content, str) and len(content) > 4000:
+                msg_copy["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+
+        result.append(msg_copy)
+
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,9 @@ from hackathon_backend.services.lambdas.agent.core.task_manager import (
 )
 from hackathon_backend.services.lambdas.agent.core.task_executor import execute_task
 from hackathon_backend.services.lambdas.agent.core.tools.excel_gen import list_artifacts, get_artifact_path
+from hackathon_backend.services.lambdas.agent.core.code_runner import (
+    run_code_execution, CODE_EXEC_SYSTEM, collect_sandbox_files, ARTIFACTS_DIR,
+)
 
 from langfuse import observe, get_client as _get_langfuse_client
 
@@ -536,6 +539,70 @@ async def api_upload_file(task_id: str, file: Any = None):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"message": "Use /api/tasks with uploaded_files parameter", "task_id": task_id}
+
+
+# ---------------------------------------------------------------------------
+# Code execution endpoint — direct access to AI code execution sandbox
+# ---------------------------------------------------------------------------
+class CodeExecRequest(BaseModel):
+    prompt: str
+    model: str = "claude-sonnet-4.5"
+    data: str = ""
+    system_prompt: str | None = None
+    task_id: str | None = None
+    container_id: str | None = None
+
+
+@app.post("/api/code-exec")
+async def api_code_execution(req: CodeExecRequest):
+    """
+    Execute code in an AI sandbox (Claude or Gemini).
+
+    The LLM writes and runs code (Python/Bash) in a secure sandboxed environment.
+    Pre-installed: openpyxl, pandas, numpy, matplotlib, scipy, scikit-learn.
+
+    Use this for:
+    - Generating Excel reports dynamically
+    - Running complex data analysis
+    - Creating charts and visualizations
+    - Any computation that benefits from code execution
+    """
+    _ensure_init()
+
+    task_id = req.task_id or f"exec_{str(uuid.uuid4())[:8]}"
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: run_code_execution(
+            prompt=req.prompt,
+            model_id=req.model,
+            data_context=req.data,
+            task_id=task_id,
+            container_id=req.container_id,
+            system_prompt=req.system_prompt or CODE_EXEC_SYSTEM,
+        ),
+    )
+
+    # Build artifact download URLs
+    files = []
+    for f in result.get("files", []):
+        files.append({
+            "filename": f["filename"],
+            "size_bytes": f.get("size_bytes", 0),
+            "type": f.get("type", "other"),
+            "url": f"/api/tasks/{task_id}/artifacts/{f['filename']}",
+        })
+
+    return {
+        "success": result.get("success", False),
+        "text": result.get("text", ""),
+        "code_blocks": result.get("code_blocks", []),
+        "files": files,
+        "container_id": result.get("container_id"),
+        "task_id": task_id,
+        "usage": result.get("usage", {}),
+    }
 
 
 # ---------------------------------------------------------------------------
