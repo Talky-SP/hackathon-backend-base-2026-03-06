@@ -21,44 +21,17 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from typing import Any
 
+import litellm
 from langfuse import observe
 
 # ---------------------------------------------------------------------------
 # Lazy SDK clients (initialized on first use with credentials from config)
 # ---------------------------------------------------------------------------
-_anthropic_client = None
 _gemini_client = None
-
-
-def _get_anthropic_client():
-    """Get or create Anthropic client configured for Azure AI Foundry."""
-    global _anthropic_client
-    if _anthropic_client is not None:
-        return _anthropic_client
-
-    from anthropic import Anthropic
-    from hackathon_backend.services.lambdas.agent.core.config import get_secret
-
-    # Claude Sonnet 4.5 on Azure AI Foundry
-    sec = get_secret("claude_sonnet")
-    api_base = sec["AZURE_API_BASE"]
-    # Azure AI Foundry uses /anthropic/v1/ path
-    if "/anthropic/v1/messages" in api_base:
-        api_base = api_base.replace("/anthropic/v1/messages", "")
-    if not api_base.endswith("/anthropic/v1"):
-        if api_base.endswith("/"):
-            api_base += "anthropic/v1"
-        else:
-            api_base += "/anthropic/v1"
-
-    _anthropic_client = Anthropic(
-        api_key=sec["AZURE_API_KEY"],
-        base_url=api_base,
-    )
-    return _anthropic_client
 
 
 def _get_gemini_client():
