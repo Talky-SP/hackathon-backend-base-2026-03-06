@@ -553,6 +553,16 @@ async def api_list_task_artifacts(task_id: str):
 @app.get("/api/tasks/{task_id}/artifacts/{filename}")
 async def api_download_artifact(task_id: str, filename: str):
     """Download a task artifact (Excel, PDF, etc.)."""
+    from hackathon_backend.services.lambdas.agent.core.storage import _use_s3, get_artifact_url, get_artifact
+    # S3 mode: redirect to presigned URL
+    if _use_s3():
+        url = get_artifact_url(task_id, filename)
+        if not url:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=url)
+    # Local mode: serve from filesystem
     from fastapi.responses import FileResponse
     path = get_artifact_path(task_id, filename)
     if not path:

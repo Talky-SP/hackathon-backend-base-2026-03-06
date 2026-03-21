@@ -678,18 +678,28 @@ def _detect_file_type(filename: str) -> str:
 
 
 def collect_sandbox_files(task_id: str) -> list[dict]:
-    """List all files in the artifacts directory for a task."""
+    """List all files in the artifacts directory for a task.
+    In Lambda mode, also uploads each file to S3 for persistence."""
     dir_path = os.path.join(ARTIFACTS_DIR, task_id)
     if not os.path.isdir(dir_path):
         return []
+    from hackathon_backend.services.lambdas.agent.core.storage import save_artifact, _use_s3
     artifacts = []
     for f in os.listdir(dir_path):
         fp = os.path.join(dir_path, f)
         if os.path.isfile(fp):
-            artifacts.append({
+            art = {
                 "filename": f,
                 "path": fp,
                 "size_bytes": os.path.getsize(fp),
                 "type": _detect_file_type(f),
-            })
+            }
+            # Upload to S3 in Lambda mode so file persists across invocations
+            if _use_s3():
+                with open(fp, "rb") as fh:
+                    s3_result = save_artifact(task_id, f, fh.read())
+                art["url"] = s3_result.get("url", "")
+            else:
+                art["url"] = f"/api/tasks/{task_id}/artifacts/{f}"
+            artifacts.append(art)
     return artifacts

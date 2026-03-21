@@ -760,14 +760,23 @@ def run_agent(
                     "text": code_result.get("text", "")[:500],
                 }
                 generated_filenames = []
+                from hackathon_backend.services.lambdas.agent.core.storage import _use_s3 as _gen_s3_check, save_artifact as _gen_save
                 for f in code_result.get("files", []):
+                    file_url = f"/api/tasks/{file_task_id}/artifacts/{f['filename']}"
+                    # Upload to S3 in Lambda mode and use presigned URL
+                    if _gen_s3_check():
+                        gen_path = f["path"]
+                        if os.path.isfile(gen_path):
+                            with open(gen_path, "rb") as _gfh:
+                                s3_res = _gen_save(file_task_id, f["filename"], _gfh.read())
+                            file_url = s3_res.get("url", file_url)
                     artifact = {
                         "filename": f["filename"],
                         "path": f["path"],
                         "task_id": file_task_id,
                         "type": f.get("type", "excel"),
                         "size_bytes": f.get("size_bytes", 0),
-                        "url": f"/api/tasks/{file_task_id}/artifacts/{f['filename']}",
+                        "url": file_url,
                     }
                     artifacts.append(artifact)
                     generated_filenames.append(f["filename"])
@@ -809,16 +818,25 @@ def run_agent(
                     "model": model_id,
                 })
 
-                # Find the existing file on disk
+                # Find the existing file — local first, then S3
                 existing_path = os.path.join(ARTIFACTS_DIR, edit_task_id, edit_filename)
                 if not os.path.isfile(existing_path):
-                    messages.append({
-                        "role": "tool", "tool_call_id": tool_call.id,
-                        "content": json.dumps({
-                            "error": f"File not found: {edit_filename} (task_id={edit_task_id})"
-                        }),
-                    })
-                    continue
+                    # In Lambda mode, file may be in S3 — download it locally
+                    from hackathon_backend.services.lambdas.agent.core.storage import _use_s3, get_artifact
+                    if _use_s3():
+                        file_bytes = get_artifact(edit_task_id, edit_filename)
+                        if file_bytes:
+                            os.makedirs(os.path.join(ARTIFACTS_DIR, edit_task_id), exist_ok=True)
+                            with open(existing_path, "wb") as _fw:
+                                _fw.write(file_bytes)
+                    if not os.path.isfile(existing_path):
+                        messages.append({
+                            "role": "tool", "tool_call_id": tool_call.id,
+                            "content": json.dumps({
+                                "error": f"File not found: {edit_filename} (task_id={edit_task_id})"
+                            }),
+                        })
+                        continue
 
                 # Read existing file as base64 for the code sandbox
                 import base64 as _b64
@@ -867,14 +885,23 @@ def run_agent(
                     "text": code_result.get("text", "")[:500],
                     "edited": True,
                 }
+                from hackathon_backend.services.lambdas.agent.core.storage import _use_s3 as _s3_check, save_artifact as _save_art
                 for f in code_result.get("files", []):
+                    file_url = f"/api/tasks/{edit_task_id}/artifacts/{f['filename']}"
+                    # Upload edited file to S3 in Lambda mode
+                    if _s3_check():
+                        edited_path = f["path"]
+                        if os.path.isfile(edited_path):
+                            with open(edited_path, "rb") as _fh:
+                                s3_res = _save_art(edit_task_id, f["filename"], _fh.read())
+                            file_url = s3_res.get("url", file_url)
                     artifact = {
                         "filename": f["filename"],
                         "path": f["path"],
                         "task_id": edit_task_id,
                         "type": f.get("type", "excel"),
                         "size_bytes": f.get("size_bytes", 0),
-                        "url": f"/api/tasks/{edit_task_id}/artifacts/{f['filename']}",
+                        "url": file_url,
                         "edited": True,
                     }
                     artifacts.append(artifact)

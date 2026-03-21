@@ -242,9 +242,41 @@ if _USE_DYNAMO:
         step_id: int, status: str, result_summary: str = "",
         tokens_used: int = 0, cost_usd: float = 0.0,
     ) -> None:
-        # In DynamoDB we need task_id and step_number — this is a limitation
-        # For simplicity, scan for the step_id (rare operation)
-        pass
+        # Scan for the step by step_id (rare operation, small dataset)
+        from boto3.dynamodb.conditions import Attr
+        table = _get_table()
+        resp = table.scan(
+            FilterExpression=Attr("step_id").eq(step_id),
+            Limit=50,
+        )
+        items = resp.get("Items", [])
+        if not items:
+            return
+        item = items[0]
+        expr_parts = ["#st = :status"]
+        expr_names = {"#st": "status"}
+        expr_values: dict[str, Any] = {":status": status}
+        if result_summary:
+            expr_parts.append("result_summary = :rs")
+            expr_values[":rs"] = result_summary
+        if tokens_used:
+            expr_parts.append("tokens_used = :tu")
+            expr_values[":tu"] = tokens_used
+        if cost_usd:
+            expr_parts.append("cost_usd = :cu")
+            expr_values[":cu"] = str(cost_usd)
+        if status == "RUNNING":
+            expr_parts.append("started_at = :sa")
+            expr_values[":sa"] = str(time.time())
+        if status in ("COMPLETED", "FAILED"):
+            expr_parts.append("completed_at = :ca")
+            expr_values[":ca"] = str(time.time())
+        table.update_item(
+            Key={"pk": item["pk"], "sk": item["sk"]},
+            UpdateExpression="SET " + ", ".join(expr_parts),
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+        )
 
     def get_task_steps(task_id: str) -> list[dict]:
         table = _get_table()

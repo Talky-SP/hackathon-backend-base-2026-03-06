@@ -451,10 +451,74 @@ if _USE_DYNAMO:
 
     def get_location_traces(location_id: str, since: float | None = None, limit: int = 100) -> dict:
         table = _get_table()
-        # Query traces from CHAT# partitions — for simplicity, use GSI1 with LOC# prefix
-        # Actually traces are stored under CHAT# partitions, not LOC#.
-        # For location-level aggregation, we'd need a separate pattern.
-        # Simplified: return recent costs from GSI1
+        # Step 1: get all chats for this location
+        chats_resp = table.query(
+            KeyConditionExpression=Key("pk").eq(f"LOC#{location_id}") & Key("sk").begins_with("CHAT#"),
+        )
+        chat_ids = [i.get("chat_id") for i in chats_resp.get("Items", []) if i.get("chat_id")]
+
+        # Step 2: gather traces from each chat
+        all_traces = []
+        for cid in chat_ids:
+            kce = Key("pk").eq(f"CHAT#{cid}") & Key("sk").begins_with("TRACE#")
+            resp = table.query(KeyConditionExpression=kce, ScanIndexForward=False, Limit=limit)
+            for item in resp.get("Items", []):
+                started = float(item.get("started_at", 0))
+                if since and started < since:
+                    continue
+                all_traces.append(item)
+
+        # Step 3: aggregate
+        total_prompt = sum(int(i.get("prompt_tokens", 0)) for i in all_traces)
+        total_compl = sum(int(i.get("completion_tokens", 0)) for i in all_traces)
+        total_tok = sum(int(i.get("total_tokens", 0)) for i in all_traces)
+        total_cost = sum(float(i.get("cost_usd", 0)) for i in all_traces)
+        latencies = [int(i.get("latency_ms", 0)) for i in all_traces if int(i.get("latency_ms", 0)) > 0]
+        avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else 0
+
+        # Step 4: by_model breakdown
+        by_model_map: dict[str, dict] = {}
+        for i in all_traces:
+            m = i.get("model", "")
+            if not m:
+                continue
+            if m not in by_model_map:
+                by_model_map[m] = {"model": m, "calls": 0, "total_tokens": 0, "cost_usd": 0.0, "avg_latency_ms": 0, "_lat_sum": 0, "_lat_count": 0}
+            by_model_map[m]["calls"] += 1
+            by_model_map[m]["total_tokens"] += int(i.get("total_tokens", 0))
+            by_model_map[m]["cost_usd"] += float(i.get("cost_usd", 0))
+            lat = int(i.get("latency_ms", 0))
+            if lat > 0:
+                by_model_map[m]["_lat_sum"] += lat
+                by_model_map[m]["_lat_count"] += 1
+        by_model = []
+        for v in sorted(by_model_map.values(), key=lambda x: x["cost_usd"], reverse=True):
+            v["avg_latency_ms"] = round(v["_lat_sum"] / v["_lat_count"], 1) if v["_lat_count"] else 0
+            v["cost_usd"] = round(v["cost_usd"], 6)
+            del v["_lat_sum"]
+            del v["_lat_count"]
+            by_model.append(v)
+
+        # Step 5: recent traces (parsed)
+        all_traces.sort(key=lambda x: float(x.get("started_at", 0)), reverse=True)
+        recent = [_parse_trace_item(i) for i in all_traces[:limit]]
+
+        return {
+            "location_id": location_id,
+            "summary": {
+                "total_calls": len(all_traces),
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_compl,
+                "total_tokens": total_tok,
+                "total_cost_usd": round(total_cost, 6),
+                "avg_latency_ms": avg_latency,
+            },
+            "by_model": by_model,
+            "recent": recent,
+        }
+
+    def get_location_costs(location_id: str, since: float | None = None) -> dict:
+        table = _get_table()
         kce = Key("gsi1pk").eq(f"LOC#{location_id}#COST")
         if since:
             kce = kce & Key("gsi1sk").gte(str(since))
@@ -462,18 +526,38 @@ if _USE_DYNAMO:
             IndexName="gsi1",
             KeyConditionExpression=kce,
             ScanIndexForward=False,
-            Limit=limit,
         )
         items = resp.get("Items", [])
+        total_prompt = sum(int(i.get("prompt_tokens", 0)) for i in items)
+        total_compl = sum(int(i.get("completion_tokens", 0)) for i in items)
+        total_tok = sum(int(i.get("total_tokens", 0)) for i in items)
         total_cost = sum(float(i.get("cost_usd", 0)) for i in items)
+
+        # by_model breakdown
+        by_model_map: dict[str, dict] = {}
+        for i in items:
+            m = i.get("model", "unknown")
+            if m not in by_model_map:
+                by_model_map[m] = {"model": m, "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+            by_model_map[m]["calls"] += 1
+            by_model_map[m]["prompt_tokens"] += int(i.get("prompt_tokens", 0))
+            by_model_map[m]["completion_tokens"] += int(i.get("completion_tokens", 0))
+            by_model_map[m]["total_tokens"] += int(i.get("total_tokens", 0))
+            by_model_map[m]["cost_usd"] += float(i.get("cost_usd", 0))
+
+        by_model = sorted(by_model_map.values(), key=lambda x: x["cost_usd"], reverse=True)
+
         return {
             "location_id": location_id,
-            "summary": {"total_calls": len(items), "total_cost_usd": round(total_cost, 6)},
-            "recent": items[:20],
+            "summary": {
+                "total_calls": len(items),
+                "prompt_tokens": total_prompt,
+                "completion_tokens": total_compl,
+                "total_tokens": total_tok,
+                "total_cost_usd": round(total_cost, 6),
+            },
+            "by_model": by_model,
         }
-
-    def get_location_costs(location_id: str, since: float | None = None) -> dict:
-        return get_location_traces(location_id, since=since)
 
     def _parse_trace_item(item: dict) -> dict:
         d = dict(item)

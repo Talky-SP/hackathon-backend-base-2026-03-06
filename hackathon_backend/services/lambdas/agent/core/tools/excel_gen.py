@@ -384,13 +384,23 @@ def generate_modelo_303_excel(task_id: str, data: dict) -> str:
 
 
 def get_artifact_path(task_id: str, filename: str) -> str | None:
-    """Get the full path for an artifact file."""
+    """Get the full path for an artifact file (local filesystem)."""
     path = os.path.join(ARTIFACTS_DIR, task_id, filename)
     return path if os.path.exists(path) else None
 
 
+def get_artifact_url(task_id: str, filename: str) -> str | None:
+    """Get a download URL for an artifact — S3 presigned URL or local API path."""
+    from hackathon_backend.services.lambdas.agent.core.storage import get_artifact_url as _s3_url
+    return _s3_url(task_id, filename)
+
+
 def list_artifacts(task_id: str) -> list[dict]:
-    """List all artifacts for a task."""
+    """List all artifacts for a task — checks both local and S3."""
+    from hackathon_backend.services.lambdas.agent.core.storage import list_artifacts as _s3_list, _use_s3
+    if _use_s3():
+        return _s3_list(task_id)
+    # Local mode
     dir_path = os.path.join(ARTIFACTS_DIR, task_id)
     if not os.path.isdir(dir_path):
         return []
@@ -402,5 +412,19 @@ def list_artifacts(task_id: str) -> list[dict]:
                 "filename": f,
                 "size_bytes": os.path.getsize(fp),
                 "path": fp,
+                "url": f"/api/tasks/{task_id}/artifacts/{f}",
             })
     return artifacts
+
+
+def upload_artifact_to_s3(task_id: str, filename: str) -> dict | None:
+    """Upload a locally generated artifact to S3 (no-op in local mode)."""
+    from hackathon_backend.services.lambdas.agent.core.storage import save_artifact, _use_s3
+    if not _use_s3():
+        return None
+    local_path = os.path.join(ARTIFACTS_DIR, task_id, filename)
+    if not os.path.isfile(local_path):
+        return None
+    with open(local_path, "rb") as f:
+        data = f.read()
+    return save_artifact(task_id, filename, data)
