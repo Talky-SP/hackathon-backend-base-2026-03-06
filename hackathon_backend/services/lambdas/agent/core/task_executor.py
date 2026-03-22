@@ -832,8 +832,8 @@ You MUST generate an Excel file — this is a report task, not just a data query
         "pack_reporting": """\
 TASK-SPECIFIC GUIDANCE — PACK REPORTING:
 Build a monthly financial reporting pack (P&L + KPIs).
-1. Query User_Expenses via UserIdPnlDateIndex for the current month's expenses.
-2. Query User_Invoice_Incomes via UserIdPnlDateIndex for income in the same period.
+1. Query User_Expenses via UserIdInvoiceDateIndex for the current month's expenses.
+2. Query User_Invoice_Incomes via UserIdInvoiceDateIndex for income in the same period.
 3. Query Payroll_Slips for salary costs in the period.
 4. Build P&L in run_code: Revenue - COGS - Operating Expenses - Payroll = Operating Profit.
 5. IMPORTANT: Use run_code to create Excel (save to output_dir) with P&L sheet, KPIs sheet, and charts.
@@ -842,9 +842,9 @@ You MUST generate an Excel file — this is a report task.""",
         "modelo_303": """\
 TASK-SPECIFIC GUIDANCE — MODELO 303 (IVA TRIMESTRAL):
 Build a quarterly VAT return draft.
-1. Query User_Expenses via UserIdPnlDateIndex for the quarter.
+1. Query User_Expenses via UserIdInvoiceDateIndex for the quarter.
    Extract: ivas[] array, vatDeductibleAmount, vatNonDeductibleAmount, vatOperationType.
-2. Query User_Invoice_Incomes via UserIdPnlDateIndex for the same quarter.
+2. Query User_Invoice_Incomes via UserIdInvoiceDateIndex for the same quarter.
 3. Calculate in run_code: Bases imponibles por tipo, cuotas soportadas deducibles, cuotas repercutidas.
 4. IMPORTANT: Use run_code to create Excel (save to output_dir) with the Modelo 303 draft.
 You MUST generate an Excel file — this is a report task.""",
@@ -887,7 +887,10 @@ Steps:
    IMPORTANT: Unreconciled txns (status=PENDING) do NOT have the `reconciled` field at all,
    and are NOT indexed in LocationByStatusDate GSI. You MUST query all, then filter in run_code.
    In code: unreconciled = [t for t in txns if t.get('status') != 'MATCHED']
-2. Query User_Expenses by PK. In run_code filter items where reconciled is None/missing.
+2. Query User_Expenses by PK. In run_code filter UNRECONCILED invoices:
+   `unreconciled_invoices = [it for it in items if not it.get('reconciled')]`
+   The field 'reconciled' is True for reconciled invoices, MISSING (not present) for unreconciled.
+   WARNING: Do NOT use 'reconciliationState' — it is ALWAYS 'UNRECONCILED' for ALL items (broken field).
 3. Query User_Invoice_Incomes by PK. Same filter for unreconciled.
 4. In run_code, implement matching algorithm:
 
@@ -941,7 +944,7 @@ TODAY: 2026-03-21
 
 AVAILABLE TABLES (DynamoDB):
 1. User_Expenses — PK=userId, SK=categoryDate (CATEGORY#YYYY-MM-DD#UUID)
-   GSIs: UserIdInvoiceDateIndex(sk=invoice_date), UserIdSupplierCifIndex(sk=supplier_cif), UserIdPnlDateIndex(sk=pnl_date)
+   GSIs: UserIdInvoiceDateIndex(sk=invoice_date), UserIdSupplierCifIndex(sk=supplier_cif), UserIdInvoiceDateIndex(sk=pnl_date)
    Fields: total, importe, ivas[], supplier, supplier_cif, invoice_date, due_date, category, concept, reconciled (None/False=unpaid), accountingEntries[], all_products[]
    NOTE: For unpaid invoices, query by PK and filter reconciled=None/False in run_code (the UserByReconStateDate GSI may not have data)
 

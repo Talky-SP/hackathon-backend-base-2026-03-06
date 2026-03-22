@@ -50,7 +50,7 @@ TABLE_CATALOG: dict[str, dict] = {
         },
         "numeric_fields": ["total", "importe", "vatTotalAmount", "retencion", "amount_due", "amount_paid"],
         "date_fields": ["invoice_date", "due_date", "pnl_date", "charge_date"],
-        "group_fields": ["category", "concept", "supplier", "supplier_cif", "documentKind"],
+        "group_fields": ["category", "concept", "supplier", "supplier_cif", "documentKind", "reconciled"],
     },
 
     "User_Invoice_Incomes": {
