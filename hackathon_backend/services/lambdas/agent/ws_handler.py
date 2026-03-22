@@ -203,19 +203,26 @@ def _handle_chat_message(body: dict, question: str, connection_id: str, apigw) -
             connection_id, apigw,
         )
 
-    # Run agent pipeline
+    # Run agent pipeline (propagate Langfuse attributes for trace grouping)
+    from langfuse import propagate_attributes as _propagate_attrs
     try:
         on_event("step", {"step": "agent", "message": "Procesando..."})
-        result = run_agent(
-            user_message=question,
-            location_id=location_id,
-            model_id=model,
-            conversation_history=history if history else None,
-            on_event=on_event,
-            chat_id=chat_id,
-            attachments=attachments if attachments else None,
-            chat_artifacts=chat_artifacts if chat_artifacts else None,
-        )
+        with _propagate_attrs(
+            session_id=chat_id,
+            user_id=location_id,
+            tags=[model, "lambda"],
+            metadata={"chat_id": chat_id},
+        ):
+            result = run_agent(
+                user_message=question,
+                location_id=location_id,
+                model_id=model,
+                conversation_history=history if history else None,
+                on_event=on_event,
+                chat_id=chat_id,
+                attachments=attachments if attachments else None,
+                chat_artifacts=chat_artifacts if chat_artifacts else None,
+            )
     except CancelledError:
         clear_cancel(chat_id)
         _send_to_connection(connection_id, {
@@ -300,20 +307,27 @@ def _handle_heavy_task(
             "type": event, "request_id": request_id, **data,
         }, apigw)
 
+    from langfuse import propagate_attributes as _propagate_attrs
     try:
         on_task_event("task_progress", {"task_id": task_id, "progress": 5, "step": "Iniciando agente..."})
-        result = run_agent(
-            user_message=question,
-            location_id=location_id,
-            model_id=model,
-            conversation_history=history if history else None,
-            on_event=on_task_event,
-            chat_id=chat_id,
-            task_id=task_id,
-            extra_system=task_guidance,
-            attachments=attachments if attachments else None,
-            chat_artifacts=chat_artifacts if chat_artifacts else None,
-        )
+        with _propagate_attrs(
+            session_id=chat_id,
+            user_id=location_id,
+            tags=[model, "lambda", "task"],
+            metadata={"chat_id": chat_id, "task_id": task_id},
+        ):
+            result = run_agent(
+                user_message=question,
+                location_id=location_id,
+                model_id=model,
+                conversation_history=history if history else None,
+                on_event=on_task_event,
+                chat_id=chat_id,
+                task_id=task_id,
+                extra_system=task_guidance,
+                attachments=attachments if attachments else None,
+                chat_artifacts=chat_artifacts if chat_artifacts else None,
+            )
         answer = result.get("answer", "")
         update_task_status(task_id, "COMPLETED", progress=100, result_summary=answer[:500])
         on_task_event("task_completed", {

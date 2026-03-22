@@ -1,10 +1,13 @@
-from aws_cdk import Stage, Tags
+from aws_cdk import Stage, Stack, Tags
 from constructs import Construct
 from hackathon_backend.config.environments import get_config_for_env
 from hackathon_backend.stacks.dynamodb_stack import DynamoDBStack
 from hackathon_backend.stacks.s3_stack import S3Stack
 from hackathon_backend.stacks.lambda_stack import LambdaStack
 from hackathon_backend.stacks.api_stack import ApiStack
+
+# Prefix to avoid CloudFormation stack name collisions with other apps (e.g. Talky)
+_PREFIX = "Hackathon"
 
 
 class DeploymentStage(Stage):
@@ -19,14 +22,14 @@ class DeploymentStage(Stage):
             Tags.of(self).add(tag_key, tag_value)
 
         # 1. DynamoDB (data tables + agent tables + WS connections)
-        dynamodb_stack = DynamoDBStack(self, "DynamoDBStack", config=self.config)
+        dynamodb_stack = DynamoDBStack(self, f"{_PREFIX}DynamoDBStack", config=self.config)
 
         # 2. S3 (artifacts bucket)
-        s3_stack = S3Stack(self, "S3Stack", config=self.config)
+        s3_stack = S3Stack(self, f"{_PREFIX}S3Stack", config=self.config)
 
         # 3. Lambda (depends on DynamoDB + S3)
         lambda_stack = LambdaStack(
-            self, "LambdaStack",
+            self, f"{_PREFIX}LambdaStack",
             config=self.config,
             dynamodb_stack=dynamodb_stack,
             s3_stack=s3_stack,
@@ -36,7 +39,7 @@ class DeploymentStage(Stage):
 
         # 4. API Gateway (depends on Lambda)
         api_stack = ApiStack(
-            self, "ApiStack",
+            self, f"{_PREFIX}ApiStack",
             lambda_stack=lambda_stack,
             config=self.config,
         )

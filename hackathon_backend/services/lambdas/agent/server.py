@@ -55,7 +55,7 @@ from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution, CODE_EXEC_SYSTEM, collect_sandbox_files, ARTIFACTS_DIR,
 )
 
-from langfuse import observe, get_client as _get_langfuse_client
+from langfuse import observe, get_client as _get_langfuse_client, propagate_attributes
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -129,49 +129,57 @@ def _run_pipeline(
         if on_event:
             on_event(event, data)
 
-    # Check if this should be a background task
-    heavy_task_type = detect_heavy_task(question)
-    if heavy_task_type and not task_id:
-        # Signal the caller to create a background task.
-        emit("step", {"step": "detect", "message": f"Tarea compleja detectada: {heavy_task_type}"})
+    # Propagate Langfuse attributes so ALL child spans share session/user
+    session_id = chat_id or task_id or ""
+    with propagate_attributes(
+        session_id=session_id,
+        user_id=location_id,
+        tags=[model, task_id or "chat"],
+        metadata={"chat_id": chat_id or "", "task_id": task_id or ""},
+    ):
+        # Check if this should be a background task
+        heavy_task_type = detect_heavy_task(question)
+        if heavy_task_type and not task_id:
+            # Signal the caller to create a background task.
+            emit("step", {"step": "detect", "message": f"Tarea compleja detectada: {heavy_task_type}"})
+            return {
+                "type": "complex_task",
+                "answer": (
+                    f"Esta tarea requiere procesamiento en segundo plano. "
+                    f"Tipo detectado: {TASK_TYPE_NAMES.get(heavy_task_type, heavy_task_type)}."
+                ),
+                "task_type": heavy_task_type,
+                "chart": None,
+                "sources": [],
+                "artifacts": [],
+                "model_used": model,
+                "usage": [],
+            }
+
+        emit("step", {"step": "agent", "message": "Procesando..."})
+
+        agent_result = run_agent(
+            user_message=question,
+            location_id=location_id,
+            model_id=model,
+            conversation_history=conversation_history,
+            on_event=on_event,
+            chat_id=chat_id,
+            task_id=task_id,
+            extra_system=extra_system,
+            attachments=attachments,
+            chat_artifacts=chat_artifacts,
+        )
+
         return {
-            "type": "complex_task",
-            "answer": (
-                f"Esta tarea requiere procesamiento en segundo plano. "
-                f"Tipo detectado: {TASK_TYPE_NAMES.get(heavy_task_type, heavy_task_type)}."
-            ),
-            "task_type": heavy_task_type,
-            "chart": None,
-            "sources": [],
-            "artifacts": [],
+            "type": "full_answer",
+            "answer": agent_result.get("answer", ""),
+            "chart": agent_result.get("chart"),
+            "sources": agent_result.get("sources") or [],
+            "artifacts": agent_result.get("artifacts", []),
             "model_used": model,
-            "usage": [],
+            "usage": agent_result.get("usage", []),
         }
-
-    emit("step", {"step": "agent", "message": "Procesando..."})
-
-    agent_result = run_agent(
-        user_message=question,
-        location_id=location_id,
-        model_id=model,
-        conversation_history=conversation_history,
-        on_event=on_event,
-        chat_id=chat_id,
-        task_id=task_id,
-        extra_system=extra_system,
-        attachments=attachments,
-        chat_artifacts=chat_artifacts,
-    )
-
-    return {
-        "type": "full_answer",
-        "answer": agent_result.get("answer", ""),
-        "chart": agent_result.get("chart"),
-        "sources": agent_result.get("sources") or [],
-        "artifacts": agent_result.get("artifacts", []),
-        "model_used": model,
-        "usage": agent_result.get("usage", []),
-    }
 
 
 def _collect_chat_artifacts(chat_id: str) -> list[dict]:

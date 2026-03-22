@@ -574,13 +574,15 @@ IMPORTANT RULES:
 8. Handle edge cases (empty data, missing fields) gracefully
 
 DATA LOADING:
-- Data is provided as base64-encoded JSON in the DATA section (variable FULL_DATA_B64).
-- ALWAYS decode it first:
+- The DATA section at the end of the user message contains a raw base64-encoded string.
+- This base64 string decodes to JSON with the real database data.
+- ALWAYS decode the DATA section FIRST before doing anything else:
   import json, base64
-  data = json.loads(base64.b64decode(FULL_DATA_B64))
-- data is a dict: {"query_1": {"items": [...], "count": N, "table": "TableName"}, ...}
-- Use ALL items from each query. NEVER use sample/dummy data. NEVER limit to a subset.
-- If FULL_DATA_B64 is not present, the data may be inline JSON — parse it directly.
+  raw_b64 = "<entire content of DATA section>"
+  data = json.loads(base64.b64decode(raw_b64))
+- After decoding, data is a dict like: {"query_1": {"items": [...], "count": N, "table": "TableName"}, ...}
+- Use ALL items from each query. NEVER use sample/dummy/fake data. NEVER limit to a subset.
+- NEVER create example data or placeholder data. The real data IS in the DATA section.
 """
 
 

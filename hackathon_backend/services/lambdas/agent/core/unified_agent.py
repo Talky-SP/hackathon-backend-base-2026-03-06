@@ -779,9 +779,11 @@ def run_agent(
                     "task_id": file_task_id,
                 })
 
-                # CRITICAL: Pass FULL query data as base64-encoded JSON file.
+                # CRITICAL: Pass FULL query data as base64-encoded JSON.
                 # The LLM's data_json is unreliable (JS templates, truncated, etc.)
-                # We encode full query_results as base64 — same pattern as edit_file.
+                # We encode full query_results as base64 — the DATA section will
+                # contain ONLY the raw base64 string, making it trivial for the
+                # sandbox LLM to decode.
                 import base64 as _b64_gen
 
                 gen_prompt = args.get("prompt", "")
@@ -801,27 +803,25 @@ def run_agent(
                     data_json_bytes = json.dumps(full_data, ensure_ascii=False, default=str).encode("utf-8")
                     data_b64 = _b64_gen.b64encode(data_json_bytes).decode()
 
-                    # Build data_context with base64 data
-                    data_for_exec = json.dumps({
-                        "FULL_DATA_B64": data_b64,
-                        "total_items": total_items,
-                        "queries": {k: {"count": v["count"], "table": v["table"]} for k, v in full_data.items()},
-                    }, ensure_ascii=False)
+                    # data_context = raw base64 string (nothing else)
+                    data_for_exec = data_b64
 
                     # Prepend data loading instructions to the prompt
                     gen_prompt = (
-                        f"IMPORTANT — DATA LOADING:\n"
-                        f"The full dataset ({total_items} items) is provided as base64-encoded JSON.\n"
-                        f"You MUST decode it FIRST before doing anything else:\n"
+                        f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
+                        f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
+                        f"Copy the ENTIRE content of the DATA section into a Python variable and decode it:\n"
                         f"```python\n"
                         f"import json, base64\n"
-                        f"data = json.loads(base64.b64decode(FULL_DATA_B64))\n"
-                        f"# data is a dict with keys like 'query_1', 'query_2', etc.\n"
-                        f"# Each has: {{'items': [...], 'count': N, 'table': 'TableName'}}\n"
-                        f"# Example: all_items = data['query_1']['items']  # list of {total_items} dicts\n"
+                        f"# The DATA section below contains the raw base64 string — copy it all\n"
+                        f"raw_b64 = \"\"\"<paste entire DATA section here>\"\"\"\n"
+                        f"data = json.loads(base64.b64decode(raw_b64))\n"
+                        f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
+                        f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
                         f"```\n"
-                        f"NEVER use sample/dummy data. NEVER limit to a subset. Use ALL {total_items} items.\n"
-                        f"The variable FULL_DATA_B64 is available in the DATA section below.\n\n"
+                        f"The DATA section contains {total_items} real items from the database.\n"
+                        f"NEVER use sample/dummy/fake data. NEVER create example data. Use ONLY the decoded data.\n"
+                        f"NEVER limit to a subset — use ALL {total_items} items.\n\n"
                         f"TASK:\n{args.get('prompt', '')}"
                     )
                 else:

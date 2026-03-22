@@ -8,7 +8,7 @@ RUN pip install --upgrade pip
 
 # Copy requirements first (cache layer)
 COPY requirements-lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir --only-binary tiktoken -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
 # Copy the full agent package
 COPY hackathon_backend/ ${LAMBDA_TASK_ROOT}/hackathon_backend/
