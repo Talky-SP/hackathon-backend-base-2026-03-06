@@ -217,14 +217,15 @@ if _USE_DYNAMO:
         # Update chat metadata (updated_at, message_count, auto-title)
         chat = get_chat(chat_id)
         if chat:
-            update_expr = "SET #ua = :now ADD #mc :one"
+            set_parts = ["#ua = :now"]
             expr_names: dict[str, str] = {"#ua": "updated_at", "#mc": "message_count"}
             expr_values: dict[str, Any] = {":now": str(now), ":one": 1}
             if role == "user" and not chat.get("title"):
                 title = content[:80] + ("..." if len(content) > 80 else "")
-                update_expr += ", #tt = :title"
+                set_parts.append("#tt = :title")
                 expr_names["#tt"] = "title"
                 expr_values[":title"] = title
+            update_expr = "SET " + ", ".join(set_parts) + " ADD #mc :one"
             table.update_item(
                 Key={"pk": f"CHAT#{chat_id}", "sk": "META"},
                 UpdateExpression=update_expr,
