@@ -675,12 +675,18 @@ RULES:
 - For cash flow: Use Bank_Reconciliations. amount<0 = outflow, amount>0 = inflow.
 - When you need data from multiple tables, call dynamo_query multiple times in a SINGLE response.
 
-BANK RECONCILIATION RULES:
-- Reconciled transactions: status=MATCHED, reconciled=True, status_date populated.
-- Unreconciled transactions: status=PENDING, `reconciled` field is MISSING (NOT false).
-  DO NOT use LocationByStatusDate GSI for unreconciled — not indexed there.
+RECONCILIATION RULES:
+Bank_Reconciliations:
+- Reconciled txns: status='MATCHED', reconciled=True.
+- Unreconciled txns: status='PENDING', 'reconciled' field is MISSING (NOT false).
 - ALL transactions: query PK=locationId (no GSI) -> returns all.
-- Only RECONCILED: filter status="MATCHED". Only UNRECONCILED: filter status="PENDING".
+
+User_Expenses (invoice reconciliation):
+- Reconciled invoice: reconciled=True (field exists and is True).
+- Unreconciled invoice: 'reconciled' field is MISSING (not present at all, never False).
+- DO NOT use reconciliationState — it is UNRELIABLE (always says UNRECONCILED even for reconciled invoices).
+- To filter unreconciled: `[it for it in items if not it.get('reconciled')]`
+- To filter reconciled: `[it for it in items if it.get('reconciled') == True]`
 
 - ALWAYS respond in the same language the user writes in.
 - Use EUR formatting and Spanish number format (1.234,56) in text. Raw numbers in charts.

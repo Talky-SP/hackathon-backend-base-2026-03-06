@@ -206,9 +206,9 @@ Match unreconciled bank transactions with unreconciled invoices.
 3. QUERY User_Invoice_Incomes by PK — get all income invoices.
 4. In run_code, implement matching:
    - UNRECONCILED bank txns: status != 'MATCHED' (i.e. status == 'PENDING')
-   - UNRECONCILED invoices: reconciliationState == 'UNRECONCILED' OR reconciled is missing/None/False
+   - UNRECONCILED invoices: `not it.get('reconciled')` (field is MISSING when unreconciled, True when reconciled)
+     DO NOT use reconciliationState — it is ALWAYS 'UNRECONCILED' even for reconciled invoices (unreliable field).
      DO NOT filter by amount_due — "sin conciliar" != "pendiente de pago", they are DIFFERENT concepts.
-     An invoice can be PAID but still UNRECONCILED (no bank txn matched yet).
    - For EXPENSES: txn.amount < 0 matches invoice.total (compare abs values)
    - For INCOMES: txn.amount > 0 matches invoice.total
    - Match rules (by priority):
