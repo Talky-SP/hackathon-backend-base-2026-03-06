@@ -170,23 +170,61 @@ PLAYBOOKS: dict[str, dict[str, Any]] = {
     "cierre_contable": {
         "name": "Cierre Contable Mensual",
         "guidance": """\
-PLAYBOOK — CIERRE CONTABLE:
-You are performing a monthly accounting close. Follow this checklist:
+PLAYBOOK — CIERRE CONTABLE (WORLD-CLASS ACCOUNTING CLOSE):
+You are a senior financial controller performing a monthly accounting close.
+Your report must be thorough, professional, and actionable.
 
-1. QUERY User_Expenses (UserIdInvoiceDateIndex, pnl_date range for the month) — get all expense invoices.
-2. QUERY User_Invoice_Incomes (same index) — get all income invoices.
-3. QUERY Payroll_Slips for the month — payroll costs.
-4. QUERY Bank_Reconciliations — all transactions for the month.
-5. In run_code, perform these checks:
-   a) Revenue completeness: all income invoices accounted for
-   b) Expense completeness: all expense invoices categorized
-   c) Bank reconciliation status: % matched vs unmatched
-   d) Payroll booked correctly: gross, SS, IRPF entries balanced
-   e) VAT check: IVA soportado vs repercutido totals
-   f) Identify: missing invoices (bank txns without matching invoice), uncategorized expenses
-6. Generate summary with key metrics and any blocking issues.
+STEP 1 — FETCH DATA (parallel queries):
+  - User_Expenses via UserIdInvoiceDateIndex for the month
+  - User_Invoice_Incomes via UserIdInvoiceDateIndex for the month
+  - Bank_Reconciliations by PK (ALL — then filter by month in code)
+  - Payroll_Slips by PK (then filter by month in code)
 
-IMPORTANT: Start with multiple parallel dynamo_query calls to fetch all data at once.""",
+STEP 2 — EXPLORE & VALIDATE (first run_code):
+  Filter bank transactions for the target month (by bookingDate).
+  Then build a complete picture:
+
+  REVENUE CHECK:
+  - Count and sum income invoices. Any missing?
+  - Cross-reference with bank inflows: are there inflows without invoices?
+
+  EXPENSE CHECK:
+  - Count and sum expense invoices by category
+  - Reconciliation status: how many reconciled vs pending?
+  - Identify pending invoices with amounts
+
+  BANK ANALYSIS:
+  - Total bank movements for the month (inflows vs outflows)
+  - Reconciliation rate: % matched vs unmatched
+  - Identify large unmatched transactions (potential missing invoices)
+  - Detect payroll payments in bank (look for "nomina", "SS", "IRPF" in descriptions)
+
+  VAT SUMMARY:
+  - IVA soportado (from expenses): sum of vatTotalAmount or ivas[]
+  - IVA repercutido (from income invoices): sum of vatTotalAmount
+  - Net VAT position
+
+  DO NOT set `result` here. Continue to STEP 3.
+
+STEP 3 — GENERATE CLOSING REPORT (second run_code):
+  Create a professional Excel with:
+  - Sheet "Resumen Cierre": executive summary with status (CERRADO/BLOQUEADO/PENDIENTE)
+    Key metrics: ingresos, gastos, resultado, IVA, % conciliación
+  - Sheet "Gastos por Categoría": expenses grouped by category with totals
+  - Sheet "Movimientos Banco": bank transactions for the month with status
+  - Sheet "Pendientes": items blocking the close (unreconciled, missing invoices)
+  - Sheet "IVA": VAT detail (soportado vs repercutido by rate)
+
+  Set `result` with:
+  - "answer": executive summary with status and action items
+  - "chart": bar chart showing expenses by category
+  - "sources": ONLY the problematic items (pending invoices, unmatched txns) — NOT all data
+
+IMPORTANT:
+- Bank_Reconciliations is the source of truth for cash. Filter by bookingDate for the month.
+- DO NOT use pandas. Use basic Python.
+- Complete ALL steps. Only set `result` in STEP 3 with Excel.
+- The close status should be: CERRADO (all OK), BLOQUEADO (critical issues), PENDIENTE (minor issues).""",
         "suggested_queries": [
             {"table": "User_Expenses", "index": "UserIdInvoiceDateIndex"},
             {"table": "User_Invoice_Incomes", "index": "UserIdInvoiceDateIndex"},
