@@ -51,7 +51,8 @@
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, UNIFIED_TOOLS; print\\(f''OK: {len\\(UNIFIED_TOOLS\\)} tools''\\); print\\([t[''function''][''name''] for t in UNIFIED_TOOLS]\\)\")",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.subagent_runner import dispatch_subagents, run_subagent; print\\(''subagent_runner OK''\\)\")",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.playbooks import classify_intent, PLAYBOOKS, TASK_TYPES; print\\(f''Playbooks: {list\\(PLAYBOOKS.keys\\(\\)\\)}''\\); print\\(f''Types: {TASK_TYPES}''\\)\")",
-      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import UNIFIED_TOOLS; print\\([t[''function''][''name''] for t in UNIFIED_TOOLS]\\)\")"
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import UNIFIED_TOOLS; print\\([t[''function''][''name''] for t in UNIFIED_TOOLS]\\)\")",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent; from hackathon_backend.services.lambdas.agent.core.subagent_runner import _find_extracted_list; print\\(''OK''\\); print\\(_find_extracted_list\\({''invoices'': [1,2,3], ''summary'': ''test''}\\)\\); print\\(_find_extracted_list\\({''extracted_data'': [4,5]}\\)\\); print\\(_find_extracted_list\\({''foo'': [6,7,8,9], ''bar'': ''x''}\\)\\)\")"
     ]
   }
 }

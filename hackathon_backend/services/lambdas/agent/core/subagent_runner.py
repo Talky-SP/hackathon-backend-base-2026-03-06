@@ -113,6 +113,32 @@ _SUBAGENT_TOOLS = [
 
 
 # ---------------------------------------------------------------------------
+# Helper: find the extracted data list from a subagent result dict
+# ---------------------------------------------------------------------------
+_EXTRACTED_KEYS = [
+    "extracted_data", "invoices", "documents", "facturas",
+    "data", "items", "results", "entries", "records",
+]
+
+
+def _find_extracted_list(result: dict) -> list | None:
+    """Find the list of extracted items in a subagent result, regardless of key name."""
+    # Try known keys first
+    for key in _EXTRACTED_KEYS:
+        val = result.get(key)
+        if isinstance(val, list) and val:
+            return val
+    # Fallback: find the largest list value in the dict
+    best = None
+    best_len = 0
+    for key, val in result.items():
+        if isinstance(val, list) and len(val) > best_len:
+            best = val
+            best_len = len(val)
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Subagent system prompt
 # ---------------------------------------------------------------------------
 def _subagent_system_prompt(objective: str, location_id: str, doc_count: int) -> str:
@@ -458,9 +484,14 @@ def run_subagent(
                         "size_bytes": f.get("size_bytes", 0),
                     })
 
-                # If result has data, this subagent is done
-                if isinstance(result_val, dict) and result_val.get("extracted_data") is not None:
-                    log.info(f"[subagent:{subagent_id}] Got structured result with {len(result_val.get('extracted_data', []))} docs")
+                # If result has data, this subagent is done.
+                # Accept any dict result — the LLM may use various key names.
+                if isinstance(result_val, dict) and result_val:
+                    # Normalize: find the list of extracted items regardless of key name
+                    extracted = _find_extracted_list(result_val)
+                    if extracted is not None:
+                        result_val["extracted_data"] = extracted  # normalize key
+                    log.info(f"[subagent:{subagent_id}] Got result with keys={list(result_val.keys())}, items={len(extracted or [])}")
                     return _subagent_result(subagent_id, True, result_val,
                                             artifacts, usage_records, None,
                                             iteration + 1, cost_usd)

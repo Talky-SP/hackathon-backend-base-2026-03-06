@@ -1465,7 +1465,7 @@ def run_agent(
                     usage_records.extend(sr.get("usage", []))
 
                 # Store FULL subagent results in query_results so run_code can access them
-                # (keeps them OUT of the LLM context but available for code execution)
+                # Flexible extraction: subagents may use various key names for the data list
                 all_extracted = []
                 subagent_summaries = []
                 for sr in dispatch_result.get("subagent_results", []):
@@ -1479,34 +1479,50 @@ def run_agent(
                     if sr.get("error"):
                         sa_summary["error"] = sr["error"]
 
-                    # Extract compact summary for LLM (not full data)
                     result_data = sr.get("result") or {}
                     if isinstance(result_data, dict):
+                        # The subagent_runner normalizes to "extracted_data" but fallback to any list
                         extracted = result_data.get("extracted_data", [])
+                        if not extracted:
+                            # Fallback: find any list in the result
+                            for _ek in ("invoices", "documents", "facturas", "data", "items", "results"):
+                                _ev = result_data.get(_ek)
+                                if isinstance(_ev, list) and _ev:
+                                    extracted = _ev
+                                    break
+                        if not extracted:
+                            # Last resort: find largest list value
+                            for _rv in result_data.values():
+                                if isinstance(_rv, list) and len(_rv) > len(extracted):
+                                    extracted = _rv
+
                         all_extracted.extend(extracted)
                         sa_summary["documents_processed"] = len(extracted)
-                        sa_summary["total_amount"] = sum(
-                            d.get("total", 0) or 0 for d in extracted if isinstance(d, dict)
-                        )
-                        # Compact preview: filename + total + matched status
+                        sa_summary["total_amount"] = round(sum(
+                            float(d.get("total", 0) or 0) for d in extracted if isinstance(d, dict)
+                        ), 2)
                         sa_summary["documents"] = [
                             {
                                 "filename": d.get("filename", "?"),
-                                "supplier": d.get("supplier", "?"),
+                                "supplier": d.get("supplier", d.get("supplier_name", "?")),
                                 "total": d.get("total"),
-                                "date": d.get("date"),
-                                "matched": d.get("matched_db_record") is not None,
+                                "date": d.get("date", d.get("invoice_date")),
+                                "matched": bool(d.get("matched_db_record") or d.get("matched") or d.get("already_registered")),
+                                "invoice_number": d.get("invoice_number", d.get("number", "")),
                                 "issues": d.get("issues", []),
                             }
-                            for d in extracted[:20]  # cap at 20 per subagent
+                            for d in extracted[:20]
                         ]
                         if result_data.get("issues"):
                             sa_summary["issues"] = result_data["issues"]
+                        if result_data.get("summary"):
+                            sa_summary["text_summary"] = str(result_data["summary"])[:200]
                     subagent_summaries.append(sa_summary)
 
+                log.info(f"[dispatch_subagents] Extracted {len(all_extracted)} total items from {len(subagent_summaries)} subagents")
+
                 # Store full extracted data in query_results for run_code access
-                query_counter += 1
-                subagent_data_key = f"subagent_results"
+                subagent_data_key = "subagent_results"
                 query_results[subagent_data_key] = {
                     "items": all_extracted,
                     "count": len(all_extracted),
@@ -1526,7 +1542,13 @@ def run_agent(
                         "documents": sa_sum.get("documents", []),
                     })
 
-                # Build COMPACT tool response for LLM (not the full data)
+                # Build data preview for LLM so it knows the structure
+                data_preview = ""
+                if all_extracted:
+                    sample = all_extracted[0]
+                    if isinstance(sample, dict):
+                        data_preview = f"Sample item keys: {list(sample.keys())}\nSample: {json.dumps(sample, ensure_ascii=False, default=str)[:500]}"
+
                 tool_response = {
                     "success": dispatch_result["success"],
                     "summary": dispatch_result["summary"],
@@ -1535,9 +1557,10 @@ def run_agent(
                     "total_extracted": len(all_extracted),
                     "subagent_results": subagent_summaries,
                     "data_access": (
-                        f"Full extracted data stored in data['{subagent_data_key}']['items'] "
-                        f"({len(all_extracted)} documents). Use run_code to process them."
+                        f"ALL {len(all_extracted)} extracted documents stored in data['{subagent_data_key}']['items']. "
+                        f"Use run_code to access: items = data['{subagent_data_key}']['items']"
                     ),
+                    "data_preview": data_preview,
                 }
 
                 emit("subagents_done", {
@@ -1546,7 +1569,6 @@ def run_agent(
                     "subagent_count": len(subtasks),
                     "documents_processed": len(all_extracted),
                     "total_cost": dispatch_result["total_cost_usd"],
-                    "elapsed_s": dispatch_result.get("elapsed_s"),
                     "subagents": subagent_summaries,
                 })
 
