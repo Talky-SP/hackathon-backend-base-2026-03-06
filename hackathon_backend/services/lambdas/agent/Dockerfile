@@ -3,6 +3,9 @@ FROM public.ecr.aws/lambda/python:3.11
 # System deps for openpyxl / pandas / etc.
 RUN yum install -y gcc gcc-c++ && yum clean all
 
+# Upgrade pip so pre-built wheels (tiktoken, numpy, etc.) are found
+RUN pip install --upgrade pip
+
 # Copy requirements first (cache layer)
 COPY requirements-lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
 RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
