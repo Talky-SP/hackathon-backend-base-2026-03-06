@@ -17,7 +17,11 @@
       "Bash(tasklist)",
       "Bash(python -m hackathon_backend.services.lambdas.agent.server --reload --port 8000)",
       "Bash(AWS_PROFILE=hackathon-equipo1 aws sts get-caller-identity)",
-      "Bash(AWS_PROFILE=hackathon-equipo1 python -m hackathon_backend.services.lambdas.agent.server --reload --port 8000)"
+      "Bash(AWS_PROFILE=hackathon-equipo1 python -m hackathon_backend.services.lambdas.agent.server --reload --port 8000)",
+      "Bash(taskkill //F //PID 59252 //T)",
+      "Bash(taskkill //F //PID 16960 //T)",
+      "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core -name \"*.pyc\" -delete)",
+      "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core -name \"__pycache__\" -type d -exec rm -rf {} +)"
     ]
   }
 }

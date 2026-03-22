@@ -4,7 +4,7 @@ Unified Agent v2 — "LLM as Director, Code as Executor"
 Single agent loop with tools:
   - dynamo_query: fetch data → returns dataset cards (metadata, not raw items)
   - run_code: execute Python locally on full dataset (analysis + file generation)
-  - edit_file: modify previously generated files via AI sandbox
+  - run_code with existing_files: edit previously generated files locally (fast)
 
 The LLM sees schemas, stats, and samples — NEVER thousands of raw items.
 It writes code that runs locally against the full dataset in a sandboxed exec().
@@ -32,7 +32,6 @@ from hackathon_backend.services.lambdas.agent.core.query_agent import (
     _execute_query, _sanitize, _extract_source,
 )
 from hackathon_backend.services.lambdas.agent.core.code_runner import (
-    run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
     ARTIFACTS_DIR,
 )
 from hackathon_backend.services.lambdas.agent.core.data_catalog import (
@@ -601,8 +600,6 @@ TOOLS:
   Use for: analysis, aggregation, charts, AND file generation (Excel, CSV, PDF).
   Environment: data dict, output_dir, pandas (pd), openpyxl, matplotlib (plt), numpy (np).
   Helpers: group_by(), monthly_totals(), top_n(), filter_items(), sum_field().
-- `edit_file`: Edit a previously generated file. Needs task_id + filename.
-
 MULTIMODAL INPUT:
 - Users can attach images (PNG, JPG) and PDFs — you can see and analyze them.
 
@@ -610,7 +607,7 @@ WORKFLOW:
 1. Simple questions: Answer directly.
 2. Data questions: dynamo_query -> read dataset card stats -> run_code for detailed analysis.
 3. File generation: dynamo_query -> run_code (write to output_dir).
-4. Edit file: Use edit_file with task_id/filename.
+4. Edit existing file: run_code with existing_files dict to load, modify, and save.
 
 DATASET CARDS:
 - dynamo_query returns metadata (field stats, distributions, 3 sample rows).
@@ -636,7 +633,7 @@ FILE GENERATION & EDITING:
   `existing_files` maps filename → absolute path of artifacts from previous turns.
   Example: `wb = openpyxl.load_workbook(existing_files['report.xlsx'])`
   Then modify and save to output_dir: `wb.save(f'{output_dir}/report.xlsx')`
-  This is FASTER than edit_file. Prefer run_code for Excel edits.
+  This is the ONLY way to edit files. Fast local execution, no extra LLM call.
 
 run_code RESULT FORMAT:
 ```python
@@ -710,7 +707,7 @@ def _build_user_content(
 def _build_artifact_context(chat_artifacts: list[dict] | None) -> str:
     if not chat_artifacts:
         return ""
-    lines = ["PREVIOUSLY GENERATED FILES (available for editing via edit_file tool):"]
+    lines = ["PREVIOUSLY GENERATED FILES (available in existing_files dict in run_code):"]
     for a in chat_artifacts:
         fname = a.get("filename", "?")
         tid = a.get("task_id", "?")
@@ -794,6 +791,8 @@ UNIFIED_TOOLS = [
                 "\n\nENVIRONMENT:\n"
                 "- `data`: dict of all query results. data['query_1']['items'] = list of dicts.\n"
                 "- `output_dir`: path to save files (Excel, CSV, PNG, PDF).\n"
+                "- `existing_files`: dict mapping filename→path for previously generated artifacts.\n"
+                "  To edit an existing file: wb = openpyxl.load_workbook(existing_files['name.xlsx'])\n"
                 "- Libraries: openpyxl, pandas (pd), numpy (np), matplotlib.pyplot (plt), json, Decimal.\n"
                 "- datetime, timedelta, Counter, defaultdict.\n"
                 "- Helpers: group_by(items, field, agg_field='total', agg_fn='sum'), "
@@ -815,27 +814,6 @@ UNIFIED_TOOLS = [
                     },
                 },
                 "required": ["code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": (
-                "Edit a previously generated file (Excel, CSV, etc.). "
-                "Provide task_id and filename of the existing file, plus "
-                "a prompt describing the edits. The AI sandbox modifies it."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {"type": "string", "description": "task_id of the file."},
-                    "filename": {"type": "string", "description": "Filename to edit."},
-                    "prompt": {"type": "string", "description": "Instructions for edits."},
-                    "data_json": {"type": "string", "description": "Optional additional data.", "default": ""},
-                },
-                "required": ["task_id", "filename", "prompt"],
             },
         },
     },
@@ -1271,109 +1249,18 @@ def run_agent(
                 })
 
             # ---------------------------------------------------------------
-            # edit_file — AI sandbox for editing existing files
+            # edit_file — DEPRECATED, redirect to run_code
             # ---------------------------------------------------------------
             elif fn_name == "edit_file":
-                edit_task_id = args.get("task_id", "")
-                edit_filename = args.get("filename", "")
-                edit_prompt = args.get("prompt", "")
-
-                emit("generating", {
-                    "message": f"Editando archivo {edit_filename}...",
-                    "detail": edit_prompt[:100],
-                    "model": model_id,
-                })
-
-                existing_path = os.path.join(ARTIFACTS_DIR, edit_task_id, edit_filename)
-                if not os.path.isfile(existing_path):
-                    from hackathon_backend.services.lambdas.agent.core.storage import _use_s3, get_artifact
-                    if _use_s3():
-                        file_bytes = get_artifact(edit_task_id, edit_filename)
-                        if file_bytes:
-                            os.makedirs(os.path.join(ARTIFACTS_DIR, edit_task_id), exist_ok=True)
-                            with open(existing_path, "wb") as _fw:
-                                _fw.write(file_bytes)
-                    if not os.path.isfile(existing_path):
-                        messages.append({
-                            "role": "tool", "tool_call_id": tc_id,
-                            "content": json.dumps({"error": f"File not found: {edit_filename} (task_id={edit_task_id})"}),
-                        })
-                        continue
-
-                import base64 as _b64
-                with open(existing_path, "rb") as fh:
-                    file_b64 = _b64.b64encode(fh.read()).decode()
-                file_size = os.path.getsize(existing_path)
-
-                edit_code_prompt = (
-                    f"You are editing an EXISTING file: {edit_filename} ({file_size} bytes).\n"
-                    f"The file is provided as base64 in the variable EXISTING_FILE_B64.\n"
-                    f"First decode it and load it, then apply the following edits:\n\n"
-                    f"{edit_prompt}\n\n"
-                    f"Save the modified file with the SAME filename."
-                )
-
-                emit("code_exec_start", {
-                    "message": f"Editando {edit_filename} con AI code execution...",
-                    "task_id": edit_task_id,
-                })
-
-                code_result = _native_code_exec(
-                    prompt=edit_code_prompt,
-                    model_id=model_id,
-                    data_context=json.dumps({
-                        "EXISTING_FILE_B64": file_b64,
-                        "filename": edit_filename,
-                        **(json.loads(args["data_json"]) if args.get("data_json") else {}),
-                    }),
-                    task_id=edit_task_id,
-                    system_prompt=CODE_EXEC_SYSTEM,
-                )
-
-                if code_result.get("usage"):
-                    cu = code_result["usage"]
-                    if isinstance(cu, dict):
-                        usage_records.append(cu)
-                    elif isinstance(cu, list):
-                        usage_records.extend(cu)
-
-                file_response: dict[str, Any] = {
-                    "success": code_result.get("success", False),
-                    "files": [],
-                    "text": code_result.get("text", "")[:500],
-                    "edited": True,
-                }
-                from hackathon_backend.services.lambdas.agent.core.storage import (
-                    _use_s3 as _s3_chk, save_artifact as _sv_art,
-                )
-                for f in code_result.get("files", []):
-                    file_url = f"/api/tasks/{edit_task_id}/artifacts/{f['filename']}"
-                    if _s3_chk():
-                        edited_path = f["path"]
-                        if os.path.isfile(edited_path):
-                            with open(edited_path, "rb") as _fh:
-                                s3_res = _sv_art(edit_task_id, f["filename"], _fh.read())
-                            file_url = s3_res.get("url", file_url)
-                    artifact = {
-                        "filename": f["filename"], "path": f["path"],
-                        "task_id": edit_task_id,
-                        "type": f.get("type", "excel"),
-                        "size_bytes": f.get("size_bytes", 0),
-                        "url": file_url, "edited": True,
-                    }
-                    artifacts.append(artifact)
-                    file_response["files"].append({"filename": f["filename"], "url": file_url})
-
-                if code_result.get("files"):
-                    fnames = [f["filename"] for f in code_result["files"]]
-                    emit("file_generated", {
-                        "message": f"Archivo editado: {', '.join(fnames)}",
-                        "files": fnames, "success": True, "edited": True,
-                    })
-
+                log.warning(f"[agent] LLM called deprecated edit_file tool, redirecting to run_code")
                 messages.append({
                     "role": "tool", "tool_call_id": tc_id,
-                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
+                    "content": json.dumps({
+                        "error": "edit_file tool has been removed. Use run_code instead. "
+                                 "The existing_files dict contains previously generated files. "
+                                 "Load the file with openpyxl.load_workbook(existing_files['filename.xlsx']), "
+                                 "apply your edits, and save to f'{output_dir}/filename.xlsx'.",
+                    }),
                 })
 
             else:
