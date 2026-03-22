@@ -11,7 +11,6 @@ class WsConnectionsTable(Construct):
 
         self._db = BaseDynamoDB(
             self, "WsConnections",
-            table_name=config.resource_name("WS_Connections"),
             partition_key="connectionId",
             billing_mode=config.dynamodb_billing_mode,
             removal_policy=config.removal_policy,

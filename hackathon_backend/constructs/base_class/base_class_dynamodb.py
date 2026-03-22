@@ -18,8 +18,8 @@ class BaseDynamoDB(Construct):
         self,
         scope: Construct,
         id: str,
-        table_name: str,
         partition_key: str,
+        table_name: str | None = None,
         sort_key: str | None = None,
         stream_type: str | None = None,
         billing_mode: str = "PAY_PER_REQUEST",
@@ -33,9 +33,9 @@ class BaseDynamoDB(Construct):
         )
 
         table_props: dict = {
-            "table_name": table_name,
             "partition_key": partition_key_attr,
             "removal_policy": removal_policy,
+            **({"table_name": table_name} if table_name else {}),
             "billing_mode": (
                 dynamodb.BillingMode.PAY_PER_REQUEST
                 if billing_mode == "PAY_PER_REQUEST"

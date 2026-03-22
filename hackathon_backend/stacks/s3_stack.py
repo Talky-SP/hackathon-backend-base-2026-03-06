@@ -18,7 +18,6 @@ class S3Stack(Stack):
 
         self.artifacts_bucket = s3.Bucket(
             self, "ArtifactsBucket",
-            bucket_name=config.resource_name("agent-artifacts"),
             removal_policy=config.removal_policy,
             auto_delete_objects=config.removal_policy == RemovalPolicy.DESTROY,
             lifecycle_rules=[

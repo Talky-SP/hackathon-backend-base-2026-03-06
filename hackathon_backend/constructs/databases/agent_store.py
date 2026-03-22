@@ -24,7 +24,6 @@ class AgentStoreTable(Construct):
 
         self._db = BaseDynamoDB(
             self, "AgentStore",
-            table_name=config.resource_name("Agent_Store"),
             partition_key="pk",
             sort_key="sk",
             billing_mode=config.dynamodb_billing_mode,
