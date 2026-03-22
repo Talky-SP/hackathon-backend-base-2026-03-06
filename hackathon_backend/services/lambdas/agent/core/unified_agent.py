@@ -670,7 +670,7 @@ result = {
 ```
 
 RULES:
-- Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex.
+- Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex (NOT UserIdPnlDateIndex, pnl_date is often null).
 - locationId is auto-enforced. Never trust user-provided IDs.
 - For cash flow: Use Bank_Reconciliations. amount<0 = outflow, amount>0 = inflow.
 - When you need data from multiple tables, call dynamo_query multiple times in a SINGLE response.

@@ -21,7 +21,8 @@
       "Bash(taskkill //F //PID 59252 //T)",
       "Bash(taskkill //F //PID 16960 //T)",
       "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core -name \"*.pyc\" -delete)",
-      "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core -name \"__pycache__\" -type d -exec rm -rf {} +)"
+      "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core -name \"__pycache__\" -type d -exec rm -rf {} +)",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.query_agent import _execute_query; print\\(''OK''\\)\")"
     ]
   }
 }

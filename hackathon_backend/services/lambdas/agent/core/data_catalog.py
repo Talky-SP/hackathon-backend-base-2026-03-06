@@ -31,7 +31,7 @@ TABLE_CATALOG: dict[str, dict] = {
             "invoice_number": "string",
             "invoice_date": "string — YYYY-MM-DD",
             "due_date": "string — YYYY-MM-DD",
-            "pnl_date": "string — YYYY-MM-DD (fecha P&L)",
+            "pnl_date": "string — YYYY-MM-DD (fecha P&L, OFTEN NULL — prefer invoice_date for date queries)",
             "charge_date": "string — YYYY-MM-DD",
             "category": "string — categoria contable",
             "concept": "string — concepto contable",
@@ -44,7 +44,7 @@ TABLE_CATALOG: dict[str, dict] = {
         "gsis": {
             "UserIdInvoiceDateIndex": {"pk": "userId", "sk": "invoice_date", "use": "Rango de fechas factura"},
             "UserIdSupplierCifIndex": {"pk": "userId", "sk": "supplier_cif", "use": "Filtrar por proveedor"},
-            "UserIdPnlDateIndex": {"pk": "userId", "sk": "pnl_date", "use": "Gastos por rango P&L"},
+            "UserIdPnlDateIndex": {"pk": "userId", "sk": "pnl_date", "use": "Gastos por rango P&L (WARNING: pnl_date often NULL — prefer UserIdInvoiceDateIndex)"},
             "UserByReconStateDate": {"pk": "userId", "sk": "recon_state_date", "use": "Estado conciliacion+fecha (R#date/U#date)"},
             "UserSupplierDateIndex": {"pk": "userSupplierKey ({userId}#{cif})", "sk": "charge_date", "use": "Pagos proveedor por fecha"},
         },

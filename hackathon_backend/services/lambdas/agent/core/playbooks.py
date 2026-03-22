@@ -173,7 +173,7 @@ PLAYBOOKS: dict[str, dict[str, Any]] = {
 PLAYBOOK — CIERRE CONTABLE:
 You are performing a monthly accounting close. Follow this checklist:
 
-1. QUERY User_Expenses (UserIdPnlDateIndex, pnl_date range for the month) — get all expense invoices.
+1. QUERY User_Expenses (UserIdInvoiceDateIndex, pnl_date range for the month) — get all expense invoices.
 2. QUERY User_Invoice_Incomes (same index) — get all income invoices.
 3. QUERY Payroll_Slips for the month — payroll costs.
 4. QUERY Bank_Reconciliations — all transactions for the month.
@@ -188,8 +188,8 @@ You are performing a monthly accounting close. Follow this checklist:
 
 IMPORTANT: Start with multiple parallel dynamo_query calls to fetch all data at once.""",
         "suggested_queries": [
-            {"table": "User_Expenses", "index": "UserIdPnlDateIndex"},
-            {"table": "User_Invoice_Incomes", "index": "UserIdPnlDateIndex"},
+            {"table": "User_Expenses", "index": "UserIdInvoiceDateIndex"},
+            {"table": "User_Invoice_Incomes", "index": "UserIdInvoiceDateIndex"},
             {"table": "Payroll_Slips"},
             {"table": "Bank_Reconciliations"},
         ],
@@ -224,8 +224,8 @@ Do NOT use LocationByStatusDate GSI for unreconciled items.""",
 PLAYBOOK — REPORTES FINANCIEROS:
 Build a financial reporting pack (P&L, KPIs).
 
-1. QUERY User_Expenses via UserIdPnlDateIndex for the period.
-2. QUERY User_Invoice_Incomes via UserIdPnlDateIndex.
+1. QUERY User_Expenses via UserIdInvoiceDateIndex for the period.
+2. QUERY User_Invoice_Incomes via UserIdInvoiceDateIndex.
 3. QUERY Payroll_Slips for the period.
 4. In run_code, build:
    - P&L: Revenue - COGS - OpEx - Payroll = Operating Profit
@@ -258,7 +258,7 @@ Find accounting errors and anomalies.
 PLAYBOOK — AUDITORIA IVA:
 Prepare VAT audit or Modelo 303 draft.
 
-1. QUERY User_Expenses via UserIdPnlDateIndex for the quarter.
+1. QUERY User_Expenses via UserIdInvoiceDateIndex for the quarter.
    Key fields: ivas[], vatTotalAmount, vatDeductibleAmount, vatOperationType, importe, total
 2. QUERY User_Invoice_Incomes for the same quarter.
 3. In run_code, compute:
@@ -294,7 +294,7 @@ Detect potential fraud or anomalies.
 PLAYBOOK — ANALISIS GASTOS:
 Deep analysis of spending patterns.
 
-1. QUERY User_Expenses via UserIdPnlDateIndex (or by PK for full history).
+1. QUERY User_Expenses via UserIdInvoiceDateIndex (or by PK for full history).
 2. In run_code:
    - Group by category → total, count, avg per invoice
    - Group by supplier → top 10 suppliers by spend

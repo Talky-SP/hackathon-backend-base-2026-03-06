@@ -144,17 +144,29 @@ def _execute_query(
     full_table_name = f"{STAGE}_{table_name}"
     table = ddb.Table(full_table_name)
 
+    import logging
+    _log = logging.getLogger(__name__)
+    catalog_entry = TABLE_CATALOG.get(table_name, {})
+
     # Auto-correct pk_field based on table's actual PK from data_catalog
-    # LLM often says "userId" for tables that actually use "locationId"
-    if not index_name:  # Only for primary key queries, not GSIs
-        catalog_entry = TABLE_CATALOG.get(table_name, {})
+    if not index_name:
         actual_pk_name = catalog_entry.get("pk", pk_field)
         if pk_field in ("userId", "locationId", "PK") and actual_pk_name in ("userId", "locationId"):
             pk_field = actual_pk_name
-            import logging
-            logging.getLogger(__name__).info(
-                f"[dynamo_query] Auto-corrected pk_field to '{pk_field}' for {table_name}"
-            )
+            _log.info(f"[dynamo_query] Auto-corrected pk_field to '{pk_field}' for {table_name}")
+    else:
+        # For GSI queries: auto-correct pk_field and sk_field from catalog
+        gsi_info = catalog_entry.get("gsis", {}).get(index_name, {})
+        if gsi_info:
+            gsi_pk = gsi_info.get("pk", "")
+            # If GSI PK is userId/locationId-based, use that
+            if gsi_pk in ("userId", "locationId"):
+                pk_field = gsi_pk
+            # Auto-fill sk_field from catalog if LLM omitted it
+            if sk_condition and not sk_field:
+                sk_field = gsi_info.get("sk")
+                if sk_field:
+                    _log.info(f"[dynamo_query] Auto-filled sk_field='{sk_field}' from GSI {index_name}")
 
     # SECURITY: Always use location_id, never trust LLM-provided PK value
     # for userId/locationId fields
