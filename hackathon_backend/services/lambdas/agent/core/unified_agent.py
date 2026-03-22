@@ -305,7 +305,7 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
 
     # Safe __import__ — only allow pre-loaded modules (no arbitrary imports)
     _allowed_modules = set(injected.keys()) | {
-        "json", "datetime", "collections", "decimal", "math", "re",
+        "json", "datetime", "collections", "decimal", "math", "re", "statistics",
         "openpyxl", "openpyxl.styles", "openpyxl.utils", "openpyxl.chart",
         "openpyxl.formatting", "openpyxl.formatting.rule",
         "pandas", "numpy", "matplotlib", "matplotlib.pyplot",

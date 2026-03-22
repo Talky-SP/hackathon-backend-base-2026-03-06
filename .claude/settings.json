@@ -28,7 +28,12 @@
       "Bash(taskkill //F //PID 46428 //T)",
       "Bash(find c:/hackathon-backend-base-2026-03-06/hackathon_backend -name \"__pycache__\" -type d -exec rm -rf {} +)",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.playbooks import PLAYBOOKS; print\\(''conciliacion'' in PLAYBOOKS, len\\(PLAYBOOKS[''conciliacion''][''guidance'']\\)\\)\")",
-      "Bash(taskkill //F //PID 20552 //T)"
+      "Bash(taskkill //F //PID 20552 //T)",
+      "Bash(tasklist //FI 'IMAGENAME eq python.exe' //FO CSV)",
+      "Bash(taskkill //F //PID 20452 //T)",
+      "Bash(taskkill //F //PID 56604 //T)",
+      "Bash(find . -type d -name \"__pycache__\" -path \"*/agent/*\" -exec rm -rf {} +)",
+      "Bash(AWS_PROFILE=hackathon-equipo1 python -m hackathon_backend.services.lambdas.agent.server --reload)"
     ]
   }
 }

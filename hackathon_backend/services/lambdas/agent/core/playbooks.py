@@ -303,18 +303,77 @@ Invoices add context (categories, suppliers) but are NOT the primary numbers."""
     "deteccion_errores": {
         "name": "Deteccion de Errores Contables",
         "guidance": """\
-PLAYBOOK — DETECCION ERRORES:
-Find accounting errors and anomalies.
+PLAYBOOK — DETECCION DE ERRORES EXPLORATORIA:
+You are an AI auditor. Your job is to find accounting errors, anomalies, and inconsistencies
+by EXPLORING the data creatively — not just running a fixed checklist.
 
-1. QUERY User_Expenses for the period.
-2. In run_code, check for:
-   - Duplicate invoices (same supplier_cif + invoice_number + total)
-   - Missing fields (no category, no concept, no supplier_cif)
-   - Unusual amounts (outliers > 3 std dev from mean per category)
-   - Date inconsistencies (invoice_date > today, pnl_date != invoice month)
-   - VAT errors: total != importe + vatTotalAmount - retencion
-   - Credit notes without matching invoice
-3. Rank findings by severity (blocking, warning, info).""",
+STEP 1 — FETCH DATA (parallel queries):
+  - User_Expenses by PK — ALL expense invoices
+  - Bank_Reconciliations by PK — ALL bank transactions (to cross-reference)
+  - User_Invoice_Incomes by PK — ALL income invoices (if relevant)
+
+STEP 2 — EXPLORE THE DATA (first run_code):
+  Before checking for errors, UNDERSTAND the data landscape:
+  - How many invoices? Date range? Document types (invoice vs credit note)?
+  - What fields are available? Which are frequently empty/null?
+  - What are the amount distributions per category?
+  - How many suppliers? Any with temporary CIFs (TEMP-*)?
+  - Print summary stats so you know what you're working with.
+
+STEP 3 — SYSTEMATIC CHECKS (second run_code):
+  Run these standard checks, but ALSO look for anything else suspicious:
+
+  a) DUPLICATES:
+     - Same supplier_cif + invoice_number (exact duplicate)
+     - Same supplier_cif + total + similar date (possible duplicate with different number)
+     - Same total + same date from different suppliers (suspicious)
+
+  b) VAT / CALCULATION ERRORS:
+     - total != importe + sum(ivas[].amount) - retencion (math doesn't add up)
+     - IVA rate not standard (4%, 10%, 21%) — unusual rates may be errors
+     - vatTotalAmount != sum(ivas[].amount) — internal inconsistency
+     - Invoices with importe=0 or total=0 (empty invoices)
+
+  c) MISSING / INCOMPLETE DATA:
+     - No supplier_cif or temporary CIF (TEMP-*)
+     - No category, no concept, no invoice_number
+     - Missing dates (invoice_date, due_date)
+
+  d) DATE ANOMALIES:
+     - invoice_date in the future
+     - charge_date much earlier/later than invoice_date (>90 days)
+     - due_date before invoice_date
+
+  e) CROSS-REFERENCE WITH BANK (creative exploration):
+     - Invoices marked reconciled=True but no matching bank transaction found
+     - Bank payments without any matching invoice (ghost payments)
+     - Invoice amount_paid != total but reconciled=True (partial payment inconsistency)
+     - Multiple invoices paid on same day to same supplier (bulk payment or duplicate?)
+
+  f) OUTLIERS & ANOMALIES (be creative here):
+     - Amounts far above average for their category
+     - Round-number invoices (exact 1000, 5000, 10000) — may warrant review
+     - Same supplier billing very different amounts for same concept
+     - Credit notes without a matching original invoice
+     - Invoices where amount_due > 0 but reconciled=True
+
+  EXPLORE BEYOND THIS LIST — look at the actual data and flag anything that looks wrong,
+  unusual, or worth investigating. You are the auditor, use your judgment.
+
+STEP 4 — GENERATE REPORT (run_code):
+  Create an Excel with:
+  - Sheet "Resumen": total invoices, errors found by severity, key findings
+  - Sheet "Errores Bloqueantes": critical issues that must be fixed
+  - Sheet "Advertencias": issues worth reviewing
+  - Sheet "Informativos": minor observations
+  - Sheet "Cruce Bancario": cross-reference findings between invoices and bank
+  Color-code by severity. Include invoice_number, supplier, amount, and the specific error.
+  ALWAYS include categoryDate (SK) for each invoice so the frontend can locate them.
+
+Classify severity:
+  - BLOQUEANTE: Math errors (IVA wrong), exact duplicates, reconciliation contradictions
+  - ADVERTENCIA: Missing fields, suspicious patterns, date anomalies
+  - INFORMATIVO: Outliers, temporary CIFs, minor observations""",
     },
 
     "auditoria_iva": {
