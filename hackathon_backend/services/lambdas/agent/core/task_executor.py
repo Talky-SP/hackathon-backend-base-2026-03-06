@@ -842,6 +842,39 @@ Cross-reference invoices, delivery notes, and purchase orders.
 1. Query User_Expenses by PK to get invoices with supplier_cif and all_products.
 2. Query Delivery_Notes by PK for delivery notes.
 3. Match by supplier_cif + product descriptions. Flag discrepancies.""",
+
+        "bank_reconciliation": """\
+TASK-SPECIFIC GUIDANCE — BANK RECONCILIATION (CONCILIACION BANCARIA):
+Automatically match unreconciled bank transactions with unreconciled invoices/payrolls.
+
+Steps:
+1. Query Bank_Reconciliations by PK (locationId). Filter unreconciled:
+   Use filter_expression: [{"field": "reconciled", "op": "ne", "value": true}]
+   OR use LocationByStatusDate GSI with SK begins_with "PENDING".
+2. Query User_Expenses by PK. In run_analysis filter items where reconciled is None/False.
+3. Query User_Invoice_Incomes by PK. Same filter for unreconciled.
+4. In run_analysis, implement matching algorithm:
+
+   MATCHING RULES (by priority):
+   a) EXACT MATCH (confidence=HIGH): abs(txn.amount) == invoice.total AND
+      (ai_enrichment.vendor_cif == supplier_cif OR ai_enrichment.vendor_cif == client_cif)
+   b) AMOUNT MATCH (confidence=MEDIUM): abs(txn.amount) == invoice.total (within 0.01 EUR tolerance)
+      AND date proximity (bookingDate within 30 days of invoice_date or due_date)
+   c) PARTIAL MATCH (confidence=LOW): amount close (within 5%) AND CIF matches
+   d) AGGREGATE MATCH: Sum of multiple invoices = single bank transaction (N-1 matching)
+
+   For EXPENSES: txn.amount < 0 matches invoice.total (outflow pays an expense)
+   For INCOMES: txn.amount > 0 matches invoice.total (inflow receives a payment)
+
+5. IMPORTANT: Call generate_file to create Excel with:
+   - Sheet 1: "Propuesta Conciliacion" — matched pairs with confidence score, txn details, invoice details
+   - Sheet 2: "Transacciones Sin Conciliar" — bank txns with no match found
+   - Sheet 3: "Facturas Sin Conciliar" — invoices (expenses + incomes) with no match found
+   - Sheet 4: "Resumen" — summary stats (total matched, unmatched, by confidence level)
+   Color-code: green=high confidence, yellow=medium, red=low.
+   You MUST generate an Excel file — this is a reconciliation report task.
+
+IMPORTANT: Do NOT modify any records. Only PROPOSE matches. The user reviews and approves.""",
     }
     return guidance.get(task_type, "")
 

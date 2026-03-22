@@ -76,7 +76,9 @@ SLIM_FIELDS_BY_TABLE: dict[str, set[str]] = {
     "Bank_Reconciliations": {
         "SK", "amount", "balance", "bookingDate",
         "description", "merchant", "status", "transactionId",
-        "ai_enrichment", "matched_expense_id", "matched_invoice_id",
+        "reconciled", "ai_enrichment",
+        "matched_expense_id", "matched_invoice_id", "matched_payroll_id",
+        "match_type", "vendor_cif", "customer_cif",
     },
     "Payroll_Slips": {
         "categoryDate", "employee_nif", "org_cif",
@@ -147,10 +149,20 @@ TABLES AND QUERY PATTERNS:
 
 4. Customers: PK=locationId, SK=cif. Fields: nombre, cif, facturas
 
-5. Bank_Reconciliations: PK=locationId, SK=MTXN#{bookingDate}#{transactionId}
-   GSI: LocationByStatusDate(pk=locationId,sk=status_date={status}#{bookingDate})
-   Fields: amount(negative=outflow,positive=inflow), bookingDate, description, merchant,
-   status(PENDING/MATCHED), transactionId, balance, ai_enrichment{payment_type, vendor_name, vendor_cif}
+5. Bank_Reconciliations (bank transactions + reconciliation):
+   PK=locationId, SK=MTXN#{bookingDate}#{transactionId}
+   GSIs: LocationByStatusDate(pk=locationId,sk=status_date={status}#{bookingDate}),
+         ByVendorCif(pk=vendor_cif), ByCustomerCif(pk=customer_cif),
+         LocationByPayrollDate(pk=locationId,sk=payroll_date)
+   Fields: amount(negative=outflow,positive=inflow), bookingDate, description, merchant, balance,
+   status(PENDING/MATCHED/UNMATCHED), transactionId,
+   reconciled(Boolean: true=matched with invoice/payroll, false/missing=unreconciled),
+   matched_expense_id(categoryDate of matched expense invoice),
+   matched_invoice_id(categoryDate of matched income invoice),
+   matched_payroll_id(categoryDate of matched payroll slip),
+   match_type(1-1|1-N|N-1|N-M — how many docs matched to how many txns),
+   ai_enrichment{payment_type(vendor_payment|payroll|social_security|bank_fee|tax_payment|
+   client_payment|loan|transfer), vendor_name, vendor_cif, customer_cif, account_type}
 
 6. Payroll_Slips: PK=locationId, SK=categoryDate({date}#{nif})
    GSI: OrgCifPeriodIndex(pk=org_cif,sk=PERIOD#{yyyy-mm}#EMP#{nif})
@@ -187,6 +199,23 @@ RULES:
 - locationId is auto-enforced. Never trust user-provided IDs.
 - For cash flow/treasury forecasts: Use ONLY Bank_Reconciliations (real money movements).
   amount<0 = outflow, amount>0 = inflow. Classify by ai_enrichment.payment_type.
+
+BANK RECONCILIATION RULES:
+- Bank_Reconciliations is the source of truth for real bank movements.
+- Each bank transaction has a `reconciled` field (Boolean): true=matched, false/missing=unreconciled.
+- `status` field: PENDING (not yet processed), MATCHED (reconciled), UNMATCHED (reviewed but no match).
+- To find UNRECONCILED transactions: filter where reconciled is false/missing OR status != "MATCHED".
+- To find which invoice matches a transaction: check `matched_expense_id` or `matched_invoice_id`.
+- Invoices (User_Expenses, User_Invoice_Incomes) also have `reconciled` (Boolean) and `matched_transaction_id`.
+- RECONCILIATION MATCHING: To propose reconciliation between invoices and bank transactions:
+  1. Query Bank_Reconciliations with filter reconciled=false (or status=PENDING) → unmatched txns
+  2. Query User_Expenses and/or User_Invoice_Incomes with filter reconciled=false → unmatched invoices
+  3. In run_analysis, match by: amount (txn.amount ≈ -invoice.total for expenses, txn.amount ≈ invoice.total for incomes),
+     date proximity (bookingDate near charge_date/due_date), and vendor/client CIF (ai_enrichment.vendor_cif = supplier_cif).
+  4. Present matches with confidence score: exact amount+CIF = high, amount only = medium, date only = low.
+- Use UserByReconStateDate GSI: SK begins_with "U#" for unreconciled, "R#" for reconciled invoices.
+- For unreconciled invoice count: query with SK begins_with "U#" on UserByReconStateDate GSI.
+
 - ALWAYS respond in the same language the user writes in.
 - Be precise with numbers. Use EUR formatting (€) and Spanish number format (1.234,56).
 - Never invent data — only use what comes from the database.
@@ -214,6 +243,9 @@ result = {
 IMPORTANT: When user asks for a downloadable file (Excel, CSV, PDF), you MUST call generate_file \
 directly with the data. Do NOT use run_analysis to produce an "answer" — that will end the \
 conversation without creating a file. Instead: dynamo_query → generate_file (pass data as data_json).
+NOTE: generate_file automatically injects ALL query_results (full dataset, not just the 50-item preview). \
+In your generate_file prompt, tell the code to use data["query_results"]["query_N"]["items"] for the \
+complete data. NEVER tell the code to use only 50 items or a subset — always process ALL items.
 
 NUMBER FORMATTING: Use Spanish format in answer text (1.234,56 EUR). Keep raw numbers in chart data.
 TODAY'S DATE: 2026-03-21."""
@@ -414,7 +446,11 @@ UNIFIED_TOOLS = [
             "description": (
                 "Generate Excel/CSV/chart files using AI code execution sandbox. "
                 "The AI writes and runs Python code (openpyxl, pandas, matplotlib). "
-                "Use for downloadable reports, exports, detailed Excel files."
+                "Use for downloadable reports, exports, detailed Excel files. "
+                "NOTE: All query_results data is automatically injected — the code execution "
+                "sandbox receives the FULL dataset (not just the 50-item preview you see). "
+                "The data is available as data['query_results']['query_N']['items']. "
+                "Always use ALL items from query_results, never limit to a subset."
             ),
             "parameters": {
                 "type": "object",
@@ -668,8 +704,12 @@ def run_agent(
                                 "supplier": item.get("merchant") or item.get("description", ""),
                                 "invoice_date": item.get("bookingDate"),
                                 "total": item.get("amount"),
-                                "reconciled": item.get("status") == "MATCHED",
+                                "reconciled": bool(item.get("reconciled")) or item.get("status") == "MATCHED",
                                 "category": "BANK",
+                                "matched_expense_id": item.get("matched_expense_id"),
+                                "matched_invoice_id": item.get("matched_invoice_id"),
+                                "match_type": item.get("match_type"),
+                                "transactionId": item.get("transactionId"),
                             })
 
                 # Build slim response for LLM (Mejora 1)
@@ -737,10 +777,33 @@ def run_agent(
                     "task_id": file_task_id,
                 })
 
+                # CRITICAL: Pass FULL query data, not just the 50 slim items the LLM saw.
+                # The LLM's data_json often only contains the slim subset it received.
+                # We inject all query_results so code execution has the complete dataset.
+                data_for_exec = args.get("data_json", "")
+                if query_results:
+                    full_data = {}
+                    for qk, qv in query_results.items():
+                        full_data[qk] = {
+                            "items": qv.get("items", []),
+                            "count": qv.get("count", 0),
+                            "table": qv.get("table", ""),
+                        }
+                    # Merge: LLM's data_json as "prompt_data", full queries as "query_results"
+                    try:
+                        llm_data = json.loads(data_for_exec) if data_for_exec else {}
+                    except (json.JSONDecodeError, TypeError):
+                        llm_data = {"raw": data_for_exec} if data_for_exec else {}
+                    merged = {
+                        "prompt_data": llm_data,
+                        "query_results": full_data,
+                    }
+                    data_for_exec = json.dumps(merged, ensure_ascii=False, default=str)
+
                 code_result = _native_code_exec(
                     prompt=args.get("prompt", ""),
                     model_id=model_id,
-                    data_context=args.get("data_json", ""),
+                    data_context=data_for_exec,
                     task_id=file_task_id,
                     system_prompt=CODE_EXEC_SYSTEM,
                 )
@@ -993,6 +1056,15 @@ _HEAVY_TASK_KEYWORDS: dict[str, list[str]] = {
     ],
     "three_way_matching": [
         "three way matching", "cruce tres vias", "albaranes facturas",
+    ],
+    "bank_reconciliation": [
+        "conciliacion bancaria", "conciliación bancaria", "conciliar facturas",
+        "conciliar transacciones", "reconciliacion", "reconciliación",
+        "transacciones sin conciliar", "facturas sin conciliar",
+        "bank reconciliation", "matching bancario", "cruce bancario",
+        "conciliar banco", "conciliar pagos", "pagos sin conciliar",
+        "conciliar las facturas", "conciliar las transacciones",
+        "conciliar con el banco", "cruce con banco",
     ],
 }
 

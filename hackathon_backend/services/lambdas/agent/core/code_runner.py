@@ -165,9 +165,15 @@ def _claude_code_exec(
     if container_id:
         litellm_kwargs["container"] = container_id
 
+    t0 = time.time()
     try:
         response = litellm.completion(**litellm_kwargs)
     except Exception as e:
+        _trace_code_execution(
+            model_id=model_id, task_id=task_id, prompt=prompt,
+            code_blocks=[], text=f"Error: {e}", success=False,
+            elapsed_ms=int((time.time() - t0) * 1000),
+        )
         return {
             "success": False,
             "text": f"Claude code execution error: {e}",
@@ -234,6 +240,14 @@ def _claude_code_exec(
             "completion_tokens": u.completion_tokens or 0,
             "total_tokens": u.total_tokens or 0,
         }
+
+    # Trace to Langfuse/trace store
+    _trace_code_execution(
+        model_id=model_id, task_id=task_id, prompt=prompt,
+        code_blocks=code_blocks, text=text, success=True,
+        elapsed_ms=int((time.time() - t0) * 1000),
+        usage=usage, files=[f.get("filename", "") for f in files],
+    )
 
     return {
         "success": True,
@@ -317,6 +331,7 @@ def _gemini_code_exec(
     from hackathon_backend.services.lambdas.agent.core.config import _VERTEX_FALLBACK_CHAIN
     fallbacks = _VERTEX_FALLBACK_CHAIN.get(cfg_key, [])
 
+    t0 = time.time()
     response = None
     last_err = None
     for attempt_cfg in [litellm_kwargs] + [
@@ -330,6 +345,11 @@ def _gemini_code_exec(
             continue
 
     if response is None:
+        _trace_code_execution(
+            model_id=model_id, task_id=task_id, prompt=prompt,
+            code_blocks=[], text=f"Error: {last_err}", success=False,
+            elapsed_ms=int((time.time() - t0) * 1000),
+        )
         return {
             "success": False,
             "text": f"Gemini code execution error: {last_err}",
@@ -365,6 +385,14 @@ def _gemini_code_exec(
     if code_blocks and not files and task_id:
         local_files = _execute_code_locally(code_blocks, task_id)
         files.extend(local_files)
+
+    # Trace to Langfuse/trace store
+    _trace_code_execution(
+        model_id=model_id, task_id=task_id, prompt=prompt,
+        code_blocks=code_blocks, text=text, success=True,
+        elapsed_ms=int((time.time() - t0) * 1000),
+        usage=usage, files=[f.get("filename", "") for f in files],
+    )
 
     return {
         "success": True,
@@ -658,6 +686,68 @@ DATA:
 """
 
     return base_prompt
+
+
+# ---------------------------------------------------------------------------
+# Trace code execution to Langfuse / trace store
+# ---------------------------------------------------------------------------
+def _trace_code_execution(
+    model_id: str,
+    task_id: str,
+    prompt: str,
+    code_blocks: list[dict],
+    text: str,
+    success: bool,
+    elapsed_ms: int,
+    usage: dict | None = None,
+    files: list[str] | None = None,
+):
+    """Record code execution details in the trace store for Langfuse visibility."""
+    try:
+        from hackathon_backend.services.lambdas.agent.core.chat_store import record_trace
+
+        # Build code summary: actual code that was executed
+        code_details = []
+        for i, block in enumerate(code_blocks):
+            entry = {"index": i, "type": block.get("type", "unknown")}
+            if block.get("code"):
+                entry["code"] = block["code"][:10000]  # Up to 10KB per block
+            if block.get("stdout"):
+                entry["stdout"] = block["stdout"][:5000]
+            if block.get("command"):
+                entry["command"] = block["command"]
+            if block.get("path"):
+                entry["path"] = block["path"]
+            code_details.append(entry)
+
+        record_trace(
+            step="code_execution",
+            location_id="",  # Not available at this level
+            task_id=task_id or None,
+            model=model_id,
+            provider="code_sandbox",
+            input_data={
+                "prompt": prompt[:5000],
+                "model": model_id,
+            },
+            output_data={
+                "text": text[:5000],
+                "success": success,
+                "files_generated": files or [],
+                "code_blocks": code_details,
+            },
+            prompt_tokens=usage.get("prompt_tokens", 0) if usage else 0,
+            completion_tokens=usage.get("completion_tokens", 0) if usage else 0,
+            total_tokens=usage.get("total_tokens", 0) if usage else 0,
+            latency_ms=elapsed_ms,
+            status="ok" if success else "error",
+            metadata={
+                "code_block_count": len(code_blocks),
+                "files_count": len(files) if files else 0,
+            },
+        )
+    except Exception as e:
+        print(f"Warning: Failed to trace code execution: {e}")
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ TASK_COST_LIMITS: dict[str, dict] = {
     "modelo_347":            {"max_usd": 2.00, "max_tokens": 1_000_000, "max_agents": 4, "timeout_s": 600},
     "three_way_matching":    {"max_usd": 1.50, "max_tokens": 750_000, "max_agents": 3, "timeout_s": 300},
     "document_analysis":     {"max_usd": 1.00, "max_tokens": 500_000, "max_agents": 2, "timeout_s": 180},
+    "bank_reconciliation":   {"max_usd": 3.00, "max_tokens": 1_500_000, "max_agents": 5, "timeout_s": 600},
     "custom":                {"max_usd": 5.00, "max_tokens": 2_000_000, "max_agents": 5, "timeout_s": 600},
 }
 
@@ -40,6 +41,7 @@ TASK_TYPE_NAMES: dict[str, str] = {
     "modelo_347": "Modelo 347 (Terceros >3.005 EUR)",
     "three_way_matching": "Three-Way Matching",
     "document_analysis": "Analisis de Documentos",
+    "bank_reconciliation": "Conciliacion Bancaria Automatica",
     "custom": "Tarea Personalizada",
 }
 
