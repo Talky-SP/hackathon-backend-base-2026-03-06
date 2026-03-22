@@ -685,6 +685,16 @@ def run_agent(
             "iteration": iteration + 1,
         })
 
+        # Log each tool call with full arguments for debugging
+        for _tc in choice.message.tool_calls:
+            _tc_args = _tc.function.arguments or "{}"
+            log.info(f"[agent] Tool call: {_tc.function.name}({_tc_args[:500]})")
+            emit("tool_call_detail", {
+                "tool": _tc.function.name,
+                "args": json.loads(_tc_args) if _tc_args else {},
+                "iteration": iteration + 1,
+            })
+
         for tool_call in choice.message.tool_calls:
             fn_name = tool_call.function.name
             try:
@@ -702,11 +712,23 @@ def run_agent(
 
                 table_name = args["table_name"]
                 table_label = table_name.replace("_", " ")
-                emit("querying", {
-                    "message": f"Consultando {table_label}...",
+
+                # Log full query details for debugging
+                query_details = {
                     "table": table_name,
                     "query_key": query_key,
+                    "index": args.get("index_name"),
+                    "pk_field": args.get("pk_field", "userId"),
+                    "sk_field": args.get("sk_field"),
+                    "sk_condition": args.get("sk_condition"),
+                    "filter": args.get("filter_expression"),
+                    "limit": args.get("limit"),
+                }
+                emit("querying", {
+                    "message": f"Consultando {table_label}...",
+                    **query_details,
                 })
+                log.info(f"[dynamo_query] {query_key}: {json.dumps(query_details, default=str)}")
 
                 result = _execute_query(
                     table_name=table_name,
@@ -729,7 +751,9 @@ def run_agent(
                         "table": table_name,
                         "count": result["count"],
                         "message": f"Encontrados {result['count']} registros en {table_label}",
+                        **query_details,
                     })
+                    log.info(f"[dynamo_query] {query_key}: {result['count']} items from {table_name}")
                     # Collect sources
                     if table_name in ("User_Expenses", "User_Invoice_Incomes"):
                         for item in result["items"]:
@@ -786,15 +810,27 @@ def run_agent(
 
                 code = args["code"]
                 code_preview = code.strip().split("\n")[0][:80]
+                log.info(f"[run_analysis] Code:\n{code}")
                 emit("analyzing", {
                     "message": f"Ejecutando analisis de datos...",
                     "detail": code_preview,
+                    "code": code,
+                    "available_queries": list(query_results.keys()),
+                    "query_counts": {k: v.get("count", 0) for k, v in query_results.items()},
                 })
                 result = _execute_code(code, query_results)
+                log.info(f"[run_analysis] Success={result['success']}, result_type={type(result.get('result')).__name__}")
 
                 if result["success"] and isinstance(result["result"], dict):
                     analysis = result["result"]
                     if "answer" in analysis:
+                        log.info(f"[run_analysis] Answer: {str(analysis.get('answer', ''))[:200]}")
+                        emit("analysis_result", {
+                            "message": "Análisis completado",
+                            "answer_preview": str(analysis.get("answer", ""))[:300],
+                            "has_chart": analysis.get("chart") is not None,
+                            "sources_count": len(analysis.get("sources") or sources_collected),
+                        })
                         emit("agent_done", {"message": "Análisis completado"})
                         return {
                             "answer": analysis.get("answer", ""),
