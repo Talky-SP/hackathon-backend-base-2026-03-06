@@ -83,27 +83,136 @@ def run_code_execution(
         result = _claude_code_exec(
             full_prompt, model_id, task_id, container_id, max_tokens, system_prompt,
         )
-        # If Azure AI Foundry doesn't support code execution, fall back to Gemini
-        if not result.get("success") and "not supported" in result.get("text", "").lower():
-            print(f"Claude code execution not available, falling back to Gemini...")
-            return _gemini_code_exec(
-                full_prompt, "gemini-3.0-flash", task_id, max_tokens, system_prompt,
-            )
-        return result
+        if result.get("success"):
+            return result
+        # Claude failed — try Gemini, then local execution
+        print(f"Claude code execution failed, trying Gemini fallback...")
+        gemini_result = _try_gemini_with_local_fallback(
+            full_prompt, task_id, max_tokens, system_prompt,
+        )
+        return gemini_result if gemini_result else result
     elif model_id.startswith("gemini"):
-        return _gemini_code_exec(
-            full_prompt, model_id, task_id, max_tokens, system_prompt,
+        return _try_gemini_with_local_fallback(
+            full_prompt, task_id, max_tokens, system_prompt, model_id,
         )
     elif model_id.startswith("gpt"):
-        # GPT models don't have native code execution, use Gemini
-        return _gemini_code_exec(
-            full_prompt, "gemini-3.0-flash", task_id, max_tokens, system_prompt,
+        # GPT models don't have native code execution — try Gemini, then local
+        return _try_gemini_with_local_fallback(
+            full_prompt, task_id, max_tokens, system_prompt,
         )
     else:
-        # Default: try Gemini Flash (cheapest, fastest code execution)
-        return _gemini_code_exec(
-            full_prompt, "gemini-3.0-flash", task_id, max_tokens, system_prompt,
+        return _try_gemini_with_local_fallback(
+            full_prompt, task_id, max_tokens, system_prompt,
         )
+
+
+# ---------------------------------------------------------------------------
+# Gemini + local fallback helper
+# ---------------------------------------------------------------------------
+def _try_gemini_with_local_fallback(
+    full_prompt: str,
+    task_id: str,
+    max_tokens: int,
+    system_prompt: str | None,
+    model_id: str = "gemini-3.0-flash",
+) -> dict:
+    """Try Gemini code execution, fall back to LLM-guided local execution."""
+    result = _gemini_code_exec(full_prompt, model_id, task_id, max_tokens, system_prompt)
+    if result.get("success") and result.get("files"):
+        return result
+
+    # Gemini failed or produced no files — use LLM to generate code, execute locally
+    print(f"Gemini code exec failed or no files, falling back to local execution...")
+    return _llm_guided_local_exec(full_prompt, task_id, max_tokens, system_prompt)
+
+
+def _llm_guided_local_exec(
+    prompt: str,
+    task_id: str,
+    max_tokens: int,
+    system_prompt: str | None,
+) -> dict:
+    """
+    Last-resort fallback: ask any available LLM to generate Python code,
+    then execute it locally. Works without sandboxed code execution tools.
+    """
+    from hackathon_backend.services.lambdas.agent.core.config import (
+        AVAILABLE_MODELS, completion,
+    )
+
+    # Pick the best available model (prefer Claude, then GPT, then Gemini)
+    llm_id = None
+    for candidate in ("claude-sonnet-4.5", "claude-opus-4.6", "gpt-5-mini", "gemini-3.0-flash"):
+        if candidate in AVAILABLE_MODELS:
+            llm_id = candidate
+            break
+    if not llm_id:
+        return {
+            "success": False, "text": "No LLM available for code generation",
+            "code_blocks": [], "files": [], "container_id": None, "usage": {},
+        }
+
+    code_gen_system = (system_prompt or CODE_EXEC_SYSTEM) + """
+
+CRITICAL: You are generating Python code that will be executed LOCALLY.
+- Output ONLY a single ```python code block with ALL the code.
+- The code must be self-contained and complete.
+- Save files to /tmp/ directory.
+- Available libraries: openpyxl, pandas, numpy, matplotlib, json, base64, os.
+- Do NOT use print() for important output — save everything to files.
+- The code block is the ONLY thing that will be executed. No explanations needed.
+"""
+
+    messages = [
+        {"role": "system", "content": code_gen_system},
+        {"role": "user", "content": prompt},
+    ]
+
+    t0 = time.time()
+    try:
+        response = completion(llm_id, messages, max_tokens=max_tokens, temperature=0.1)
+    except Exception as e:
+        return {
+            "success": False, "text": f"LLM code generation failed: {e}",
+            "code_blocks": [], "files": [], "container_id": None, "usage": {},
+        }
+
+    text = response.choices[0].message.content or ""
+    code_blocks = _extract_python_from_markdown(text)
+
+    usage = {}
+    if response.usage:
+        u = response.usage
+        usage = {
+            "model": llm_id, "step": "code_execution_local",
+            "prompt_tokens": u.prompt_tokens or 0,
+            "completion_tokens": u.completion_tokens or 0,
+            "total_tokens": u.total_tokens or 0,
+        }
+
+    # Execute locally
+    files = []
+    if code_blocks and task_id:
+        files = _execute_code_locally(code_blocks, task_id)
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+    success = len(files) > 0
+
+    _trace_code_execution(
+        model_id=llm_id, task_id=task_id, prompt=prompt,
+        code_blocks=code_blocks, text=text, success=success,
+        elapsed_ms=elapsed_ms, usage=usage,
+        files=[f.get("filename", "") for f in files],
+    )
+
+    return {
+        "success": success,
+        "text": text if success else f"Local execution produced no files. LLM output: {text[:500]}",
+        "code_blocks": code_blocks,
+        "files": files,
+        "container_id": None,
+        "usage": usage,
+    }
 
 
 # ---------------------------------------------------------------------------

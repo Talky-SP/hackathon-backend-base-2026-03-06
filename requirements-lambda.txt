@@ -11,3 +11,6 @@ pandas>=2.0.0,<3.0.0
 numpy>=1.24.0,<2.2.0
 matplotlib>=3.7.0,<3.10.0
 tiktoken>=0.7.0,<0.9.0
+# Google Cloud — needed for Vertex AI (Gemini) via LiteLLM
+google-auth>=2.0.0
+google-cloud-aiplatform>=1.38.0

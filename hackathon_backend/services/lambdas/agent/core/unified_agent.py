@@ -905,33 +905,23 @@ def run_agent(
                 data_size_kb = len(data_json_str) / 1024
 
                 if data_size_kb > 200:
-                    # Large dataset: write JSON to temp file, sandbox reads it
-                    # The file is written locally — for Claude sandbox we pass the
-                    # JSON directly (Gemini can handle larger contexts).
-                    # Strategy: pass raw JSON (not base64) to save tokens,
-                    # and use Gemini Flash for large data (2M context window).
+                    # Large dataset: pass raw JSON (not base64) to save tokens.
+                    # code_runner handles model routing + fallbacks.
                     data_for_exec = data_json_str
                     gen_prompt = (
                         f"IMPORTANT — DATA LOADING:\n"
                         f"The DATA section below contains {total_items} items as raw JSON.\n"
-                        f"Parse it directly:\n"
-                        f"```python\n"
-                        f"import json\n"
-                        f"# The DATA section is a JSON string — parse it\n"
-                        f"data = json.loads(open('/dev/stdin').read())  # or from the DATA variable\n"
-                        f"```\n"
-                        f"Actually, the data is already available below in the DATA section as JSON.\n"
                         f"Load it like this:\n"
                         f"```python\n"
                         f"import json\n"
-                        f"raw = r'''{data_json_str[:200]}...'''  # This is truncated — use the FULL DATA section\n"
+                        f"# DATA section contains raw JSON — parse it from the DATA variable below\n"
+                        f"data = json.loads(DATA_STRING)  # DATA_STRING = the entire DATA section\n"
                         f"```\n"
                         f"Use ALL {total_items} items. NEVER use sample/dummy data.\n\n"
                         f"TASK:\n{args.get('prompt', '')}"
                     )
-                    # Force Gemini for large datasets (2M context vs Claude's 200K)
-                    log.info(f"[generate_file] Large dataset ({data_size_kb:.0f}KB, {total_items} items) — using Gemini Flash")
-                    code_exec_model = "gemini-3.0-flash"
+                    log.info(f"[generate_file] Large dataset ({data_size_kb:.0f}KB, {total_items} items)")
+                    code_exec_model = model_id
                 else:
                     data_b64 = _b64_gen.b64encode(data_json_str.encode("utf-8")).decode()
                     data_for_exec = data_b64
