@@ -39,6 +39,9 @@ from hackathon_backend.services.lambdas.agent.core.data_catalog import (
     get_schema_prompt, get_numeric_fields, get_date_fields,
     get_group_fields, get_slim_fields, ALL_TABLE_NAMES,
 )
+from hackathon_backend.services.lambdas.agent.core.playbooks import (
+    classify_intent, get_playbook_guidance, get_playbook_name, PLAYBOOKS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +83,74 @@ EventCallback = Callable[[str, dict], None]
 
 def _noop(event: str, data: dict) -> None:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Context compression — shrink old tool results to save tokens
+# ---------------------------------------------------------------------------
+_COMPRESS_AFTER_ITERATION = 3  # Start compressing after this many iterations
+_KEEP_RECENT_TOOL_RESULTS = 4  # Keep the N most recent tool results in full
+
+
+def _compress_messages(messages: list[dict]) -> list[dict]:
+    """Compress older tool result messages to short summaries.
+
+    Keeps the system prompt, user messages, assistant messages, and the
+    most recent tool results untouched. Older tool results are replaced
+    with a short summary (table name, item count, success/error).
+    """
+    # Find all tool result indices
+    tool_indices = [
+        i for i, m in enumerate(messages) if m.get("role") == "tool"
+    ]
+    if len(tool_indices) <= _KEEP_RECENT_TOOL_RESULTS:
+        return messages  # Nothing to compress
+
+    # Indices to compress (all except the most recent N)
+    to_compress = set(tool_indices[:-_KEEP_RECENT_TOOL_RESULTS])
+
+    compressed = []
+    for i, msg in enumerate(messages):
+        if i in to_compress:
+            compressed.append(_summarize_tool_result(msg))
+        else:
+            compressed.append(msg)
+    return compressed
+
+
+def _summarize_tool_result(msg: dict) -> dict:
+    """Replace a tool result message content with a short summary."""
+    content = msg.get("content", "")
+    try:
+        data = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        # If content is very long text, truncate it
+        summary = content[:200] + "..." if len(content) > 200 else content
+        return {**msg, "content": summary}
+
+    if isinstance(data, dict):
+        # Dataset card summary
+        if "total_items" in data:
+            summary = {
+                "compressed": True,
+                "table": data.get("table", "?"),
+                "total_items": data.get("total_items", 0),
+                "stats_keys": list(data.get("stats", {}).keys()),
+            }
+        # Code execution summary
+        elif "success" in data:
+            summary = {
+                "compressed": True,
+                "success": data.get("success"),
+                "error": data.get("error"),
+                "files": [f.get("filename", "?") for f in data.get("files", [])],
+                "result_preview": str(data.get("result", ""))[:200] if data.get("result") else None,
+            }
+        else:
+            summary = {"compressed": True, "keys": list(data.keys())[:10]}
+        return {**msg, "content": json.dumps(summary)}
+
+    return {**msg, "content": str(data)[:300]}
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +239,12 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
     """Execute code in a sandboxed environment with data injection."""
     output_dir = os.path.join(ARTIFACTS_DIR, file_task_id)
     os.makedirs(output_dir, exist_ok=True)
+    log.info(f"[_safe_exec] task={file_task_id}, output_dir={output_dir}, queries={list(query_results.keys())}")
 
     # Check memory before execution
     data_json_str = json.dumps(query_results, default=str)
     data_size_mb = len(data_json_str) / (1024 * 1024)
+    log.info(f"[_safe_exec] data_size={data_size_mb:.2f}MB, code_len={len(code)}")
     if data_size_mb > 500:
         return {
             "success": False, "result": None, "files": [],
@@ -204,8 +277,20 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
     except ImportError:
         pass
 
+    # Restricted open() — only allows writing inside output_dir
+    _real_open = open
+    _allowed_dir = os.path.normpath(output_dir)
+
+    def _sandbox_open(path, mode="r", *args, **kwargs):
+        norm = os.path.normpath(str(path))
+        if not norm.startswith(_allowed_dir):
+            raise PermissionError(f"Cannot open '{path}' — use output_dir for file operations")
+        return _real_open(path, mode, *args, **kwargs)
+
+    builtins_with_open = {**_SAFE_BUILTINS, "open": _sandbox_open}
+
     safe_globals = {
-        "__builtins__": _SAFE_BUILTINS,
+        "__builtins__": builtins_with_open,
         # Data
         "data": query_results,
         "output_dir": output_dir,
@@ -231,22 +316,33 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
         elapsed_ms = int((time.time() - t0) * 1000)
     except Exception as e:
         elapsed_ms = int((time.time() - t0) * 1000)
+        log.error(f"[_safe_exec] FAILED after {elapsed_ms}ms: {type(e).__name__}: {e}")
         return {
             "success": False, "result": None, "files": [],
             "error": f"{type(e).__name__}: {e}", "elapsed_ms": elapsed_ms,
         }
 
+    log.info(f"[_safe_exec] exec OK in {elapsed_ms}ms, scanning output_dir={output_dir}")
     result_val = safe_globals.get("result")
     files = []
     if os.path.isdir(output_dir):
-        for f in os.listdir(output_dir):
+        all_entries = os.listdir(output_dir)
+        log.info(f"[_safe_exec] output_dir contents: {all_entries}")
+        for f in all_entries:
             fp = os.path.join(output_dir, f)
             if os.path.isfile(fp) and not f.startswith("_"):
+                fsize = os.path.getsize(fp)
+                log.info(f"[_safe_exec] Found file: {f} ({fsize} bytes)")
                 files.append({
                     "filename": f, "path": fp,
-                    "size_bytes": os.path.getsize(fp),
+                    "size_bytes": fsize,
                     "type": _detect_file_type(f),
                 })
+    else:
+        log.warning(f"[_safe_exec] output_dir does not exist: {output_dir}")
+
+    if not files and not result_val:
+        log.warning("[_safe_exec] No files and no result produced by code execution")
 
     return {
         "success": True,
@@ -727,11 +823,16 @@ def run_agent(
 ) -> dict[str, Any]:
     emit = on_event or _noop
 
-    # Build system prompt
+    # Classify intent and inject playbook guidance
+    task_type = classify_intent(user_message)
+    playbook_guidance = get_playbook_guidance(task_type) if task_type != "general" else ""
+    if playbook_guidance:
+        log.info(f"[agent] Playbook detected: {task_type} ({get_playbook_name(task_type)})")
+
+    # Build system prompt with playbook + artifact context
     artifact_ctx = _build_artifact_context(chat_artifacts)
-    full_extra = extra_system
-    if artifact_ctx:
-        full_extra = f"{extra_system}\n\n{artifact_ctx}" if extra_system else artifact_ctx
+    extra_parts = [p for p in [extra_system, playbook_guidance, artifact_ctx] if p]
+    full_extra = "\n\n".join(extra_parts)
     system_blocks = _build_system_prompt(full_extra, location_id)
 
     messages: list[dict] = [{"role": "system", "content": system_blocks}]
@@ -755,6 +856,10 @@ def run_agent(
             raise CancelledError(f"Chat {chat_id} cancelled")
         if task_id and is_cancelled(task_id):
             raise CancelledError(f"Task {task_id} cancelled")
+
+        # Compress older tool results to save context tokens
+        if iteration >= _COMPRESS_AFTER_ITERATION:
+            messages = _compress_messages(messages)
 
         if iteration == 0:
             emit("thinking", {"step": 1, "message": "Analizando tu pregunta..."})
@@ -815,6 +920,7 @@ def run_agent(
             result = _parse_final_response(final_text, sources_collected)
             result["artifacts"] = artifacts
             result["usage"] = usage_records
+            log.info(f"[run_agent] DONE iterations={iteration+1}, artifacts={[a.get('filename') for a in artifacts]}, answer_len={len(final_text)}")
             return result
 
         # Process tool calls
@@ -1004,14 +1110,22 @@ def run_agent(
                 from hackathon_backend.services.lambdas.agent.core.storage import (
                     _use_s3 as _s3_check, save_artifact as _save_art,
                 )
+                log.info(f"[run_code] {len(generated_files)} files to process, s3={_s3_check()}, task={file_task_id}")
                 for f in generated_files:
                     file_url = f"/api/tasks/{file_task_id}/artifacts/{f['filename']}"
                     if _s3_check():
                         fp = f["path"]
                         if os.path.isfile(fp):
-                            with open(fp, "rb") as _fh:
-                                s3_res = _save_art(file_task_id, f["filename"], _fh.read())
-                            file_url = s3_res.get("url", file_url)
+                            log.info(f"[run_code] Uploading to S3: {f['filename']} ({f.get('size_bytes', 0)} bytes)")
+                            try:
+                                with open(fp, "rb") as _fh:
+                                    s3_res = _save_art(file_task_id, f["filename"], _fh.read())
+                                file_url = s3_res.get("url", file_url)
+                                log.info(f"[run_code] S3 upload OK: {f['filename']} → url_len={len(file_url)}")
+                            except Exception as s3_err:
+                                log.error(f"[run_code] S3 upload FAILED for {f['filename']}: {s3_err}")
+                        else:
+                            log.warning(f"[run_code] File not found on disk: {fp}")
                     artifact = {
                         "filename": f["filename"], "path": f["path"],
                         "task_id": file_task_id,
@@ -1222,56 +1336,27 @@ def _parse_final_response(text: str, default_sources: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 # Detect if a message needs background processing (heavy task)
 # ---------------------------------------------------------------------------
-_HEAVY_TASK_KEYWORDS: dict[str, list[str]] = {
-    "cash_flow_forecast": [
-        "prevision tesoreria", "prevision de tesoreria", "cash flow", "flujo de caja",
-        "prevision de caja", "13 semanas", "forecast tesoreria",
-        "prevision de tesoreria", "prevision tesoreria", "prevision caja", "tesoreria 13",
-    ],
-    "pack_reporting": [
-        "pack reporting", "reporting mensual", "p&l mensual", "cuenta resultados", "balance mensual",
-    ],
-    "modelo_303": [
-        "modelo 303", "iva trimestral", "liquidacion iva", "borrador 303",
-    ],
-    "aging_analysis": [
-        "aging", "antiguedad", "cobros pendientes", "deuda por antiguedad", "facturas vencidas",
-    ],
-    "client_profitability": [
-        "rentabilidad cliente", "rentabilidad por cliente", "margen por cliente",
-    ],
-    "modelo_347": [
-        "modelo 347", "terceros 3005", "declaracion terceros",
-    ],
-    "three_way_matching": [
-        "three way matching", "cruce tres vias", "albaranes facturas",
-    ],
-    "bank_reconciliation": [
-        "conciliacion bancaria", "conciliacion bancaria", "conciliar facturas",
-        "conciliar transacciones", "reconciliacion", "reconciliacion",
-        "transacciones sin conciliar", "facturas sin conciliar",
-        "bank reconciliation", "matching bancario", "cruce bancario",
-        "conciliar banco", "conciliar pagos", "pagos sin conciliar",
-        "conciliar las facturas", "conciliar las transacciones",
-        "conciliar con el banco", "cruce con banco",
-    ],
+# Maps playbook task_type → task_executor task_type (for heavy background tasks)
+_HEAVY_PLAYBOOK_TYPES: dict[str, str] = {
+    "prediccion_cashflow": "cash_flow_forecast",
+    "reportes_financieros": "pack_reporting",
+    "auditoria_iva": "modelo_303",
+    "conciliacion": "bank_reconciliation",
 }
-
-_INFORMATIONAL_PREFIXES = [
-    "que es", "que es", "que son", "que son", "como funciona", "como funciona",
-    "como se calcula", "como se calcula", "explicame", "explicame", "dime que es",
-    "que significa", "que significa", "para que sirve", "para que sirve",
-    "what is", "how does", "explain",
-]
 
 
 def detect_heavy_task(user_message: str) -> str | None:
-    msg_lower = user_message.lower()
-    for prefix in _INFORMATIONAL_PREFIXES:
-        if msg_lower.startswith(prefix) or msg_lower.startswith("?" + prefix):
-            return None
-    for task_type, keywords in _HEAVY_TASK_KEYWORDS.items():
-        for kw in keywords:
-            if kw in msg_lower:
-                return task_type
-    return None
+    """
+    Detect if a message requires heavy background processing.
+
+    Uses semantic intent classification (via cheap LLM call) instead of keywords.
+    Returns the task_type string if heavy, or None for inline processing.
+    """
+    task_type = classify_intent(user_message)
+
+    # Explanations and general questions are never heavy
+    if task_type in ("explicacion_humana", "general"):
+        return None
+
+    # Only certain task types are heavy enough for background processing
+    return _HEAVY_PLAYBOOK_TYPES.get(task_type)

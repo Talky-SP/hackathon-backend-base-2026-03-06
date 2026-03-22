@@ -457,3 +457,51 @@ def get_group_fields(table_name: str) -> list[str]:
     if not cat:
         return []
     return cat.get("group_fields", [])
+
+
+# DynamoDB reserved words that need ExpressionAttributeNames
+_RESERVED_WORDS = {
+    "status", "name", "description", "type", "key", "value", "count",
+    "date", "comment", "data", "source", "position", "role", "location",
+    "number", "size", "time", "year", "month", "day", "hour", "minute",
+    "second", "action", "domain", "limit", "order", "by",
+}
+
+
+def get_projection_fields(table_name: str) -> set[str]:
+    """Get all fields worth projecting for a table (keys + key_fields + common refs).
+
+    Returns the union of PK, SK, key_fields, and essential reference fields.
+    This is used to build a DynamoDB ProjectionExpression that avoids
+    fetching heavy fields like field_images, raw_text, original_json, etc.
+    """
+    cat = TABLE_CATALOG.get(table_name)
+    if not cat:
+        return set()
+    fields = set(cat.get("key_fields", {}).keys())
+    # Always include PK and SK
+    fields.add(cat["pk"])
+    fields.add(cat["sk"])
+    # Include ai_enrichment for bank reconciliations (nested map used in analysis)
+    if table_name == "Bank_Reconciliations":
+        fields.add("ai_enrichment")
+    return fields
+
+
+def build_projection_expression(fields: set[str]) -> tuple[str, dict[str, str]] | None:
+    """Build DynamoDB ProjectionExpression + ExpressionAttributeNames for reserved words.
+
+    Returns (projection_expr, attr_names) or None if fields is empty.
+    """
+    if not fields:
+        return None
+    parts = []
+    attr_names: dict[str, str] = {}
+    for f in sorted(fields):
+        if f.lower() in _RESERVED_WORDS:
+            alias = f"#{f}"
+            attr_names[alias] = f
+            parts.append(alias)
+        else:
+            parts.append(f)
+    return ", ".join(parts), attr_names

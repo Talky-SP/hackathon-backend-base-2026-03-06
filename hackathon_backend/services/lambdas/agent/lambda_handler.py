@@ -13,8 +13,14 @@ import json
 import logging
 import os
 
+# Configure root logger so ALL module loggers (unified_agent, code_runner, etc.)
+# emit to CloudWatch at the correct level.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    force=True,  # Override any prior basicConfig (e.g. from imports)
+)
 logger = logging.getLogger("agent.lambda")
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 _initialized = False
 

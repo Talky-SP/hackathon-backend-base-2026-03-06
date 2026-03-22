@@ -27,6 +27,9 @@ from hackathon_backend.services.lambdas.agent.core.config import traced_completi
 from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
 )
+from hackathon_backend.services.lambdas.agent.core.data_catalog import (
+    get_projection_fields, build_projection_expression,
+)
 
 AWS_PROFILE = os.getenv("AWS_PROFILE", "")
 AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_REGION_NAME", "eu-west-3"))
@@ -204,16 +207,20 @@ def _execute_query(
     if limit:
         query_kwargs["Limit"] = limit
 
-    # Projection expression
+    # Projection expression — reduce network transfer by only fetching needed fields
+    proj_fields = get_projection_fields(table_name)
     if fields_to_return:
-        # Always include key fields + source fields
-        essential = {"userId", "locationId", "categoryDate", "supplier", "supplier_cif",
-                     "client_name", "client_cif", "invoice_date", "due_date", "total",
-                     "importe", "reconciled", "category", "concept", "field_images"}
-        all_fields = list(set(fields_to_return) | essential)
-        # DynamoDB reserved words need expression attribute names
-        # Skip projection for simplicity — fields are small enough
-        pass
+        proj_fields = proj_fields | set(fields_to_return)
+    if proj_fields:
+        proj_result = build_projection_expression(proj_fields)
+        if proj_result:
+            proj_expr, attr_names = proj_result
+            query_kwargs["ProjectionExpression"] = proj_expr
+            if attr_names:
+                # Merge with any existing ExpressionAttributeNames
+                existing = query_kwargs.get("ExpressionAttributeNames", {})
+                existing.update(attr_names)
+                query_kwargs["ExpressionAttributeNames"] = existing
 
     # Execute with pagination (hard limit: MAX_ITEMS_PER_QUERY)
     items = []

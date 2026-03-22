@@ -33,6 +33,16 @@ from hackathon_backend.services.lambdas.agent.core.query_agent import (
     _execute_query, _execute_code, _sanitize, _extract_source,
     QUERY_AGENT_TOOLS, QUERY_AGENT_SYSTEM,
 )
+from hackathon_backend.services.lambdas.agent.core.unified_agent import (
+    _safe_exec, _build_dataset_card, _validate_generated_files,
+    _audit_code_execution, UNIFIED_TOOLS, ARTIFACTS_DIR as _UA_ARTIFACTS_DIR,
+)
+from hackathon_backend.services.lambdas.agent.core.data_catalog import (
+    get_schema_prompt, ALL_TABLE_NAMES,
+)
+from hackathon_backend.services.lambdas.agent.core.playbooks import (
+    get_playbook_guidance,
+)
 from hackathon_backend.services.lambdas.agent.core.chat_store import record_llm_cost
 from hackathon_backend.services.lambdas.agent.core.task_manager import (
     update_task_status, add_task_cost, add_task_artifact,
@@ -69,22 +79,36 @@ def run_sub_agent(
     on_event: EventCallback | None = None,
 ) -> dict:
     """
-    Run a sub-agent that can query DynamoDB and run analysis code.
+    Run a sub-agent that can query DynamoDB and run code.
+    Uses v2 tools: dynamo_query (dataset cards) + run_code (sandboxed exec).
     Returns: {"success": bool, "data": dict, "usage": list[dict], "sources": list[dict]}
     """
     emit = on_event or _noop
     usage_records: list[dict] = []
     sources: list[dict] = []
 
-    system_prompt = QUERY_AGENT_SYSTEM + f"""
+    # Build sub-agent system prompt with schema from data_catalog
+    schema = get_schema_prompt()
+    system_prompt = f"""{schema}
 
-ADDITIONAL CONTEXT:
-You are a sub-agent working as part of a larger task. Your specific objective:
+You are a sub-agent working as part of a larger financial analysis task.
+Your tools: dynamo_query (returns dataset cards with stats, not raw items),
+run_code (sandboxed Python with full data access).
+
+In run_code:
+- Access data via: items = data['query_1']['items']
+- Helpers available: group_by(), monthly_totals(), top_n(), filter_items(), sum_field()
+- Libraries: pandas (pd), openpyxl, matplotlib (plt), numpy (np), json, Decimal, datetime
+- Assign results to `result` variable (dict with 'answer' key)
+
+YOUR SPECIFIC OBJECTIVE:
 {objective}
 
-Return your results by calling run_analysis with a structured result dict.
-Focus ONLY on your objective — do not try to answer the full user question.
-"""
+Return your results by calling run_code with a structured result dict.
+Focus ONLY on your objective — do not try to answer the full user question."""
+
+    # Use UNIFIED_TOOLS (dynamo_query + run_code + edit_file)
+    sub_agent_tools = [t for t in UNIFIED_TOOLS if t["function"]["name"] in ("dynamo_query", "run_code")]
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -93,14 +117,12 @@ Focus ONLY on your objective — do not try to answer the full user question.
 
     query_results: dict[str, dict] = {}
     query_counter = 0
-    # location_id for traced_completion — extracted from the _execute_query calls
+    code_retry_counts: dict[str, int] = {}
 
     for iteration in range(max_iterations):
-        # Check cancellation
         if is_cancelled(task_id):
             raise CancelledError(f"Task {task_id} cancelled")
 
-        # Check budget before each LLM call
         budget = check_budget(task_id)
         if not budget["ok"]:
             return {
@@ -119,7 +141,7 @@ Focus ONLY on your objective — do not try to answer the full user question.
             step=f"sub_agent_iter_{iteration + 1}",
             task_id=task_id,
             location_id=location_id,
-            tools=QUERY_AGENT_TOOLS,
+            tools=sub_agent_tools,
             temperature=0.1,
         )
 
@@ -136,14 +158,12 @@ Focus ONLY on your objective — do not try to answer the full user question.
             "total_tokens": total_tokens,
         })
 
-        # Track cost
         from hackathon_backend.services.lambdas.agent.core.chat_store import _estimate_cost
         cost = _estimate_cost(model_id, prompt_tokens, completion_tokens)
         add_task_cost(task_id, total_tokens, cost)
 
         choice = response.choices[0]
 
-        # Agent finished
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
             text = choice.message.content or ""
             update_task_step(step_id, "COMPLETED", result_summary=text[:200])
@@ -159,11 +179,12 @@ Focus ONLY on your objective — do not try to answer the full user question.
 
         for tool_call in choice.message.tool_calls:
             fn_name = tool_call.function.name
+            tc_id = tool_call.id
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps({"error": "Invalid JSON"}),
                 })
                 continue
@@ -171,14 +192,15 @@ Focus ONLY on your objective — do not try to answer the full user question.
             if fn_name == "dynamo_query":
                 query_counter += 1
                 query_key = f"query_{query_counter}"
+                table_name = args["table_name"]
 
                 emit("task_progress", {
                     "task_id": task_id,
-                    "message": f"Consultando {args['table_name']}...",
+                    "message": f"Consultando {table_name.replace('_', ' ')}...",
                 })
 
                 result = _execute_query(
-                    table_name=args["table_name"],
+                    table_name=table_name,
                     location_id=location_id,
                     index_name=args.get("index_name"),
                     pk_field=args.get("pk_field", "userId"),
@@ -188,100 +210,112 @@ Focus ONLY on your objective — do not try to answer the full user question.
                     filter_expression=args.get("filter_expression"),
                     limit=args.get("limit"),
                 )
-
                 query_results[query_key] = result
 
-                # Collect sources
-                if result.get("success") and args["table_name"] in ("User_Expenses", "User_Invoice_Incomes"):
+                if result.get("success") and table_name in ("User_Expenses", "User_Invoice_Incomes"):
                     for item in result["items"]:
                         src = _extract_source(item)
                         if src:
                             sources.append(src)
 
-                # Prepare LLM response (truncated)
-                response_for_llm = {
-                    "query_key": query_key,
-                    "success": result["success"],
-                    "table": result["table"],
-                    "count": result["count"],
-                }
-                if result["success"]:
-                    from hackathon_backend.services.lambdas.agent.core.query_agent import KEEP_FIELDS
-                    items_for_llm = result["items"][:50]
-                    slim_items = [{k: v for k, v in it.items() if k in KEEP_FIELDS} for it in items_for_llm]
-                    response_for_llm["items"] = _sanitize(slim_items)
-                    if result["count"] > 50:
-                        response_for_llm["note"] = f"Showing 50 of {result['count']}. Use run_analysis for full dataset."
+                # Return dataset card instead of raw items
+                if result.get("success"):
+                    response_for_llm = _build_dataset_card(query_key, result, table_name)
                 else:
-                    response_for_llm["error"] = result.get("error", "Unknown")
+                    response_for_llm = {
+                        "query_key": query_key, "success": False,
+                        "table": table_name,
+                        "error": result.get("error", "Unknown"),
+                    }
 
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps(response_for_llm, ensure_ascii=False, default=str),
                 })
 
-            elif fn_name == "run_analysis":
-                code = args["code"]
-                result = _execute_code(code, query_results)
+            elif fn_name == "run_code":
+                code = args.get("code", "")
+                file_task_id = task_id
 
-                if result["success"] and isinstance(result["result"], dict):
-                    analysis = result["result"]
-                    if "answer" in analysis or "data" in analysis:
-                        update_task_step(step_id, "COMPLETED",
-                                         result_summary=str(analysis.get("answer", ""))[:200])
-                        return {
-                            "success": True,
-                            "data": analysis,
-                            "usage": usage_records,
-                            "sources": sources,
-                        }
-
-                messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
-                })
-
-            elif fn_name == "generate_file":
                 emit("task_progress", {
                     "task_id": task_id,
-                    "message": "Sub-agent generando archivo...",
+                    "message": "Ejecutando codigo de analisis...",
                 })
-                file_prompt = args.get("prompt", "")
-                data_json = args.get("data_json", "")
 
-                code_result = run_code_execution(
-                    prompt=file_prompt,
-                    model_id=model_id,
-                    data_context=data_json,
-                    task_id=task_id,
-                    system_prompt=CODE_EXEC_SYSTEM,
+                exec_result = _safe_exec(code, query_results, file_task_id)
+                elapsed_ms = exec_result.get("elapsed_ms", 0)
+
+                _audit_code_execution(
+                    task_id=file_task_id, code=code, query_results=query_results,
+                    result=exec_result.get("result"), error=exec_result.get("error"),
+                    elapsed_ms=elapsed_ms, files=exec_result.get("files"),
+                    location_id=location_id,
                 )
 
-                if code_result.get("usage"):
-                    u = code_result["usage"]
-                    if isinstance(u, dict):
-                        usage_records.append(u)
-                    elif isinstance(u, list):
-                        usage_records.extend(u)
+                if not exec_result["success"]:
+                    retry_key = f"{iteration}_run_code"
+                    code_retry_counts[retry_key] = code_retry_counts.get(retry_key, 0) + 1
+                    if code_retry_counts[retry_key] >= 3:
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc_id,
+                            "content": json.dumps({
+                                "error": exec_result["error"], "fatal": True,
+                                "message": "Code failed 3 times. Return error to user.",
+                            }),
+                        })
+                    else:
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc_id,
+                            "content": json.dumps({
+                                "error": exec_result["error"],
+                                "attempt": code_retry_counts[retry_key],
+                                "max_attempts": 3,
+                                "hint": "Fix the code and try again.",
+                            }),
+                        })
+                    continue
 
-                file_response = {
-                    "success": code_result.get("success", False),
-                    "files": [f["filename"] for f in code_result.get("files", [])],
-                    "text": code_result.get("text", "")[:500],
-                }
+                result_val = exec_result.get("result")
+                generated_files = exec_result.get("files", [])
+
+                # Validate and register files
+                if generated_files:
+                    generated_files = _validate_generated_files(generated_files)
+                    for f in generated_files:
+                        add_task_artifact(task_id, {
+                            "filename": f["filename"], "path": f["path"],
+                            "type": f.get("type", "file"),
+                            "size_bytes": f.get("size_bytes", 0),
+                        })
+
+                # If result has 'answer' or 'data', return immediately
+                if isinstance(result_val, dict) and ("answer" in result_val or "data" in result_val):
+                    update_task_step(step_id, "COMPLETED",
+                                     result_summary=str(result_val.get("answer", ""))[:200])
+                    return {
+                        "success": True,
+                        "data": result_val,
+                        "usage": usage_records,
+                        "sources": sources,
+                    }
+
+                tool_response = {"success": True}
+                if result_val is not None:
+                    tool_response["result"] = result_val
+                if generated_files:
+                    tool_response["files"] = [f["filename"] for f in generated_files]
 
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
-                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": json.dumps(tool_response, ensure_ascii=False, default=str),
                 })
 
             else:
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps({"error": f"Unknown tool: {fn_name}"}),
                 })
 
-    # Max iterations
     update_task_step(step_id, "COMPLETED", result_summary="Max iterations reached")
     return {
         "success": True,
@@ -777,18 +811,18 @@ This table contains ALL actual money movements: amount<0 = outflow, amount>0 = i
 Steps:
 1. Fetch ALL bank transactions from Bank_Reconciliations (PK=locationId, query by PK directly).
    Extract: bookingDate, amount, description, merchant, ai_enrichment.payment_type
-2. In run_analysis, classify transactions into categories using ai_enrichment.payment_type
+2. In run_code, classify transactions into categories using ai_enrichment.payment_type
    (vendor_payment, payroll, social_security, bank_fee, tax_payment) and amount sign.
    Group by week and category to find historical patterns (weekly averages for inflows/outflows).
 3. Project 13 weeks forward based on historical weekly averages per category.
    Calculate: opening_balance (last known bank position), weekly inflows, weekly outflows, closing_balance.
    Identify liquidity alerts (weeks where projected balance goes negative).
-4. IMPORTANT: Call generate_file to create a professional Excel with:
+4. IMPORTANT: Use run_code to create a professional Excel with:
    - Sheet 1: 13-week forecast table with weekly columns (inflows, outflows, net, cumulative balance)
    - Sheet 2: Historical analysis (weekly actuals by category)
    - Sheet 3: Executive summary with key metrics and alerts
    - Include a line chart showing projected balance over 13 weeks
-   Pass the computed forecast data as data_json.
+   Save files to output_dir.
 
 DO NOT use User_Expenses or User_Invoice_Incomes as primary data for cash flow.
 Bank_Reconciliations IS the source of truth for actual cash movements.
@@ -800,8 +834,8 @@ Build a monthly financial reporting pack (P&L + KPIs).
 1. Query User_Expenses via UserIdPnlDateIndex for the current month's expenses.
 2. Query User_Invoice_Incomes via UserIdPnlDateIndex for income in the same period.
 3. Query Payroll_Slips for salary costs in the period.
-4. Build P&L in run_analysis: Revenue - COGS - Operating Expenses - Payroll = Operating Profit.
-5. IMPORTANT: Call generate_file to create Excel with P&L sheet, KPIs sheet, and charts.
+4. Build P&L in run_code: Revenue - COGS - Operating Expenses - Payroll = Operating Profit.
+5. IMPORTANT: Use run_code to create Excel (save to output_dir) with P&L sheet, KPIs sheet, and charts.
 You MUST generate an Excel file — this is a report task.""",
 
         "modelo_303": """\
@@ -810,17 +844,17 @@ Build a quarterly VAT return draft.
 1. Query User_Expenses via UserIdPnlDateIndex for the quarter.
    Extract: ivas[] array, vatDeductibleAmount, vatNonDeductibleAmount, vatOperationType.
 2. Query User_Invoice_Incomes via UserIdPnlDateIndex for the same quarter.
-3. Calculate in run_analysis: Bases imponibles por tipo, cuotas soportadas deducibles, cuotas repercutidas.
-4. IMPORTANT: Call generate_file to create Excel with the Modelo 303 draft.
+3. Calculate in run_code: Bases imponibles por tipo, cuotas soportadas deducibles, cuotas repercutidas.
+4. IMPORTANT: Use run_code to create Excel (save to output_dir) with the Modelo 303 draft.
 You MUST generate an Excel file — this is a report task.""",
 
         "aging_analysis": """\
 TASK-SPECIFIC GUIDANCE — AGING ANALYSIS:
 Classify outstanding debts by age buckets (0-30d, 31-60d, 61-90d, >90d).
-1. Query User_Invoice_Incomes by PK, filter unpaid in run_analysis.
+1. Query User_Invoice_Incomes by PK, filter unpaid in run_code.
 2. Query User_Expenses by PK, filter unpaid.
 3. Bucket by age, identify top debtors/creditors.
-4. IMPORTANT: Call generate_file to create Excel with aging report.
+4. IMPORTANT: Use run_code to create Excel (save to output_dir) with aging report.
 You MUST generate an Excel file — this is a report task.""",
 
         "client_profitability": """\
@@ -850,11 +884,11 @@ Automatically match unreconciled bank transactions with unreconciled invoices/pa
 Steps:
 1. Query ALL Bank_Reconciliations by PK (locationId) — NO filter, NO GSI.
    IMPORTANT: Unreconciled txns (status=PENDING) do NOT have the `reconciled` field at all,
-   and are NOT indexed in LocationByStatusDate GSI. You MUST query all, then filter in run_analysis.
+   and are NOT indexed in LocationByStatusDate GSI. You MUST query all, then filter in run_code.
    In code: unreconciled = [t for t in txns if t.get('status') != 'MATCHED']
-2. Query User_Expenses by PK. In run_analysis filter items where reconciled is None/missing.
+2. Query User_Expenses by PK. In run_code filter items where reconciled is None/missing.
 3. Query User_Invoice_Incomes by PK. Same filter for unreconciled.
-4. In run_analysis, implement matching algorithm:
+4. In run_code, implement matching algorithm:
 
    MATCHING RULES (by priority):
    a) EXACT MATCH (confidence=HIGH): abs(txn.amount) == invoice.total AND
@@ -867,7 +901,7 @@ Steps:
    For EXPENSES: txn.amount < 0 matches invoice.total (outflow pays an expense)
    For INCOMES: txn.amount > 0 matches invoice.total (inflow receives a payment)
 
-5. IMPORTANT: Call generate_file to create Excel with:
+5. IMPORTANT: Use run_code to create Excel (save to output_dir) with:
    - Sheet 1: "Propuesta Conciliacion" — matched pairs with confidence score, txn details, invoice details
    - Sheet 2: "Transacciones Sin Conciliar" — bank txns with no match found
    - Sheet 3: "Facturas Sin Conciliar" — invoices (expenses + incomes) with no match found
@@ -908,7 +942,7 @@ AVAILABLE TABLES (DynamoDB):
 1. User_Expenses — PK=userId, SK=categoryDate (CATEGORY#YYYY-MM-DD#UUID)
    GSIs: UserIdInvoiceDateIndex(sk=invoice_date), UserIdSupplierCifIndex(sk=supplier_cif), UserIdPnlDateIndex(sk=pnl_date)
    Fields: total, importe, ivas[], supplier, supplier_cif, invoice_date, due_date, category, concept, reconciled (None/False=unpaid), accountingEntries[], all_products[]
-   NOTE: For unpaid invoices, query by PK and filter reconciled=None/False in run_analysis (the UserByReconStateDate GSI may not have data)
+   NOTE: For unpaid invoices, query by PK and filter reconciled=None/False in run_code (the UserByReconStateDate GSI may not have data)
 
 2. User_Invoice_Incomes — PK=userId, SK=categoryDate. Same pattern as expenses but with client_name/client_cif.
    GSIs: UserIdInvoiceDateIndex, UserIdClientCifIndex(sk=client_cif)
@@ -930,10 +964,10 @@ AVAILABLE TABLES (DynamoDB):
 {task_guidance}
 
 IMPORTANT QUERY TIPS:
-- Each sub-agent has dynamo_query (DynamoDB), run_analysis (Python code), and generate_file (AI code execution) tools.
+- Each sub-agent has dynamo_query (DynamoDB) and run_code (Python execution with data access, file generation) tools.
 - Always use PK queries (never scans). For date ranges, use GSIs with SK conditions.
-- If a GSI returns 0 results, try querying by PK directly and filtering with run_analysis.
-- The sub-agent should always finish with run_analysis to return structured data.
+- If a GSI returns 0 results, try querying by PK directly and filtering with run_code.
+- The sub-agent should always finish with run_code to return structured data and/or generate files.
 - Bank_Reconciliations contains the REAL money movements. amount<0 = outflow, amount>0 = inflow.
 
 Create 2-5 steps. Each step runs as a sub-agent that can query DynamoDB and run Python analysis.
@@ -946,7 +980,7 @@ Return JSON array:
     "name": "step_name",
     "description": "Human-readable description (Spanish)",
     "parallel_group": 1,
-    "objective": "Detailed objective: what table to query, what PK/SK/GSI to use, what fields to extract, what to compute in run_analysis. Be specific."
+    "objective": "Detailed objective: what table to query, what PK/SK/GSI to use, what fields to extract, what to compute in run_code. Be specific."
   }}
 ]"""
 

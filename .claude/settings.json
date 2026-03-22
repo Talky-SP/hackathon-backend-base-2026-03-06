@@ -10,7 +10,10 @@
       "Bash(python -c \"import numpy; print\\(''OK''\\)\")",
       "Bash(python -c \"import matplotlib; print\\(''OK''\\)\")",
       "Bash(python -c \"import openpyxl; print\\(''OK''\\)\")",
-      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, detect_heavy_task; print\\(''server imports OK''\\)\")"
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, detect_heavy_task; print\\(''server imports OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''hackathon_backend/services/lambdas/agent/lambda_handler.py''\\).read\\(\\)\\); print\\(''lambda_handler.py: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''hackathon_backend/services/lambdas/agent/core/unified_agent.py''\\).read\\(\\)\\); print\\(''unified_agent.py: OK''\\)\")"
     ]
   }
 }
