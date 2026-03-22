@@ -901,34 +901,60 @@ def run_agent(
                     }
                     total_items += len(qv.get("items", []))
 
-                data_json_bytes = json.dumps(full_data, ensure_ascii=False, default=str).encode("utf-8")
-                data_b64 = _b64_gen.b64encode(data_json_bytes).decode()
+                data_json_str = json.dumps(full_data, ensure_ascii=False, default=str)
+                data_size_kb = len(data_json_str) / 1024
 
-                # data_context = raw base64 string (nothing else)
-                data_for_exec = data_b64
+                if data_size_kb > 200:
+                    # Large dataset: write JSON to temp file, sandbox reads it
+                    # The file is written locally — for Claude sandbox we pass the
+                    # JSON directly (Gemini can handle larger contexts).
+                    # Strategy: pass raw JSON (not base64) to save tokens,
+                    # and use Gemini Flash for large data (2M context window).
+                    data_for_exec = data_json_str
+                    gen_prompt = (
+                        f"IMPORTANT — DATA LOADING:\n"
+                        f"The DATA section below contains {total_items} items as raw JSON.\n"
+                        f"Parse it directly:\n"
+                        f"```python\n"
+                        f"import json\n"
+                        f"# The DATA section is a JSON string — parse it\n"
+                        f"data = json.loads(open('/dev/stdin').read())  # or from the DATA variable\n"
+                        f"```\n"
+                        f"Actually, the data is already available below in the DATA section as JSON.\n"
+                        f"Load it like this:\n"
+                        f"```python\n"
+                        f"import json\n"
+                        f"raw = r'''{data_json_str[:200]}...'''  # This is truncated — use the FULL DATA section\n"
+                        f"```\n"
+                        f"Use ALL {total_items} items. NEVER use sample/dummy data.\n\n"
+                        f"TASK:\n{args.get('prompt', '')}"
+                    )
+                    # Force Gemini for large datasets (2M context vs Claude's 200K)
+                    log.info(f"[generate_file] Large dataset ({data_size_kb:.0f}KB, {total_items} items) — using Gemini Flash")
+                    code_exec_model = "gemini-3.0-flash"
+                else:
+                    data_b64 = _b64_gen.b64encode(data_json_str.encode("utf-8")).decode()
+                    data_for_exec = data_b64
+                    code_exec_model = model_id
 
-                # Prepend data loading instructions to the prompt
-                gen_prompt = (
-                    f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
-                    f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
-                    f"Copy the ENTIRE content of the DATA section into a Python variable and decode it:\n"
-                    f"```python\n"
-                    f"import json, base64\n"
-                    f"# The DATA section below contains the raw base64 string — copy it all\n"
-                    f"raw_b64 = '<entire content of DATA section>'\n"
-                    f"data = json.loads(base64.b64decode(raw_b64))\n"
-                    f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
-                    f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
-                    f"```\n"
-                    f"The DATA section contains {total_items} real items from the database.\n"
-                    f"NEVER use sample/dummy/fake data. NEVER create example data. Use ONLY the decoded data.\n"
-                    f"NEVER limit to a subset — use ALL {total_items} items.\n\n"
-                    f"TASK:\n{args.get('prompt', '')}"
-                )
+                    gen_prompt = (
+                        f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
+                        f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
+                        f"Decode it:\n"
+                        f"```python\n"
+                        f"import json, base64\n"
+                        f"raw_b64 = '<entire content of DATA section>'\n"
+                        f"data = json.loads(base64.b64decode(raw_b64))\n"
+                        f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
+                        f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
+                        f"```\n"
+                        f"NEVER use sample/dummy/fake data. Use ALL {total_items} items.\n\n"
+                        f"TASK:\n{args.get('prompt', '')}"
+                    )
 
                 code_result = _native_code_exec(
                     prompt=gen_prompt,
-                    model_id=model_id,
+                    model_id=code_exec_model,
                     data_context=data_for_exec,
                     task_id=file_task_id,
                     system_prompt=CODE_EXEC_SYSTEM,
@@ -986,9 +1012,12 @@ def run_agent(
                         "success": True,
                     })
                 elif not code_result.get("success"):
+                    error_text = code_result.get("text", "")[:300]
+                    log.error(f"[generate_file] Code execution FAILED: {error_text}")
                     emit("file_generated", {
-                        "message": "Error generando archivo, reintentando...",
+                        "message": f"Error generando archivo: {error_text[:100]}",
                         "success": False,
+                        "error": error_text,
                     })
 
                 messages.append({

@@ -143,16 +143,18 @@ if _USE_DYNAMO:
     ) -> bool:
         table = _get_table()
         expr_parts = ["#st = :status"]
-        expr_names = {"#st": "status"}
+        expr_names: dict[str, str] = {"#st": "status"}
         expr_values: dict[str, Any] = {":status": status}
         if progress is not None:
-            expr_parts.append("progress = :progress")
+            expr_parts.append("#pg = :progress")
+            expr_names["#pg"] = "progress"
             expr_values[":progress"] = progress
         if result_summary:
             expr_parts.append("result_summary = :rs")
             expr_values[":rs"] = result_summary
         if error:
-            expr_parts.append("error = :err")
+            expr_parts.append("#err = :err")
+            expr_names["#err"] = "error"
             expr_values[":err"] = error
         if status == "RUNNING" and progress == 0:
             expr_parts.append("started_at = :sa")
