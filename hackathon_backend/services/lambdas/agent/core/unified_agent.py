@@ -269,6 +269,8 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
         pass
     try:
         import openpyxl
+        import openpyxl.styles
+        import openpyxl.utils
         injected["openpyxl"] = openpyxl
     except ImportError:
         pass
@@ -301,7 +303,25 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
             raise PermissionError(f"Cannot open '{path}' — use output_dir for file operations")
         return _real_open(path, mode, *args, **kwargs)
 
-    builtins_with_open = {**_SAFE_BUILTINS, "open": _sandbox_open}
+    # Safe __import__ — only allow pre-loaded modules (no arbitrary imports)
+    _allowed_modules = set(injected.keys()) | {
+        "json", "datetime", "collections", "decimal", "math", "re",
+        "openpyxl", "openpyxl.styles", "openpyxl.utils", "openpyxl.chart",
+        "openpyxl.formatting", "openpyxl.formatting.rule",
+        "pandas", "numpy", "matplotlib", "matplotlib.pyplot",
+    }
+
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            raise ImportError(f"Relative imports not allowed")
+        if name not in _allowed_modules:
+            # Check if it's a submodule of an allowed package
+            parts = name.split(".")
+            if not any(name.startswith(m + ".") or name == m for m in _allowed_modules):
+                raise ImportError(f"Import of '{name}' is not allowed. Use pre-injected libraries.")
+        return __builtins__["__import__"](name, globals, locals, fromlist, level) if isinstance(__builtins__, dict) else __import__(name, globals, locals, fromlist, level)
+
+    builtins_with_open = {**_SAFE_BUILTINS, "open": _sandbox_open, "__import__": _safe_import}
 
     # Build existing_files map: {filename: absolute_path} for artifacts from previous turns
     _existing_files: dict[str, str] = {}
@@ -713,7 +733,43 @@ def _build_artifact_context(chat_artifacts: list[dict] | None) -> str:
         tid = a.get("task_id", "?")
         url = a.get("url", "")
         lines.append(f"  - {fname} (task_id={tid}, url={url})")
+    lines.append(
+        "\nIMPORTANT: To EDIT these files you MUST call run_code. "
+        "Do NOT just say you did it — you must actually execute code. "
+        "Load via: wb = openpyxl.load_workbook(existing_files['filename.xlsx'])"
+    )
     return "\n".join(lines)
+
+
+def _build_state_summary(
+    cached_queries: dict[str, dict] | None,
+    chat_artifacts: list[dict] | None,
+) -> str:
+    """Build a concise state summary injected before the user message.
+
+    This tells the LLM what data and files are already available so it
+    doesn't re-query or hallucinate actions.
+    """
+    parts: list[str] = []
+
+    if cached_queries:
+        lines = ["[CACHED DATA — already in memory, no need to re-query]:"]
+        for qk, qv in cached_queries.items():
+            table = qv.get("table", "?")
+            count = qv.get("count", len(qv.get("items", [])))
+            lines.append(f"  - data['{qk}']: {table} ({count} items)")
+        lines.append("Use run_code to access this data directly. Only call dynamo_query if you need DIFFERENT data.")
+        parts.append("\n".join(lines))
+
+    if chat_artifacts:
+        lines = ["[EXISTING FILES — available in existing_files dict in run_code]:"]
+        for a in chat_artifacts:
+            fname = a.get("filename", "?")
+            lines.append(f"  - existing_files['{fname}']")
+        lines.append("To EDIT: call run_code, load with openpyxl.load_workbook(existing_files['name.xlsx']), modify, save to output_dir.")
+        parts.append("\n".join(lines))
+
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +901,14 @@ def run_agent(
     if playbook_guidance:
         log.info(f"[agent] Playbook detected: {task_type} ({get_playbook_name(task_type)})")
 
+    # Load cached query results from previous turns (same chat)
+    query_results: dict[str, dict] = {}
+    if chat_id:
+        cached = _get_cached_query_results(chat_id)
+        if cached:
+            query_results = cached
+            log.info(f"[agent] Loaded {len(cached)} cached queries for chat {chat_id}: {list(cached.keys())}")
+
     # Build system prompt with playbook + artifact context
     artifact_ctx = _build_artifact_context(chat_artifacts)
     extra_parts = [p for p in [extra_system, playbook_guidance, artifact_ctx] if p]
@@ -855,10 +919,17 @@ def run_agent(
     if conversation_history:
         messages.extend(conversation_history)
 
+    # Inject state summary before user message so LLM knows what's available
+    state_summary = _build_state_summary(query_results, chat_artifacts)
     user_content = _build_user_content(user_message, attachments)
+    if state_summary:
+        if isinstance(user_content, str):
+            user_content = f"{state_summary}\n\n---\nUSER MESSAGE: {user_content}"
+        else:
+            # Multimodal — prepend state as text block
+            user_content.insert(0, {"type": "text", "text": state_summary + "\n\n---\nUSER MESSAGE:"})
     messages.append({"role": "user", "content": user_content})
 
-    query_results: dict[str, dict] = {}
     query_counter = 0
     sources_collected: list[dict] = []
     artifacts: list[dict] = []
@@ -1058,13 +1129,6 @@ def run_agent(
                 code = args.get("code", "")
                 file_task_id = task_id or f"chat_{str(uuid.uuid4())[:8]}"
 
-                # Load cached query results if none this turn
-                if not query_results:
-                    cached = _get_cached_query_results(chat_id)
-                    if cached:
-                        query_results = cached
-                        log.info(f"[run_code] Loaded {len(cached)} cached queries for chat {chat_id}")
-
                 # If no data and code references data[], tell the LLM to query first
                 # But allow run_code without data for file editing (uses existing_files)
                 if not query_results and "data[" in code:
@@ -1088,8 +1152,10 @@ def run_agent(
                     "query_counts": {k: v.get("count", 0) for k, v in query_results.items()},
                 })
 
+                # Combine artifacts from this turn + previous turns
+                all_artifacts = (chat_artifacts or []) + artifacts
                 exec_result = _safe_exec(code, query_results, file_task_id,
-                                        existing_artifacts=artifacts)
+                                        existing_artifacts=all_artifacts)
                 elapsed_ms = exec_result.get("elapsed_ms", 0)
 
                 # Audit every execution
