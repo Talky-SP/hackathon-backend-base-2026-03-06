@@ -1307,13 +1307,18 @@ def run_agent(
                         "sources_count": len(result_val.get("sources") or sources_collected),
                     })
                     emit("agent_done", {"message": "Analisis completado"})
-                    return {
+                    ret = {
                         "answer": result_val.get("answer", ""),
                         "chart": result_val.get("chart"),
                         "sources": result_val.get("sources") or sources_collected,
                         "artifacts": artifacts,
                         "usage": usage_records,
                     }
+                    # Pass through extra fields (todo, close_status, etc.)
+                    for extra_key in ("todo", "close_status", "kpis"):
+                        if result_val.get(extra_key):
+                            ret[extra_key] = result_val[extra_key]
+                    return ret
 
                 # Build tool response
                 tool_response: dict[str, Any] = {"success": True}

@@ -170,61 +170,121 @@ PLAYBOOKS: dict[str, dict[str, Any]] = {
     "cierre_contable": {
         "name": "Cierre Contable Mensual",
         "guidance": """\
-PLAYBOOK — CIERRE CONTABLE (WORLD-CLASS ACCOUNTING CLOSE):
-You are a senior financial controller performing a monthly accounting close.
-Your report must be thorough, professional, and actionable.
+PLAYBOOK — CIERRE CONTABLE (WORLD-CLASS FINANCIAL CONTROLLER):
+You are the best financial controller in the world. The monthly accounting close is your
+signature deliverable — thorough, precise, and actionable. You don't just check boxes,
+you UNDERSTAND the financial reality and surface insights others would miss.
 
 STEP 1 — FETCH DATA (parallel queries):
-  - User_Expenses via UserIdInvoiceDateIndex for the month
-  - User_Invoice_Incomes via UserIdInvoiceDateIndex for the month
-  - Bank_Reconciliations by PK (ALL — then filter by month in code)
-  - Payroll_Slips by PK (then filter by month in code)
+  - User_Expenses via UserIdInvoiceDateIndex for the target month
+  - User_Invoice_Incomes via UserIdInvoiceDateIndex for the target month
+  - Bank_Reconciliations by PK (ALL — you'll filter by month in code)
+  - Payroll_Slips by PK (you'll filter by month in code)
 
-STEP 2 — EXPLORE & VALIDATE (first run_code):
+STEP 2 — DEEP EXPLORATION (first run_code):
   Filter bank transactions for the target month (by bookingDate).
-  Then build a complete picture:
+  Then EXPLORE the data like a forensic accountant:
 
-  REVENUE CHECK:
-  - Count and sum income invoices. Any missing?
-  - Cross-reference with bank inflows: are there inflows without invoices?
+  CASH REALITY (from bank — the ground truth):
+  - Total inflows and outflows for the month
+  - Classify bank movements: supplier payments, payroll, taxes, fees, income received
+  - Use ai_enrichment and description/merchant fields for classification
+  - What's the net cash position change for this month?
 
-  EXPENSE CHECK:
-  - Count and sum expense invoices by category
-  - Reconciliation status: how many reconciled vs pending?
-  - Identify pending invoices with amounts
+  INVOICES vs BANK (cross-reference):
+  - Match expense invoices to bank outflows. How many matched vs unmatched?
+  - Match income invoices to bank inflows. Any income received without an invoice?
+  - Identify bank payments without any matching invoice (potential missing invoices)
+  - Identify invoices without bank payment (pending / unpaid)
 
-  BANK ANALYSIS:
-  - Total bank movements for the month (inflows vs outflows)
-  - Reconciliation rate: % matched vs unmatched
-  - Identify large unmatched transactions (potential missing invoices)
-  - Detect payroll payments in bank (look for "nomina", "SS", "IRPF" in descriptions)
+  EXPENSE DEEP DIVE:
+  - Group by category: what are the main cost drivers?
+  - Group by supplier: who are the top suppliers this month?
+  - Any unusual amounts? First-time suppliers? Temporary CIFs?
+  - Compare with typical monthly pattern — anything anomalous?
 
-  VAT SUMMARY:
-  - IVA soportado (from expenses): sum of vatTotalAmount or ivas[]
-  - IVA repercutido (from income invoices): sum of vatTotalAmount
-  - Net VAT position
+  PAYROLL DETECTION:
+  - Even if Payroll_Slips table is empty, detect payroll in bank transactions
+  - Look for: "nomina", "SS", "seguridad social", "IRPF", "mod.111" in descriptions
+  - Estimate total payroll cost from bank data
 
-  DO NOT set `result` here. Continue to STEP 3.
+  VAT POSITION:
+  - IVA soportado: sum from expense invoices (ivas[] or vatTotalAmount)
+  - IVA repercutido: sum from income invoices
+  - Net position: repercutido - soportado (positive = owe AEAT, negative = claim refund)
 
-STEP 3 — GENERATE CLOSING REPORT (second run_code):
+  ANOMALY SCAN — be creative:
+  - Any duplicate-looking invoices?
+  - Bank txns on weekends? Round numbers? Unusual merchants?
+  - Invoices with dates outside the target month?
+
+  Print ALL findings. DO NOT set `result`. Continue to STEP 3.
+
+STEP 3 — GENERATE CLOSING REPORT + TODO LIST (second run_code):
   Create a professional Excel with:
-  - Sheet "Resumen Cierre": executive summary with status (CERRADO/BLOQUEADO/PENDIENTE)
-    Key metrics: ingresos, gastos, resultado, IVA, % conciliación
-  - Sheet "Gastos por Categoría": expenses grouped by category with totals
-  - Sheet "Movimientos Banco": bank transactions for the month with status
-  - Sheet "Pendientes": items blocking the close (unreconciled, missing invoices)
-  - Sheet "IVA": VAT detail (soportado vs repercutido by rate)
+  - Sheet "Resumen Cierre": executive summary with close status and KPIs
+  - Sheet "P&L Mensual": income - expenses = result, by category
+  - Sheet "Gastos Detalle": all expense invoices with category, supplier, amount, status
+  - Sheet "Movimientos Banco": bank transactions for the month, classified
+  - Sheet "Conciliación": reconciliation status (matched vs pending, both sides)
+  - Sheet "IVA": VAT summary by rate (4%, 10%, 21%)
+  - Sheet "Tareas Pendientes": the TODO list for closing (see below)
 
-  Set `result` with:
-  - "answer": executive summary with status and action items
-  - "chart": bar chart showing expenses by category
-  - "sources": ONLY the problematic items (pending invoices, unmatched txns) — NOT all data
+  TODO LIST FORMAT (critical — frontend will render this):
+  The `result` must include a "todo" field with structured tasks:
+  ```
+  result = {
+      "answer": "Executive summary text...",
+      "chart": {"type": "bar", ...},  # expenses by category
+      "sources": [...only problematic items...],
+      "todo": [
+          {
+              "id": "1",
+              "priority": "critical",  # critical / high / medium / low
+              "category": "conciliacion",  # conciliacion / facturacion / nominas / iva / revision
+              "title": "Conciliar 28 transacciones bancarias pendientes",
+              "description": "Hay 28 transacciones por 1,045,173.95€ sin conciliar, incluyendo un depósito a plazo de 1M€",
+              "amount": 1045173.95,
+              "items_count": 28,
+              "blocking": true  # true = blocks the close
+          },
+          {
+              "id": "2",
+              "priority": "critical",
+              "category": "facturacion",
+              "title": "Registrar facturas de ingreso de febrero",
+              "description": "No hay facturas de ingreso pero sí ingresos bancarios de 4,186.40€",
+              "amount": 4186.40,
+              "blocking": true
+          },
+          {
+              "id": "3",
+              "priority": "high",
+              "category": "nominas",
+              "title": "Registrar nóminas de febrero",
+              "description": "Se detectan pagos de nómina en banco (Tadros 6,973.80€, López-Abente 4,674.56€) pero no hay registros en Payroll_Slips",
+              "amount": 11648.36,
+              "blocking": false
+          },
+          ...more tasks...
+      ]
+  }
+  ```
+
+  CLOSE STATUS:
+  - "CERRADO": no blocking tasks, all reconciled, all invoices accounted for
+  - "BLOQUEADO": has blocking tasks that prevent the close
+  - "PENDIENTE": minor non-blocking issues to review
+
+  The TODO list should be ordered by priority (critical first) and include EVERY
+  actionable item found during exploration. Be specific — include amounts, counts,
+  supplier names. Each task should be something a person can act on.
 
 IMPORTANT:
-- Bank_Reconciliations is the source of truth for cash. Filter by bookingDate for the month.
+- Bank is the ground truth. Filter by bookingDate for the target month.
 - DO NOT use pandas. Use basic Python.
 - Complete ALL steps. Only set `result` in STEP 3 with Excel.
-- The close status should be: CERRADO (all OK), BLOQUEADO (critical issues), PENDIENTE (minor issues).""",
+- Keep sources concise: only pending/problematic items, NOT all data.""",
         "suggested_queries": [
             {"table": "User_Expenses", "index": "UserIdInvoiceDateIndex"},
             {"table": "User_Invoice_Incomes", "index": "UserIdInvoiceDateIndex"},

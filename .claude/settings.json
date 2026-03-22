@@ -44,7 +44,9 @@
       "Bash(taskkill //F //IM python.exe)",
       "Bash(find c:/hackathon-backend-base-2026-03-06 -type d -name \"__pycache__\" -exec rm -rf {} +)",
       "Bash(python -c \"import pandas; print\\(f''pandas {pandas.__version__} OK''\\)\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Read(//c/tmp/**)",
+      "Bash(ls c:/hackathon-backend-base-2026-03-06/hackathon_backend/services/lambdas/agent/core/server*)"
     ]
   }
 }
