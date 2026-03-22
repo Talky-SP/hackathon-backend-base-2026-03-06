@@ -205,17 +205,24 @@ Match unreconciled bank transactions with unreconciled invoices.
 2. QUERY User_Expenses by PK — get all expense invoices.
 3. QUERY User_Invoice_Incomes by PK — get all income invoices.
 4. In run_code, implement matching:
-   - Filter: bank txns where status != 'MATCHED', invoices where reconciled is missing/False
-   - For EXPENSES: txn.amount < 0 matches invoice.total
+   - UNRECONCILED bank txns: status != 'MATCHED' (i.e. status == 'PENDING')
+   - UNRECONCILED invoices: reconciliationState == 'UNRECONCILED' OR reconciled is missing/None/False
+     DO NOT filter by amount_due — "sin conciliar" != "pendiente de pago", they are DIFFERENT concepts.
+     An invoice can be PAID but still UNRECONCILED (no bank txn matched yet).
+   - For EXPENSES: txn.amount < 0 matches invoice.total (compare abs values)
    - For INCOMES: txn.amount > 0 matches invoice.total
    - Match rules (by priority):
-     a) HIGH: abs(amount) == total AND vendor_cif/client_cif matches
-     b) MEDIUM: abs(amount) == total AND date within 30 days
-     c) LOW: amount within 5% AND CIF matches
-   - Present matches with confidence score
+     a) HIGH (90%): abs(txn.amount) == invoice.total AND vendor_cif/client_cif matches
+     b) MEDIUM (70%): abs(txn.amount) == invoice.total AND date within 30 days
+     c) LOW (50%): amount within 5% AND CIF matches
+     d) POSSIBLE (40%): amount within 10% AND date within 60 days
+   - Present matches with confidence score, sorted by confidence desc
 
-CRITICAL: Unreconciled txns have status='PENDING' and NO 'reconciled' field (it's MISSING, not false).
-Do NOT use LocationByStatusDate GSI for unreconciled items.""",
+CRITICAL RULES:
+- Unreconciled txns have status='PENDING'. The 'reconciled' field may be MISSING (not false).
+- Do NOT use LocationByStatusDate GSI for unreconciled items.
+- Do NOT add extra filters like amount_due > 0 or amount_paid == 0.
+- Compare abs(txn.amount) with invoice.total (bank amounts can be negative for expenses).""",
     },
 
     "reportes_financieros": {
