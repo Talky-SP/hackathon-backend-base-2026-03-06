@@ -41,6 +41,10 @@ from hackathon_backend.services.lambdas.agent.core.data_catalog import (
 from hackathon_backend.services.lambdas.agent.core.playbooks import (
     classify_intent, get_playbook_guidance, get_playbook_name, PLAYBOOKS,
 )
+# Lazy import to avoid circular: subagent_runner imports from unified_agent
+def _dispatch_subagents(**kwargs):
+    from hackathon_backend.services.lambdas.agent.core.subagent_runner import dispatch_subagents
+    return dispatch_subagents(**kwargs)
 
 log = logging.getLogger(__name__)
 
@@ -627,14 +631,25 @@ TOOLS:
   Use for: analysis, aggregation, charts, AND file generation (Excel, CSV, PDF).
   Environment: data dict, output_dir, openpyxl, matplotlib (plt), numpy (np). NO pandas — use basic Python.
   Helpers: group_by(), monthly_totals(), top_n(), filter_items(), sum_field().
+- `dispatch_subagents`: Fan out work to parallel AI subagents. Each subagent gets documents
+  + full tool access (vision, queries, code execution). Use when processing 5+ documents.
+  Each subagent extracts structured data. You consolidate the results.
+
 MULTIMODAL INPUT:
 - Users can attach images (PNG, JPG) and PDFs — you can see and analyze them.
+- For MANY documents (5+), use dispatch_subagents to process them in parallel batches.
 
 WORKFLOW:
 1. Simple questions: Answer directly.
 2. Data questions: dynamo_query -> read dataset card stats -> run_code for detailed analysis.
 3. File generation: dynamo_query -> run_code (write to output_dir).
 4. Edit existing file: run_code with existing_files dict to load, modify, and save.
+5. Batch document processing (5+ documents):
+   a. Split documents into batches of 3-5 per subagent.
+   b. Call dispatch_subagents with objective + document paths.
+   c. Subagents process docs in parallel (OCR, extract data, cross-ref DB).
+   d. You receive consolidated structured results from all subagents.
+   e. Use run_code to merge results, generate Excel, create journal entries, etc.
 
 DATASET CARDS:
 - dynamo_query returns metadata (field stats, distributions, 3 sample rows).
@@ -730,11 +745,32 @@ def _build_user_content(
     if not attachments:
         return text
 
+    # If many documents (5+), hint subagent dispatch and include paths
+    saved_paths = [a for a in attachments if a.get("saved_path")]
+    if len(saved_paths) >= 5:
+        path_list = "\n".join(f"  - {a.get('filename', '?')}: {a['saved_path']}" for a in saved_paths)
+        dispatch_hint = (
+            f"\n\n[BATCH DOCUMENTS: {len(saved_paths)} files attached. "
+            f"Use dispatch_subagents to process them in parallel. "
+            f"Split into batches of 3-5 docs per subagent. File paths:\n{path_list}]"
+        )
+        text = text + dispatch_hint
+
     blocks: list[dict] = [{"type": "text", "text": text}]
-    for att in attachments:
+
+    # For small batches (< 5 docs), send inline as multimodal
+    # For large batches (5+), only send first 2 as preview + use dispatch for the rest
+    inline_limit = 4 if len(attachments) < 5 else 2
+    for i, att in enumerate(attachments):
         mime = att.get("mime_type", "application/octet-stream")
         b64 = att.get("data", "")
         fname = att.get("filename", "file")
+
+        if i >= inline_limit and len(attachments) >= 5:
+            # Skip inline — these will be processed by subagents
+            if i == inline_limit:
+                blocks.append({"type": "text", "text": f"[... and {len(attachments) - inline_limit} more documents — use dispatch_subagents with saved_path to process them]"})
+            continue
 
         if mime in _IMAGE_MIMES:
             blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
@@ -891,6 +927,54 @@ UNIFIED_TOOLS = [
                     },
                 },
                 "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dispatch_subagents",
+            "description": (
+                "Fan out work to parallel subagents for batch document processing. "
+                "Each subagent receives a batch of documents and an objective, and has "
+                "full access to vision (multimodal), DynamoDB queries, and code execution. "
+                "\n\nUSE WHEN:\n"
+                "- User uploads many documents (invoices, receipts, payslips) that need individual processing.\n"
+                "- A task can be split into independent parallel subtasks.\n"
+                "- Processing 5+ documents that each need OCR/analysis.\n"
+                "\n\nEach subagent extracts structured data from its documents, "
+                "can cross-reference with the database, and returns results. "
+                "You (the main agent) then consolidate all subagent results into the final output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subtasks": {
+                        "type": "array",
+                        "description": "List of subtasks. Each gets its own parallel subagent.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "objective": {
+                                    "type": "string",
+                                    "description": "What this subagent should do with its documents.",
+                                },
+                                "documents": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "File paths of documents to process.",
+                                },
+                            },
+                            "required": ["objective", "documents"],
+                        },
+                    },
+                    "max_parallel": {
+                        "type": "integer",
+                        "description": "Max subagents running simultaneously (default 5, max 10).",
+                        "default": 5,
+                    },
+                },
+                "required": ["subtasks"],
             },
         },
     },
@@ -1336,6 +1420,78 @@ def run_agent(
                         for f in generated_files
                     ]
                 tool_response["elapsed_ms"] = elapsed_ms
+
+                messages.append({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": json.dumps(tool_response, ensure_ascii=False, default=str),
+                })
+
+            # ---------------------------------------------------------------
+            # dispatch_subagents — parallel document processing
+            # ---------------------------------------------------------------
+            elif fn_name == "dispatch_subagents":
+                subtasks = args.get("subtasks", [])
+                max_parallel = min(args.get("max_parallel", 5), 10)
+
+                if not subtasks:
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc_id,
+                        "content": json.dumps({"error": "No subtasks provided."}),
+                    })
+                    continue
+
+                total_docs = sum(len(st.get("documents", [])) for st in subtasks)
+                log.info(f"[dispatch_subagents] {len(subtasks)} subtasks, {total_docs} docs, max_parallel={max_parallel}")
+                emit("dispatching_subagents", {
+                    "message": f"Lanzando {len(subtasks)} subagentes para procesar {total_docs} documentos...",
+                    "subtask_count": len(subtasks),
+                    "total_documents": total_docs,
+                })
+
+                dispatch_result = _dispatch_subagents(
+                    subtasks=subtasks,
+                    location_id=location_id,
+                    model_id=model_id,
+                    chat_id=chat_id,
+                    task_id=task_id,
+                    max_parallel=max_parallel,
+                    on_event=emit,
+                )
+
+                # Collect artifacts from subagents
+                for sr in dispatch_result.get("subagent_results", []):
+                    for art in sr.get("artifacts", []):
+                        artifacts.append(art)
+                    usage_records.extend(sr.get("usage", []))
+
+                # Build summary for LLM — include all extracted data
+                subagent_summaries = []
+                for sr in dispatch_result.get("subagent_results", []):
+                    sa_summary = {
+                        "subagent_id": sr["subagent_id"],
+                        "success": sr["success"],
+                        "cost_usd": sr["cost_usd"],
+                        "iterations": sr["iterations"],
+                    }
+                    if sr.get("error"):
+                        sa_summary["error"] = sr["error"]
+                    if sr.get("result"):
+                        sa_summary["result"] = sr["result"]
+                    subagent_summaries.append(sa_summary)
+
+                tool_response = {
+                    "success": dispatch_result["success"],
+                    "summary": dispatch_result["summary"],
+                    "total_cost_usd": dispatch_result["total_cost_usd"],
+                    "documents_processed": dispatch_result["documents_processed"],
+                    "subagent_results": subagent_summaries,
+                }
+
+                emit("subagents_done", {
+                    "message": dispatch_result["summary"],
+                    "success": dispatch_result["success"],
+                    "total_cost": dispatch_result["total_cost_usd"],
+                })
 
                 messages.append({
                     "role": "tool", "tool_call_id": tc_id,

@@ -35,6 +35,7 @@ TASK_TYPES = [
     "prediccion_cashflow",
     "simulacion",
     "explicacion_humana",
+    "contabilizar_facturas",
     "general",
 ]
 
@@ -58,6 +59,7 @@ Task types:
 - prediccion_cashflow: Cash flow forecast, treasury prediction, 13-week forecast
 - simulacion: What-if scenarios, decision simulation, impact analysis
 - explicacion_humana: Explain a concept, what is X, how does Y work
+- contabilizar_facturas: Process uploaded invoices/documents, create journal entries, register invoices, OCR invoices
 - general: Any other question that doesn't fit the above categories
 
 Question: {question}
@@ -152,6 +154,12 @@ def _keyword_fallback(question: str) -> str:
         "explicacion_humana": [
             "que es", "qué es", "explicame", "explícame", "como funciona",
             "cómo funciona", "que significa", "qué significa",
+        ],
+        "contabilizar_facturas": [
+            "contabilizar factura", "contabiliza estas factura", "registrar factura",
+            "asientos contable", "hacer la conta", "haz la conta",
+            "contabilizar esto", "registra estas factura", "procesar factura",
+            "dar de alta factura", "meter factura", "subir factura",
         ],
     }
 
@@ -720,6 +728,82 @@ The user wants an explanation, not data analysis.
 Answer directly without querying the database unless the explanation
 requires specific data from their business.
 Keep it clear, concise, and in the user's language.""",
+    },
+
+    "contabilizar_facturas": {
+        "name": "Contabilizar Facturas / Procesar Documentos",
+        "guidance": """\
+PLAYBOOK — CONTABILIZAR FACTURAS / PROCESAR DOCUMENTOS EN LOTE:
+You are the best accountant in the world. The user has uploaded documents (invoices,
+receipts, payslips, bank statements) and wants you to process them.
+
+STRATEGY:
+- If 1-4 documents: analyze them directly from the multimodal attachments.
+- If 5+ documents: use dispatch_subagents to process them in parallel batches.
+  Split into batches of 3-5 documents per subagent.
+
+STEP 1 — DISPATCH SUBAGENTS (for 5+ docs):
+  Call dispatch_subagents with subtasks. Each subtask gets 3-5 document paths and an objective:
+  "Extract all financial data from these invoices: supplier name, CIF/NIF, invoice number,
+   date, line items, base amount, VAT rate, VAT amount, total. Cross-reference with
+   User_Expenses in DynamoDB to check if already registered."
+
+  The subagent objective should match the user's request:
+  - "Contabilizar": extract data + match with DB + flag new/existing
+  - "Auditar": extract data + validate amounts + check for errors
+  - "Registrar": extract data + prepare for entry
+
+STEP 2 — CONSOLIDATE (run_code after dispatch completes):
+  Receive all subagent results. Merge into a single dataset:
+  - Deduplicate (same invoice number / CIF / date / amount)
+  - Cross-reference with DB records (query User_Expenses for the date range)
+  - Classify: already_registered, new, duplicate, error
+
+STEP 3 — GENERATE JOURNAL ENTRIES (run_code):
+  For each new invoice, generate accounting journal entries:
+  ```
+  result_entries = []
+  for inv in new_invoices:
+      result_entries.append({
+          "date": inv["date"],
+          "description": f"Fra. {inv['invoice_number']} - {inv['supplier']}",
+          "entries": [
+              {"account": "600", "concept": inv["concept"], "debit": inv["base_amount"], "credit": 0},
+              {"account": "472", "concept": f"IVA soportado {inv['vat_rate']}%", "debit": inv["vat_amount"], "credit": 0},
+              {"account": "410", "concept": inv["supplier"], "debit": 0, "credit": inv["total"]},
+          ]
+      })
+  ```
+
+STEP 4 — GENERATE EXCEL (run_code):
+  Create comprehensive Excel with sheets:
+  - "Resumen": summary stats (total invoices, total amount, new vs existing, errors)
+  - "Facturas Procesadas": all extracted data in table format
+  - "Asientos Contables": journal entries ready for import
+  - "Ya Registradas": invoices found in DB (no action needed)
+  - "Errores": documents that couldn't be processed or have issues
+
+  Set result with structured summary:
+  ```python
+  result = {
+      "answer": "Procesadas 50 facturas. 35 nuevas (42,300.00 EUR), 12 ya registradas, 3 con errores.",
+      "chart": {
+          "type": "pie",
+          "title": "Estado de facturas procesadas",
+          "labels": ["Nuevas", "Ya registradas", "Errores"],
+          "datasets": [{"label": "Facturas", "data": [35, 12, 3]}]
+      },
+      "sources": [...problematic items only...],
+  }
+  ```
+
+IMPORTANT:
+- Each subagent has FULL access: vision (read documents), DynamoDB (cross-reference), code (process).
+- Subagents run in PARALLEL — 10 subagents processing 5 docs each = 50 docs in ~30 seconds.
+- Cost per subagent: ~$0.30-0.50. Total for 50 docs: ~$3-5.
+- DO NOT use pandas. Use basic Python.
+- Document paths are in the user message (saved_path field in attachments).
+- If no documents attached, ask the user to upload them.""",
     },
 }
 

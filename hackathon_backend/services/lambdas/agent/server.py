@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
 import os
@@ -592,24 +593,76 @@ async def api_cancel_task(task_id: str):
 
 
 @app.post("/api/tasks/{task_id}/upload")
-async def api_upload_to_task(task_id: str):
+async def api_upload_to_task(task_id: str, request: Any = None):
     """Upload a file (PDF/image) for task processing."""
-    from fastapi import UploadFile, File, HTTPException
-    # This needs to be a separate function due to FastAPI file upload handling
-    pass  # Implemented below
-
-
-# Override with proper file upload signature
-@app.post("/api/tasks/{task_id}/files")
-async def api_upload_file(task_id: str, file: Any = None):
-    """Upload a file for task processing. Use multipart/form-data."""
-    from fastapi import HTTPException, Request
+    from fastapi import HTTPException, Request as FastAPIRequest
     from hackathon_backend.services.lambdas.agent.core.tools.pdf_reader import save_upload
-    # For now, accept raw body
-    task = get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return {"message": "Use /api/tasks with uploaded_files parameter", "task_id": task_id}
+    from starlette.requests import Request as StarletteRequest
+    req: StarletteRequest = request or None
+    if req is None:
+        raise HTTPException(status_code=400, detail="No request")
+    form = await req.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file in form data")
+    content = await file.read()
+    filename = getattr(file, "filename", f"doc_{uuid.uuid4().hex[:6]}")
+    saved_path = save_upload(task_id, filename, content)
+    return {"filename": filename, "path": saved_path, "size_bytes": len(content), "task_id": task_id}
+
+
+@app.post("/api/upload")
+async def api_upload_documents(request: Any = None):
+    """Upload multiple documents. Returns saved file paths for use with dispatch_subagents.
+
+    Use multipart/form-data with multiple 'files' fields.
+    """
+    from fastapi import HTTPException
+    from starlette.requests import Request as StarletteRequest
+    from hackathon_backend.services.lambdas.agent.core.tools.pdf_reader import save_upload
+
+    req: StarletteRequest = request
+    form = await req.form()
+    upload_id = f"upload_{uuid.uuid4().hex[:8]}"
+    saved_files = []
+
+    for key in form:
+        file = form[key]
+        if hasattr(file, "read"):
+            content = await file.read()
+            filename = getattr(file, "filename", f"doc_{uuid.uuid4().hex[:6]}")
+            saved_path = save_upload(upload_id, filename, content)
+            saved_files.append({
+                "filename": filename,
+                "path": saved_path,
+                "size_bytes": len(content),
+            })
+
+    if not saved_files:
+        raise HTTPException(status_code=400, detail="No files in form data")
+
+    return {
+        "upload_id": upload_id,
+        "files": saved_files,
+        "count": len(saved_files),
+    }
+
+
+@app.post("/api/tasks/{task_id}/files")
+async def api_upload_file(task_id: str, request: Any = None):
+    """Upload a file for task processing. Use multipart/form-data."""
+    from fastapi import HTTPException
+    from hackathon_backend.services.lambdas.agent.core.tools.pdf_reader import save_upload
+    from starlette.requests import Request as StarletteRequest
+    req: StarletteRequest = request
+    form = await req.form()
+    file = form.get("file")
+    if not file:
+        raise HTTPException(status_code=400, detail="No file in form data")
+    content = await file.read()
+    filename = getattr(file, "filename", f"doc_{uuid.uuid4().hex[:6]}")
+    saved_path = save_upload(task_id, filename, content)
+    return {"filename": filename, "path": saved_path, "size_bytes": len(content), "task_id": task_id}
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +771,20 @@ async def ws_chat(ws: WebSocket):
 
             # Parse attachments: [{filename, mime_type, data (base64)}]
             attachments = msg.get("attachments") or []
+
+            # Save attachments to disk so subagents can access them by path
+            if attachments:
+                from hackathon_backend.services.lambdas.agent.core.tools.pdf_reader import save_upload, ARTIFACTS_DIR
+                upload_chat_id = msg.get("chat_id") or f"upload_{uuid.uuid4().hex[:8]}"
+                for att in attachments:
+                    if att.get("data"):
+                        try:
+                            raw = base64.b64decode(att["data"])
+                            fname = att.get("filename", f"doc_{uuid.uuid4().hex[:6]}")
+                            saved_path = save_upload(upload_chat_id, fname, raw)
+                            att["saved_path"] = saved_path
+                        except Exception as e:
+                            log.warning(f"[ws] Failed to save attachment {att.get('filename')}: {e}")
 
             # Resolve or create chat
             if not chat_id:
