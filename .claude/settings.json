@@ -3,7 +3,14 @@
     "allow": [
       "Bash(aws cloudformation:*)",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent; print\\(''OK''\\)\")",
-      "Bash(grep -E \"\\\\.py$\")"
+      "Bash(grep -E \"\\\\.py$\")",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.data_catalog import get_schema_prompt, ALL_TABLE_NAMES; print\\(''Tables:'', len\\(ALL_TABLE_NAMES\\)\\); print\\(ALL_TABLE_NAMES[:5]\\); prompt = get_schema_prompt\\(\\); print\\(''Schema prompt length:'', len\\(prompt\\)\\); print\\(prompt[:500]\\)\")",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, UNIFIED_TOOLS, _safe_exec, _build_dataset_card; print\\(''OK - run_agent imported''\\); print\\(''Tools:'', [t[''function''][''name''] for t in UNIFIED_TOOLS]\\); print\\(''Table enum:'', UNIFIED_TOOLS[0][''function''][''parameters''][''properties''][''table_name''][''enum''][:5]\\)\")",
+      "Bash(python -c \"import pandas; print\\(''OK''\\)\")",
+      "Bash(python -c \"import numpy; print\\(''OK''\\)\")",
+      "Bash(python -c \"import matplotlib; print\\(''OK''\\)\")",
+      "Bash(python -c \"import openpyxl; print\\(''OK''\\)\")",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent, detect_heavy_task; print\\(''server imports OK''\\)\")"
     ]
   }
 }

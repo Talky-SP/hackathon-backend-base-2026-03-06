@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -27,6 +28,8 @@ from typing import Any
 
 import litellm
 from langfuse import observe
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Artifacts directory
@@ -75,55 +78,68 @@ def run_code_execution(
             "usage": dict,         # Token usage
         }
     """
+    log.info(f"[code_exec] Starting: model={model_id}, task={task_id}, prompt_len={len(prompt)}, data_len={len(data_context)}")
+
     full_prompt = prompt
     if data_context:
         full_prompt = f"{prompt}\n\nDATA:\n{data_context}"
 
     if model_id.startswith("claude") or model_id.startswith("azure"):
+        log.info(f"[code_exec] Trying Claude sandbox ({model_id})...")
         result = _claude_code_exec(
             full_prompt, model_id, task_id, container_id, max_tokens, system_prompt,
         )
-        if result.get("success"):
+        if result.get("success") and result.get("files"):
+            log.info(f"[code_exec] Claude sandbox succeeded: {len(result['files'])} files")
             return result
-        # Claude failed — try Gemini, then local execution
-        print(f"Claude code execution failed, trying Gemini fallback...")
-        gemini_result = _try_gemini_with_local_fallback(
-            full_prompt, task_id, max_tokens, system_prompt,
-        )
-        return gemini_result if gemini_result else result
+        # Claude sandbox didn't produce files — go to fallback chain
+        claude_err = result.get("text", "")[:200]
+        log.warning(f"[code_exec] Claude sandbox failed or no files: {claude_err}")
+        return _fallback_chain(full_prompt, task_id, max_tokens, system_prompt, claude_result=result)
     elif model_id.startswith("gemini"):
-        return _try_gemini_with_local_fallback(
-            full_prompt, task_id, max_tokens, system_prompt, model_id,
-        )
-    elif model_id.startswith("gpt"):
-        # GPT models don't have native code execution — try Gemini, then local
-        return _try_gemini_with_local_fallback(
-            full_prompt, task_id, max_tokens, system_prompt,
-        )
+        log.info(f"[code_exec] Trying Gemini sandbox ({model_id})...")
+        return _fallback_chain(full_prompt, task_id, max_tokens, system_prompt, try_gemini_id=model_id)
     else:
-        return _try_gemini_with_local_fallback(
-            full_prompt, task_id, max_tokens, system_prompt,
-        )
+        # GPT or unknown — skip sandbox, go straight to LLM-guided local exec
+        log.info(f"[code_exec] Model {model_id} has no sandbox — using LLM-guided local execution")
+        return _llm_guided_local_exec(full_prompt, task_id, max_tokens, system_prompt)
 
 
 # ---------------------------------------------------------------------------
 # Gemini + local fallback helper
 # ---------------------------------------------------------------------------
-def _try_gemini_with_local_fallback(
+def _fallback_chain(
     full_prompt: str,
     task_id: str,
     max_tokens: int,
     system_prompt: str | None,
-    model_id: str = "gemini-3.0-flash",
+    try_gemini_id: str = "gemini-3.0-flash",
+    claude_result: dict | None = None,
 ) -> dict:
-    """Try Gemini code execution, fall back to LLM-guided local execution."""
-    result = _gemini_code_exec(full_prompt, model_id, task_id, max_tokens, system_prompt)
-    if result.get("success") and result.get("files"):
-        return result
+    """Fallback chain: Gemini sandbox → LLM-guided local execution."""
+    # Step 1: Try Gemini sandbox
+    log.info(f"[code_exec] Fallback step 1: Gemini sandbox ({try_gemini_id})...")
+    gemini_result = _gemini_code_exec(full_prompt, try_gemini_id, task_id, max_tokens, system_prompt)
+    if gemini_result.get("success") and gemini_result.get("files"):
+        log.info(f"[code_exec] Gemini sandbox succeeded: {len(gemini_result['files'])} files")
+        return gemini_result
 
-    # Gemini failed or produced no files — use LLM to generate code, execute locally
-    print(f"Gemini code exec failed or no files, falling back to local execution...")
-    return _llm_guided_local_exec(full_prompt, task_id, max_tokens, system_prompt)
+    gemini_err = gemini_result.get("text", "")[:200]
+    log.warning(f"[code_exec] Gemini sandbox failed or no files: {gemini_err}")
+
+    # Step 2: LLM-guided local execution (last resort)
+    log.info(f"[code_exec] Fallback step 2: LLM-guided local execution...")
+    local_result = _llm_guided_local_exec(full_prompt, task_id, max_tokens, system_prompt)
+    if local_result.get("success"):
+        log.info(f"[code_exec] Local execution succeeded: {len(local_result.get('files', []))} files")
+        return local_result
+
+    log.error(f"[code_exec] ALL execution methods failed for task={task_id}")
+    # Return the most informative error
+    return local_result or gemini_result or claude_result or {
+        "success": False, "text": "All code execution methods failed",
+        "code_blocks": [], "files": [], "container_id": None, "usage": {},
+    }
 
 
 def _llm_guided_local_exec(
@@ -146,7 +162,9 @@ def _llm_guided_local_exec(
         if candidate in AVAILABLE_MODELS:
             llm_id = candidate
             break
+    log.info(f"[local_exec] Available models: {list(AVAILABLE_MODELS.keys())}, selected: {llm_id}")
     if not llm_id:
+        log.error("[local_exec] No LLM available for code generation")
         return {
             "success": False, "text": "No LLM available for code generation",
             "code_blocks": [], "files": [], "container_id": None, "usage": {},
@@ -169,9 +187,12 @@ CRITICAL: You are generating Python code that will be executed LOCALLY.
     ]
 
     t0 = time.time()
+    log.info(f"[local_exec] Asking {llm_id} to generate Python code (prompt_len={len(prompt)})...")
     try:
         response = completion(llm_id, messages, max_tokens=max_tokens, temperature=0.1)
+        log.info(f"[local_exec] LLM responded in {int((time.time() - t0) * 1000)}ms")
     except Exception as e:
+        log.error(f"[local_exec] LLM call failed: {type(e).__name__}: {e}")
         return {
             "success": False, "text": f"LLM code generation failed: {e}",
             "code_blocks": [], "files": [], "container_id": None, "usage": {},
@@ -179,6 +200,7 @@ CRITICAL: You are generating Python code that will be executed LOCALLY.
 
     text = response.choices[0].message.content or ""
     code_blocks = _extract_python_from_markdown(text)
+    log.info(f"[local_exec] Extracted {len(code_blocks)} code blocks from LLM response")
 
     usage = {}
     if response.usage:
@@ -193,7 +215,13 @@ CRITICAL: You are generating Python code that will be executed LOCALLY.
     # Execute locally
     files = []
     if code_blocks and task_id:
+        log.info(f"[local_exec] Executing {len(code_blocks)} code blocks locally for task={task_id}...")
         files = _execute_code_locally(code_blocks, task_id)
+        log.info(f"[local_exec] Local execution produced {len(files)} files")
+    elif not code_blocks:
+        log.warning(f"[local_exec] No code blocks extracted from LLM response")
+    elif not task_id:
+        log.warning(f"[local_exec] No task_id provided, skipping local execution")
 
     elapsed_ms = int((time.time() - t0) * 1000)
     success = len(files) > 0
@@ -253,6 +281,7 @@ def _claude_code_exec(
         cfg_key = "claude-opus-4.6" if "claude-opus-4.6" in AVAILABLE_MODELS else "claude-sonnet-4.5"
 
     cfg = AVAILABLE_MODELS[cfg_key]
+    log.info(f"[claude_exec] Using model config: key={cfg_key}, model={cfg.get('model')}, api_base={cfg.get('api_base', '')[:50]}")
 
     # Build messages — inject file capture instruction into prompt
     full_prompt = prompt + "\n" + _FILE_CAPTURE_INSTRUCTION
@@ -275,13 +304,17 @@ def _claude_code_exec(
         litellm_kwargs["container"] = container_id
 
     t0 = time.time()
+    log.info(f"[claude_exec] Calling litellm.completion: model={litellm_kwargs['model']}")
     try:
         response = litellm.completion(**litellm_kwargs)
+        log.info(f"[claude_exec] Response received in {int((time.time() - t0) * 1000)}ms")
     except Exception as e:
+        elapsed = int((time.time() - t0) * 1000)
+        log.error(f"[claude_exec] FAILED after {elapsed}ms: {type(e).__name__}: {e}")
         _trace_code_execution(
             model_id=model_id, task_id=task_id, prompt=prompt,
             code_blocks=[], text=f"Error: {e}", success=False,
-            elapsed_ms=int((time.time() - t0) * 1000),
+            elapsed_ms=elapsed,
         )
         return {
             "success": False,
@@ -388,7 +421,7 @@ def _extract_b64_files(stdout: str, task_id: str) -> list[dict]:
                 "type": _detect_file_type(filename),
             })
         except Exception as e:
-            print(f"Warning: Could not decode file {filename}: {e}")
+            log.warning(f"[code_exec] Could not decode file {filename}: {e}")
     return files
 
 
@@ -413,6 +446,7 @@ def _gemini_code_exec(
     if model_id in AVAILABLE_MODELS:
         cfg_key = model_id
     cfg = AVAILABLE_MODELS.get(cfg_key, {})
+    log.info(f"[gemini_exec] Using model config: key={cfg_key}, model={cfg.get('model', 'N/A')}, project={cfg.get('vertex_project', 'N/A')}")
 
     # Build messages — add instruction to include code in response for local re-execution
     gemini_code_instruction = (
@@ -443,21 +477,27 @@ def _gemini_code_exec(
     t0 = time.time()
     response = None
     last_err = None
-    for attempt_cfg in [litellm_kwargs] + [
-        {**litellm_kwargs, **fb} for fb in fallbacks
-    ]:
+    all_attempts = [litellm_kwargs] + [{**litellm_kwargs, **fb} for fb in fallbacks]
+    for i, attempt_cfg in enumerate(all_attempts):
+        attempt_model = attempt_cfg.get("model", "?")
+        attempt_loc = attempt_cfg.get("vertex_location", "?")
+        log.info(f"[gemini_exec] Attempt {i+1}/{len(all_attempts)}: model={attempt_model}, location={attempt_loc}")
         try:
             response = litellm.completion(**attempt_cfg)
+            log.info(f"[gemini_exec] Success on attempt {i+1} in {int((time.time() - t0) * 1000)}ms")
             break
         except Exception as e:
             last_err = e
+            log.warning(f"[gemini_exec] Attempt {i+1} failed: {type(e).__name__}: {str(e)[:200]}")
             continue
 
     if response is None:
+        elapsed = int((time.time() - t0) * 1000)
+        log.error(f"[gemini_exec] ALL {len(all_attempts)} attempts failed after {elapsed}ms. Last error: {last_err}")
         _trace_code_execution(
             model_id=model_id, task_id=task_id, prompt=prompt,
             code_blocks=[], text=f"Error: {last_err}", success=False,
-            elapsed_ms=int((time.time() - t0) * 1000),
+            elapsed_ms=elapsed,
         )
         return {
             "success": False,
@@ -544,7 +584,7 @@ def _save_inline_data(inline_data: dict, task_id: str) -> dict | None:
             "type": _detect_file_type(filename),
         }
     except Exception as e:
-        print(f"Warning: Could not save inline data: {e}")
+        log.warning(f"[code_exec] Could not save inline data: {e}")
         return None
 
 
@@ -589,7 +629,7 @@ def _execute_code_locally(code_blocks: list[dict], task_id: str) -> list[dict]:
             exec_globals = {"__builtins__": __builtins__}
             exec(code, exec_globals)
         except Exception as e:
-            print(f"Warning: Local code execution failed: {e}")
+            log.warning(f"[code_exec] Local code execution failed: {e}")
             continue
 
     # Collect any files that were created in the artifacts dir
@@ -867,7 +907,7 @@ def _trace_code_execution(
             },
         )
     except Exception as e:
-        print(f"Warning: Failed to trace code execution: {e}")
+        log.warning(f"[code_exec] Failed to trace code execution: {e}")
 
 
 # ---------------------------------------------------------------------------

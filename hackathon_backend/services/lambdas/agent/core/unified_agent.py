@@ -1,25 +1,25 @@
 """
-Unified Agent — single entry point for all user queries.
+Unified Agent v2 — "LLM as Director, Code as Executor"
 
-Replaces the old classifier → orchestrator → query_agent pipeline with a
-single agent loop that has direct access to all tools:
-  - dynamo_query: fetch data from DynamoDB
-  - run_analysis: execute Python code on fetched data
-  - generate_file: create Excel/PDF via AI code execution sandbox
+Single agent loop with tools:
+  - dynamo_query: fetch data → returns dataset cards (metadata, not raw items)
+  - run_code: execute Python locally on full dataset (analysis + file generation)
+  - edit_file: modify previously generated files via AI sandbox
 
-The agent decides on its own whether to answer directly, query data, or
-generate files. No classifier needed.
-
-For truly heavy work (e.g. 13-week cash flow forecast), the server can
-still wrap this in a background task with progress tracking.
+The LLM sees schemas, stats, and samples — NEVER thousands of raw items.
+It writes code that runs locally against the full dataset in a sandboxed exec().
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import sys
 import time
 import uuid
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -29,11 +29,15 @@ from hackathon_backend.services.lambdas.agent.core.config import (
     traced_completion, is_cancelled, CancelledError,
 )
 from hackathon_backend.services.lambdas.agent.core.query_agent import (
-    _execute_query, _execute_code, _sanitize, _extract_source,
+    _execute_query, _sanitize, _extract_source,
 )
 from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
     ARTIFACTS_DIR,
+)
+from hackathon_backend.services.lambdas.agent.core.data_catalog import (
+    get_schema_prompt, get_numeric_fields, get_date_fields,
+    get_group_fields, get_slim_fields, ALL_TABLE_NAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -41,18 +45,14 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Query results cache — reuse data across turns within the same chat
 # ---------------------------------------------------------------------------
-# Key: chat_id → {"results": {query_key: {...}}, "ts": timestamp}
-# TTL: 10 minutes — after that, data is considered stale
 _QUERY_CACHE: dict[str, dict] = {}
-_QUERY_CACHE_TTL = 600  # seconds
+_QUERY_CACHE_TTL = 600  # 10 minutes
 
 
 def _cache_query_results(chat_id: str, query_results: dict[str, dict]) -> None:
-    """Save query results to cache for this chat."""
     if not chat_id or not query_results:
         return
     _QUERY_CACHE[chat_id] = {"results": query_results, "ts": time.time()}
-    # Evict old entries (keep max 50 chats)
     if len(_QUERY_CACHE) > 50:
         oldest = sorted(_QUERY_CACHE, key=lambda k: _QUERY_CACHE[k]["ts"])
         for k in oldest[:len(_QUERY_CACHE) - 50]:
@@ -60,7 +60,6 @@ def _cache_query_results(chat_id: str, query_results: dict[str, dict]) -> None:
 
 
 def _get_cached_query_results(chat_id: str) -> dict[str, dict] | None:
-    """Retrieve cached query results for this chat if still fresh."""
     if not chat_id or chat_id not in _QUERY_CACHE:
         return None
     entry = _QUERY_CACHE[chat_id]
@@ -69,12 +68,12 @@ def _get_cached_query_results(chat_id: str) -> dict[str, dict] | None:
         return None
     return entry["results"]
 
+
 # ---------------------------------------------------------------------------
-# Multimodal: supported MIME types for native LLM processing
+# Multimodal
 # ---------------------------------------------------------------------------
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 _PDF_MIMES = {"application/pdf"}
-_SUPPORTED_MIMES = _IMAGE_MIMES | _PDF_MIMES
 
 EventCallback = Callable[[str, dict], None]
 
@@ -84,239 +83,469 @@ def _noop(event: str, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Slim fields per table — ONLY these go to the LLM (Mejora 1)
-# Full data stays in query_results for run_analysis to use
+# Pre-aggregation helpers (injected into run_code sandbox)
 # ---------------------------------------------------------------------------
-SLIM_FIELDS_BY_TABLE: dict[str, set[str]] = {
-    "User_Expenses": {
-        "categoryDate", "category", "concept", "documentKind",
-        "supplier", "supplier_cif", "invoice_number",
-        "invoice_date", "due_date", "charge_date",
-        "total", "importe", "ivas", "retencion", "vatTotalAmount",
-        "amount_due", "amount_paid",
-        "reconciled", "reconciliationState",
-    },
-    "User_Invoice_Incomes": {
-        "categoryDate", "category", "concept", "documentKind",
-        "client_name", "client_cif", "invoice_number",
-        "invoice_date", "due_date",
-        "total", "importe", "ivas", "retencion", "vatTotalAmount",
-        "amount_due", "amount_paid",
-        "reconciled", "reconciliationState",
-    },
-    "Bank_Reconciliations": {
-        "SK", "amount", "balance", "bookingDate",
-        "description", "merchant", "status", "transactionId",
-        "reconciled", "ai_enrichment",
-        "matched_expense_id", "matched_invoice_id", "matched_payroll_id",
-        "match_type", "vendor_cif", "customer_cif",
-    },
-    "Payroll_Slips": {
-        "categoryDate", "employee_nif", "org_cif",
-        "payroll_info", "payroll_date",
-    },
-    "Providers": {
-        "nombre", "cif", "trade_name", "facturas",
-        "provincia", "emails", "phones", "website",
-    },
-    "Customers": {
-        "nombre", "cif", "facturas",
-    },
-    "Employees": {
-        "employeeNif", "name", "position",
-    },
-    "Delivery_Notes": {
-        "categoryDate", "supplier", "supplier_cif",
-        "total", "invoice_date",
-    },
-    "Daily_Stats": {
-        "dayKey",
-    },
-    "Monthly_Stats": {
-        "monthKey",
-    },
+def _group_by(items, field, agg_field="total", agg_fn="sum"):
+    """group_by(items, 'category', 'total') -> {'Alimentacion': 15000.0, ...}"""
+    groups: dict[str, list] = {}
+    for it in items:
+        key = str(it.get(field, "Unknown"))
+        val = float(it.get(agg_field, 0) or 0)
+        groups.setdefault(key, []).append(val)
+    fns = {
+        "sum": sum, "count": len,
+        "avg": lambda v: sum(v) / len(v) if v else 0,
+        "min": min, "max": max,
+    }
+    fn = fns.get(agg_fn, sum)
+    return {k: round(fn(v), 2) for k, v in groups.items()}
+
+
+def _monthly_totals(items, date_field="invoice_date", amount_field="total"):
+    """monthly_totals(items, 'pnl_date') -> {'2026-01': 12000.0, ...}"""
+    totals: dict[str, float] = {}
+    for it in items:
+        month = str(it.get(date_field, ""))[:7]
+        if month:
+            totals[month] = totals.get(month, 0) + float(it.get(amount_field, 0) or 0)
+    return {k: round(v, 2) for k, v in sorted(totals.items())}
+
+
+def _top_n(items, field, n=10, sort_field="total", reverse=True):
+    """top_n(items, 'supplier', 5) -> [{name, total, count}, ...]"""
+    groups: dict[str, dict] = {}
+    for it in items:
+        key = it.get(field)
+        if key:
+            g = groups.setdefault(str(key), {"key": str(key), "sum": 0, "count": 0})
+            g["sum"] += float(it.get(sort_field, 0) or 0)
+            g["count"] += 1
+    ranked = sorted(groups.values(), key=lambda x: x["sum"], reverse=reverse)
+    return [{"name": g["key"], "total": round(g["sum"], 2), "count": g["count"]}
+            for g in ranked[:n]]
+
+
+def _filter_items(items, **conditions):
+    """filter_items(items, status='PENDING', reconciled=False) -> filtered list"""
+    result = []
+    for it in items:
+        if all(it.get(k) == v for k, v in conditions.items()):
+            result.append(it)
+    return result
+
+
+def _sum_field(items, field):
+    """sum_field(items, 'total') -> 145230.50"""
+    return round(sum(float(it.get(field, 0) or 0) for it in items), 2)
+
+
+# ---------------------------------------------------------------------------
+# Sandboxed code execution (_safe_exec)
+# ---------------------------------------------------------------------------
+_SAFE_BUILTINS = {
+    # Data types
+    "int": int, "float": float, "str": str, "bool": bool,
+    "list": list, "dict": dict, "set": set, "tuple": tuple,
+    "bytes": bytes, "bytearray": bytearray, "type": type,
+    # Iteration
+    "range": range, "enumerate": enumerate, "zip": zip,
+    "map": map, "filter": filter, "reversed": reversed,
+    # Aggregation
+    "len": len, "sum": sum, "min": min, "max": max, "abs": abs,
+    "round": round, "sorted": sorted, "any": any, "all": all,
+    # Utilities
+    "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
+    "print": print, "repr": repr, "format": format,
+    "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
+    "IndexError": IndexError, "Exception": Exception, "StopIteration": StopIteration,
+    "True": True, "False": False, "None": None,
+    # NO: open, __import__, eval, exec, compile, globals, locals, dir,
+    #     vars, setattr, delattr, input, breakpoint, exit, quit
 }
 
-# Fallback: if table not in SLIM_FIELDS_BY_TABLE, use this broad set
-_FALLBACK_SLIM_FIELDS = {
-    "categoryDate", "category", "concept", "total", "importe",
-    "supplier", "supplier_cif", "client_name", "client_cif",
-    "invoice_date", "due_date", "amount", "bookingDate",
-    "description", "merchant", "status", "nombre", "cif",
-}
+
+def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
+    """Execute code in a sandboxed environment with data injection."""
+    output_dir = os.path.join(ARTIFACTS_DIR, file_task_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Check memory before execution
+    data_json_str = json.dumps(query_results, default=str)
+    data_size_mb = len(data_json_str) / (1024 * 1024)
+    if data_size_mb > 500:
+        return {
+            "success": False, "result": None, "files": [],
+            "error": f"Dataset too large ({data_size_mb:.0f}MB). Use more specific queries.",
+        }
+
+    # Pre-import libraries
+    injected = {}
+    try:
+        import pandas
+        injected["pd"] = pandas
+    except ImportError:
+        pass
+    try:
+        import openpyxl
+        injected["openpyxl"] = openpyxl
+    except ImportError:
+        pass
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        injected["plt"] = plt
+        injected["matplotlib"] = matplotlib
+    except ImportError:
+        pass
+    try:
+        import numpy
+        injected["np"] = numpy
+    except ImportError:
+        pass
+
+    safe_globals = {
+        "__builtins__": _SAFE_BUILTINS,
+        # Data
+        "data": query_results,
+        "output_dir": output_dir,
+        "result": None,
+        # Standard lib
+        "json": json, "Decimal": Decimal,
+        "datetime": datetime, "timedelta": timedelta,
+        "Counter": Counter, "defaultdict": defaultdict,
+        # Libraries
+        **injected,
+        # Helpers
+        "group_by": _group_by, "monthly_totals": _monthly_totals,
+        "top_n": _top_n, "filter_items": _filter_items, "sum_field": _sum_field,
+    }
+
+    # Rewrite /tmp/ paths to output_dir (LLM often writes to /tmp/)
+    normalized_output = output_dir.replace("\\", "/")
+    code = code.replace("/tmp/", normalized_output + "/")
+
+    t0 = time.time()
+    try:
+        exec(code, safe_globals)
+        elapsed_ms = int((time.time() - t0) * 1000)
+    except Exception as e:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        return {
+            "success": False, "result": None, "files": [],
+            "error": f"{type(e).__name__}: {e}", "elapsed_ms": elapsed_ms,
+        }
+
+    result_val = safe_globals.get("result")
+    files = []
+    if os.path.isdir(output_dir):
+        for f in os.listdir(output_dir):
+            fp = os.path.join(output_dir, f)
+            if os.path.isfile(fp) and not f.startswith("_"):
+                files.append({
+                    "filename": f, "path": fp,
+                    "size_bytes": os.path.getsize(fp),
+                    "type": _detect_file_type(f),
+                })
+
+    return {
+        "success": True,
+        "result": _sanitize(result_val) if result_val else None,
+        "files": files,
+        "error": None,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
-def _slim_item(item: dict, table_name: str) -> dict:
-    """Keep only the fields the LLM needs for decision-making."""
-    fields = SLIM_FIELDS_BY_TABLE.get(table_name, _FALLBACK_SLIM_FIELDS)
-    return {k: v for k, v in item.items() if k in fields}
+def _detect_file_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "xlsx": "excel", "xls": "excel", "csv": "csv",
+        "pdf": "pdf", "png": "image", "jpg": "image", "jpeg": "image",
+        "json": "json", "html": "html",
+    }.get(ext, "file")
 
 
 # ---------------------------------------------------------------------------
-# System prompt — split into SCHEMA (cacheable) + RULES (Mejora 2)
+# Audit trail for code execution
 # ---------------------------------------------------------------------------
+def _audit_code_execution(
+    task_id: str, code: str, query_results: dict,
+    result: Any, error: str | None, elapsed_ms: int,
+    files: list[dict] | None = None,
+    location_id: str = "", chat_id: str | None = None,
+) -> None:
+    """Immutable audit record of every code execution."""
+    data_summary = {
+        k: {"count": len(v.get("items", [])), "table": v.get("table", "")}
+        for k, v in query_results.items()
+    }
+    data_hash = hashlib.sha256(
+        json.dumps(data_summary, sort_keys=True).encode()
+    ).hexdigest()[:16]
 
-# Block 1: DB Schema — static, rarely changes, perfect for prompt caching
-_SCHEMA_BLOCK = """\
-TABLES AND QUERY PATTERNS:
+    try:
+        from hackathon_backend.services.lambdas.agent.core.chat_store import record_trace
+        record_trace(
+            step="code_execution_audit",
+            location_id=location_id,
+            task_id=task_id,
+            chat_id=chat_id,
+            model="local_exec",
+            provider="local",
+            input_data={
+                "code": code[:10000],
+                "data_hash": data_hash,
+                "data_summary": data_summary,
+            },
+            output_data={
+                "success": error is None,
+                "error": error[:1000] if error else None,
+                "result_type": type(result).__name__ if result else None,
+                "result_preview": str(result)[:500] if result else None,
+                "files": [f["filename"] for f in (files or [])],
+            },
+            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            latency_ms=elapsed_ms,
+            status="ok" if error is None else "error",
+        )
+    except Exception as e:
+        log.warning(f"[audit] Failed to record code execution audit: {e}")
 
-1. User_Expenses (expense invoices):
-   PK=userId, SK=categoryDate (CATEGORY#YYYY-MM-DD#UUID)
-   GSIs: UserIdInvoiceDateIndex(pk=userId,sk=invoice_date), UserIdSupplierCifIndex(pk=userId,sk=supplier_cif),
-         UserIdPnlDateIndex(pk=userId,sk=pnl_date), UserByReconStateDate(pk=userId,sk=recon_state_date R#date/U#date),
-         UserSupplierDateIndex(pk=userSupplierKey={userId}#{cif},sk=charge_date)
-   Fields returned: total, importe, ivas[{type,base_imponible,amount}], supplier, supplier_cif, invoice_date,
-           due_date, category, concept, reconciled, documentKind(invoice/credit_note), vatTotalAmount,
-           retencion, amount_due, amount_paid, invoice_number, charge_date
 
-2. User_Invoice_Incomes (income invoices):
-   PK=userId, SK=categoryDate. Same GSIs pattern as expenses but with client_name/client_cif.
-   GSIs: UserIdInvoiceDateIndex, UserIdClientCifIndex(pk=userId,sk=client_cif), UserByReconStateDate
-   Fields returned: total, importe, ivas, client_name, client_cif, invoice_date, due_date, category, concept,
-           reconciled, documentKind, vatTotalAmount, retencion, amount_due, amount_paid
+# ---------------------------------------------------------------------------
+# Output validation for generated files
+# ---------------------------------------------------------------------------
+def _validate_generated_files(files: list[dict]) -> list[dict]:
+    """Validate generated files and add metrics."""
+    validated = []
+    for f in files:
+        info = {**f, "valid": True, "metrics": {}}
+        fp = f["path"]
+        if fp.endswith(".xlsx") or fp.endswith(".xls"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(fp, read_only=True)
+                sheets = {}
+                for name in wb.sheetnames:
+                    ws = wb[name]
+                    rows = ws.max_row or 0
+                    cols = ws.max_column or 0
+                    sheets[name] = {"rows": rows, "cols": cols}
+                wb.close()
+                info["metrics"] = {
+                    "sheets": sheets,
+                    "total_rows": sum(s["rows"] for s in sheets.values()),
+                }
+                if all(s["rows"] <= 1 for s in sheets.values()):
+                    info["valid"] = False
+                    info["warning"] = "Excel has no data rows (only headers)"
+            except Exception as e:
+                info["valid"] = False
+                info["warning"] = f"Cannot validate: {e}"
+        elif fp.endswith(".csv"):
+            try:
+                with open(fp, "r") as fh:
+                    lines = sum(1 for _ in fh)
+                info["metrics"] = {"lines": lines}
+                if lines <= 1:
+                    info["valid"] = False
+                    info["warning"] = "CSV has no data rows"
+            except Exception:
+                pass
+        validated.append(info)
+    return validated
 
-3. Providers (supplier master): PK=locationId, SK=cif
-   Fields: nombre, cif, trade_name, facturas(list of expense categoryDates), provincia, emails, phones
 
-4. Customers: PK=locationId, SK=cif. Fields: nombre, cif, facturas
+# ---------------------------------------------------------------------------
+# Dataset cards — replace raw items in LLM context
+# ---------------------------------------------------------------------------
+def _build_dataset_card(query_key: str, result: dict, table_name: str) -> dict:
+    """Build a dataset card with stats over ALL items (fully paginated)."""
+    items = result.get("items", [])
+    total_count = len(items)
 
-5. Bank_Reconciliations (bank transactions + reconciliation):
-   PK=locationId, SK=MTXN#{bookingDate}#{transactionId}
-   GSIs: LocationByStatusDate(pk=locationId,sk=status_date={status}#{bookingDate}),
-         ByVendorCif(pk=vendor_cif), ByCustomerCif(pk=customer_cif),
-         LocationByPayrollDate(pk=locationId,sk=payroll_date)
-   Fields: amount(negative=outflow,positive=inflow), bookingDate, description, merchant, balance,
-   status(PENDING/MATCHED/UNMATCHED), transactionId,
-   reconciled(Boolean: true=matched with invoice/payroll, false/missing=unreconciled),
-   matched_expense_id(categoryDate of matched expense invoice),
-   matched_invoice_id(categoryDate of matched income invoice),
-   matched_payroll_id(categoryDate of matched payroll slip),
-   match_type(1-1|1-N|N-1|N-M — how many docs matched to how many txns),
-   ai_enrichment{payment_type(vendor_payment|payroll|social_security|bank_fee|tax_payment|
-   client_payment|loan|transfer), vendor_name, vendor_cif, customer_cif, account_type}
+    card: dict[str, Any] = {
+        "query_key": query_key,
+        "table": table_name,
+        "total_items": total_count,
+        "fields": list(items[0].keys()) if items else [],
+    }
 
-6. Payroll_Slips: PK=locationId, SK=categoryDate({date}#{nif})
-   GSI: OrgCifPeriodIndex(pk=org_cif,sk=PERIOD#{yyyy-mm}#EMP#{nif})
-   Fields: employee_nif, payroll_info{gross_amount, net_amount, company_ss_contribution, irpf_amount}
+    if total_count == 0:
+        card["access"] = f"No items found. data['{query_key}']['items'] is empty."
+        return card
 
-7. Employees: PK=locationId, SK=employeeNif
-8. Daily_Stats: PK=locationId, SK=dayKey
-9. Monthly_Stats: PK=locationId, SK=monthKey"""
+    # Numeric stats over ALL items
+    for field in get_numeric_fields(table_name):
+        values = []
+        for it in items:
+            v = it.get(field)
+            if v is not None and v != "":
+                try:
+                    values.append(float(v))
+                except (ValueError, TypeError):
+                    pass
+        if values:
+            card.setdefault("stats", {})[field] = {
+                "sum": round(sum(values), 2),
+                "min": round(min(values), 2),
+                "max": round(max(values), 2),
+                "avg": round(sum(values) / len(values), 2),
+                "count_non_null": len(values),
+            }
 
-# Block 2: Agent rules + workflow — may change with extra_system
-_RULES_BLOCK = """\
+    # Payroll special handling — extract nested numeric fields
+    if table_name == "Payroll_Slips" and items:
+        for pf in ["gross_amount", "net_amount", "company_ss_contribution", "irpf_amount"]:
+            values = []
+            for it in items:
+                pi = it.get("payroll_info") or {}
+                v = pi.get(pf)
+                if v is not None:
+                    try:
+                        values.append(float(v))
+                    except (ValueError, TypeError):
+                        pass
+            if values:
+                card.setdefault("stats", {})[f"payroll_info.{pf}"] = {
+                    "sum": round(sum(values), 2),
+                    "min": round(min(values), 2),
+                    "max": round(max(values), 2),
+                    "avg": round(sum(values) / len(values), 2),
+                    "count_non_null": len(values),
+                }
+
+    # Date range over ALL items
+    for df in get_date_fields(table_name):
+        dates = sorted([str(it[df]) for it in items if it.get(df)])
+        if dates:
+            card["date_range"] = {"field": df, "min": dates[0], "max": dates[-1]}
+            break
+
+    # Distributions over ALL items (top 5)
+    for gf in get_group_fields(table_name):
+        groups: dict[str, int] = {}
+        for it in items:
+            k = it.get(gf)
+            if k:
+                groups[str(k)] = groups.get(str(k), 0) + 1
+        if groups:
+            top = sorted(groups.items(), key=lambda x: -x[1])[:5]
+            remaining = total_count - sum(v for _, v in top)
+            dist = dict(top)
+            if remaining > 0:
+                dist["_other"] = remaining
+            card.setdefault("distributions", {})[gf] = dist
+
+    # 3 sample rows (slim fields for pattern recognition)
+    slim = get_slim_fields(table_name)
+    if slim:
+        card["sample_rows"] = [
+            {k: v for k, v in it.items() if k in slim}
+            for it in items[:3]
+        ]
+    else:
+        card["sample_rows"] = [
+            {k: v for k, v in it.items()}
+            for it in items[:3]
+        ]
+
+    card["access"] = (
+        f"All {total_count} items stored in data['{query_key}']['items']. "
+        f"Use run_code to process them."
+    )
+    return card
+
+
+# ---------------------------------------------------------------------------
+# System prompt — uses data_catalog for schema
+# ---------------------------------------------------------------------------
+def _build_system_prompt(extra_system: str = "", location_id: str = "") -> list[dict]:
+    """Build system prompt as cached content blocks."""
+    schema_text = get_schema_prompt()
+
+    rules_text = """\
 You are an expert AI CFO assistant (Controller Financiero IA). You help business
 owners understand their financial data in real time.
 
 TOOLS:
 - `dynamo_query`: Query DynamoDB tables. locationId is auto-enforced.
-- `run_analysis`: Execute Python code on fetched data. Access `data` dict with query results.
-- `generate_file`: Generate Excel/CSV/chart files via AI code execution sandbox.
-- `edit_file`: Edit a previously generated file (Excel, etc.). Needs task_id + filename from context.
+  Returns a DATASET CARD (metadata: stats, distributions, sample rows) — NOT raw items.
+  All items are stored in memory for run_code to access.
+- `run_code`: Execute Python code with full access to ALL queried data.
+  Use for: analysis, aggregation, charts, AND file generation (Excel, CSV, PDF).
+  Environment: data dict, output_dir, pandas (pd), openpyxl, matplotlib (plt), numpy (np).
+  Helpers: group_by(), monthly_totals(), top_n(), filter_items(), sum_field().
+- `edit_file`: Edit a previously generated file. Needs task_id + filename.
 
 MULTIMODAL INPUT:
-- Users can attach images (PNG, JPG) and PDFs. They are sent natively — you can see and analyze them.
-- For attached invoices/receipts: extract key data (amounts, dates, supplier, line items).
-- For attached PDFs: read and analyze the full document content.
+- Users can attach images (PNG, JPG) and PDFs — you can see and analyze them.
 
 WORKFLOW:
-1. Simple questions (what is X, explain Y): Answer directly, no tools needed.
-2. Data questions (how much, top N, list of): Query DB → run_analysis → return answer with chart.
-3. Complex tasks (forecast, reports, modelo 303): Query DB → run_analysis → generate_file for Excel.
-4. Edit previous file: User asks to modify a generated Excel → use edit_file with the task_id/filename.
+1. Simple questions: Answer directly.
+2. Data questions: dynamo_query -> read dataset card stats -> run_code for detailed analysis.
+3. File generation: dynamo_query -> run_code (write to output_dir).
+4. Edit file: Use edit_file with task_id/filename.
 
-RULES:
-- Use GSIs, never full scans. Date queries → UserIdInvoiceDateIndex. Supplier → UserIdSupplierCifIndex.
-- locationId is auto-enforced. Never trust user-provided IDs.
-- For cash flow/treasury forecasts: Use ONLY Bank_Reconciliations (real money movements).
-  amount<0 = outflow, amount>0 = inflow. Classify by ai_enrichment.payment_type.
+DATASET CARDS:
+- dynamo_query returns metadata (field stats, distributions, 3 sample rows).
+- To access actual items, use run_code: `items = data['query_1']['items']`
+- Stats in the card are computed over ALL items (not a sample).
 
-BANK RECONCILIATION RULES:
-- Bank_Reconciliations is the source of truth for real bank movements.
-- IMPORTANT DATA REALITY:
-  * Reconciled transactions (179): have status=MATCHED, reconciled=True, and status_date field populated.
-  * Unreconciled transactions (251): have status=PENDING, and DO NOT have the `reconciled` field at all \
-(the field is MISSING, NOT false). They also lack `status_date`, so the LocationByStatusDate GSI \
-DOES NOT index them.
-- HOW TO QUERY:
-  * ALL transactions: query by PK=locationId (no GSI, no filter) → returns all 430.
-  * Only RECONCILED: filter status="MATCHED" or reconciled=True.
-  * Only UNRECONCILED: filter status="PENDING". Do NOT filter by reconciled=false (field doesn't exist \
-on unreconciled items). Alternatively: query ALL, then in run_analysis filter by status != "MATCHED".
-  * DO NOT use LocationByStatusDate GSI for unreconciled — those items are not indexed there.
-- To find which invoice matches a transaction: check `matched_expense_id` or `matched_invoice_id`.
-- RECONCILIATION MATCHING: To propose reconciliation between invoices and bank transactions:
-  1. Query ALL Bank_Reconciliations (no filter) → then filter status="PENDING" in run_analysis
-  2. Query User_Expenses and/or User_Invoice_Incomes → then filter unreconciled in run_analysis
-  3. In run_analysis, match by: amount, date proximity, and vendor/client CIF.
-  4. Present matches with confidence score: exact amount+CIF = high, amount only = medium, date only = low.
+run_code ENVIRONMENT:
+- `data`: dict of all query results. `data['query_1']['items']` = list of dicts.
+- `output_dir`: path to save files (Excel, CSV, PNG, PDF).
+- Libraries: openpyxl, pandas (pd), numpy (np), matplotlib.pyplot (plt), json, Decimal.
+- datetime, timedelta, Counter, defaultdict available.
+- Helpers: group_by(items, field, agg_field, agg_fn), monthly_totals(items, date_field, amt_field),
+  top_n(items, field, n, sort_field), filter_items(items, **conditions), sum_field(items, field).
+- Assign results to `result` variable (dict with 'answer', 'chart', 'sources').
+- Save files to output_dir: f'{output_dir}/report.xlsx'
+- NEVER use sample/dummy data. ALWAYS use data from `data` dict.
 
-- ALWAYS respond in the same language the user writes in.
-- Be precise with numbers. Use EUR formatting (€) and Spanish number format (1.234,56).
-- Never invent data — only use what comes from the database.
-- OPTIMIZATION: When you need data from multiple tables, call dynamo_query multiple times \
-in a SINGLE response. All queries execute in parallel — this saves time.
-
-CRITICAL: When answering data questions, you MUST call run_analysis to produce a structured \
-result. ALWAYS assign to `result` a dict with:
-
+run_code RESULT FORMAT:
 ```python
 result = {
     "answer": "Text answer in user's language",
     "chart": {  # or None
         "type": "bar|line|pie|table",
         "title": "Chart title",
-        "labels": ["L1", "L2", ...],
-        "datasets": [{"label": "Series", "data": [1, 2, 3]}]
+        "labels": ["L1", "L2"],
+        "datasets": [{"label": "Series", "data": [1, 2]}]
     },
-    "sources": [  # invoice/document references used
-        {"categoryDate": "...", "supplier": "...", "total": 123.45, ...}
-    ]
+    "sources": [{"categoryDate": "...", "supplier": "...", "total": 123.45}]
 }
 ```
 
-IMPORTANT: When user asks for a downloadable file (Excel, CSV, PDF), you MUST call generate_file \
-directly. Do NOT use run_analysis to produce an "answer" — that will end the conversation without \
-creating a file. Instead: dynamo_query → generate_file.
-FILE DATA: generate_file automatically injects ALL query data (full dataset, not just the 50-item \
-preview you see). You do NOT need to pass data in data_json — just describe what file to create in \
-the prompt field. The sandbox receives data["query_1"]["items"] etc. with ALL records. \
-NEVER reference data with JS templates like ${...} — just describe the columns/format you want.
-DATA CACHE: Query results from recent turns are cached automatically. If the user asks to \
-generate a file with data you already queried recently (e.g., "ponlo en Excel"), you can call \
-generate_file directly — the cached data will be used. You do NOT need to re-query. \
-However, if more than 10 minutes have passed or the user asks for different data, query again.
+RULES:
+- Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex.
+- locationId is auto-enforced. Never trust user-provided IDs.
+- For cash flow: Use Bank_Reconciliations. amount<0 = outflow, amount>0 = inflow.
+- When you need data from multiple tables, call dynamo_query multiple times in a SINGLE response.
 
-NUMBER FORMATTING: Use Spanish format in answer text (1.234,56 EUR). Keep raw numbers in chart data.
-TODAY'S DATE: 2026-03-21."""
+BANK RECONCILIATION RULES:
+- Reconciled transactions: status=MATCHED, reconciled=True, status_date populated.
+- Unreconciled transactions: status=PENDING, `reconciled` field is MISSING (NOT false).
+  DO NOT use LocationByStatusDate GSI for unreconciled — not indexed there.
+- ALL transactions: query PK=locationId (no GSI) -> returns all.
+- Only RECONCILED: filter status="MATCHED". Only UNRECONCILED: filter status="PENDING".
 
+- ALWAYS respond in the same language the user writes in.
+- Use EUR formatting and Spanish number format (1.234,56) in text. Raw numbers in charts.
+- Never invent data — only use what comes from the database.
+- DATA CACHE: Query results from recent turns are cached. If user asks to work with
+  recently queried data, run_code can access it directly without re-querying.
 
-def _build_system_prompt(extra_system: str = "", location_id: str = "") -> list[dict]:
-    """
-    Build the system prompt as content blocks for optimal prompt caching.
-
-    Returns a list of content blocks (Anthropic format) with cache_control markers.
-    Block 1 (schema) is cached — it's identical across all calls.
-    Block 2 (rules + context) varies per task but is still cached within a conversation.
-    """
-    schema_text = _SCHEMA_BLOCK
-    rules_text = _RULES_BLOCK
+TODAY'S DATE: 2026-03-22."""
 
     if extra_system:
         rules_text += f"\n\nADDITIONAL CONTEXT:\n{extra_system}"
     rules_text += f"\nCURRENT CONTEXT: locationId={location_id}"
 
     return [
-        {
-            "type": "text",
-            "text": schema_text,
-            "cache_control": {"type": "ephemeral"},
-        },
-        {
-            "type": "text",
-            "text": rules_text,
-            "cache_control": {"type": "ephemeral"},
-        },
+        {"type": "text", "text": schema_text, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": rules_text, "cache_control": {"type": "ephemeral"}},
     ]
 
 
@@ -324,63 +553,35 @@ def _build_system_prompt(extra_system: str = "", location_id: str = "") -> list[
 # Multimodal user message builder
 # ---------------------------------------------------------------------------
 def _build_user_content(
-    text: str,
-    attachments: list[dict] | None = None,
+    text: str, attachments: list[dict] | None = None,
 ) -> str | list[dict]:
-    """
-    Build user message content, optionally with multimodal attachments.
-
-    Each attachment: {"filename": str, "mime_type": str, "data": str (base64)}
-
-    Uses LiteLLM native format:
-    - Images → {"type": "image_url", "image_url": {"url": "data:mime;base64,..."}}
-    - PDFs   → {"type": "file", "file": {"file_data": "data:application/pdf;base64,..."}}
-
-    Unsupported types are described as text.
-    """
     if not attachments:
         return text
 
     blocks: list[dict] = [{"type": "text", "text": text}]
-
     for att in attachments:
         mime = att.get("mime_type", "application/octet-stream")
         b64 = att.get("data", "")
         fname = att.get("filename", "file")
 
         if mime in _IMAGE_MIMES:
-            blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64}"},
-            })
+            blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
         elif mime in _PDF_MIMES:
-            blocks.append({
-                "type": "file",
-                "file": {"file_data": f"data:{mime};base64,{b64}"},
-            })
+            blocks.append({"type": "file", "file": {"file_data": f"data:{mime};base64,{b64}"}})
         else:
-            blocks.append({
-                "type": "text",
-                "text": f"[Attached file: {fname} ({mime}) — unsupported for direct viewing]",
-            })
-
+            blocks.append({"type": "text", "text": f"[Attached file: {fname} ({mime}) — unsupported]"})
     return blocks
 
 
 def _build_artifact_context(chat_artifacts: list[dict] | None) -> str:
-    """
-    Build a context string describing files generated in previous turns.
-    This tells the agent what files exist and can be edited.
-    """
     if not chat_artifacts:
         return ""
-
     lines = ["PREVIOUSLY GENERATED FILES (available for editing via edit_file tool):"]
     for a in chat_artifacts:
         fname = a.get("filename", "?")
-        task_id = a.get("task_id", "?")
+        tid = a.get("task_id", "?")
         url = a.get("url", "")
-        lines.append(f"  - {fname} (task_id={task_id}, url={url})")
+        lines.append(f"  - {fname} (task_id={tid}, url={url})")
     return "\n".join(lines)
 
 
@@ -392,18 +593,14 @@ UNIFIED_TOOLS = [
         "type": "function",
         "function": {
             "name": "dynamo_query",
-            "description": "Execute a DynamoDB query. locationId is auto-enforced.",
+            "description": "Execute a DynamoDB query. locationId is auto-enforced. Returns a dataset card (stats, distributions, samples) — not raw items. Full data accessible via run_code.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "table_name": {
                         "type": "string",
                         "description": "Table name without stage prefix",
-                        "enum": [
-                            "User_Expenses", "User_Invoice_Incomes", "Bank_Reconciliations",
-                            "Payroll_Slips", "Delivery_Notes", "Employees", "Providers",
-                            "Customers", "Daily_Stats", "Monthly_Stats",
-                        ],
+                        "enum": ALL_TABLE_NAMES,
                     },
                     "index_name": {
                         "type": "string",
@@ -456,23 +653,31 @@ UNIFIED_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "run_analysis",
+            "name": "run_code",
             "description": (
-                "Execute Python code to analyze data from previous queries. "
-                "Access `data` dict with query results keyed by 'query_N'. "
-                "Each entry: {items, count, table}. "
-                "IMPORTANT: ALWAYS assign to `result` a dict with at minimum "
-                "{\"answer\": \"text\"}, optionally \"chart\" and \"sources\". "
-                "This allows immediate return without extra LLM calls.\n"
-                "Available: len, sum, min, max, round, sorted, enumerate, zip, map, filter, "
-                "list, dict, set, tuple, str, int, float, bool, range, any, all, reversed, json, Decimal."
+                "Execute Python code with full access to ALL queried data. "
+                "Use for analysis, aggregation, chart generation, and file creation. "
+                "\n\nENVIRONMENT:\n"
+                "- `data`: dict of all query results. data['query_1']['items'] = list of dicts.\n"
+                "- `output_dir`: path to save files (Excel, CSV, PNG, PDF).\n"
+                "- Libraries: openpyxl, pandas (pd), numpy (np), matplotlib.pyplot (plt), json, Decimal.\n"
+                "- datetime, timedelta, Counter, defaultdict.\n"
+                "- Helpers: group_by(items, field, agg_field='total', agg_fn='sum'), "
+                "monthly_totals(items, date_field, amount_field), "
+                "top_n(items, field, n=10, sort_field='total'), "
+                "filter_items(items, **conditions), sum_field(items, field).\n"
+                "\n\nRULES:\n"
+                "- Assign analysis results to `result` variable (dict with 'answer', 'chart', 'sources').\n"
+                "- Save generated files to output_dir (e.g. f'{output_dir}/report.xlsx').\n"
+                "- NEVER use sample/dummy data. Always use data from `data` dict.\n"
+                "- Code runs in a sandboxed environment. No imports needed — all libraries pre-injected."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Python code. Use `data` dict. MUST assign to `result` a dict with 'answer' key.",
+                        "description": "Python code to execute.",
                     },
                 },
                 "required": ["code"],
@@ -482,63 +687,19 @@ UNIFIED_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_file",
-            "description": (
-                "Generate Excel/CSV/chart files using AI code execution sandbox. "
-                "The AI writes and runs Python code (openpyxl, pandas, matplotlib). "
-                "Use for downloadable reports, exports, detailed Excel files. "
-                "NOTE: All query data is AUTOMATICALLY injected as base64-encoded JSON — "
-                "the sandbox receives the FULL dataset (all items, not the 50 you see). "
-                "You do NOT need to pass the data yourself in data_json. "
-                "Just describe what file to create in the prompt. "
-                "The sandbox decodes data['query_N']['items'] with ALL records."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Detailed instructions: file type, sheets, columns, data, formatting.",
-                    },
-                    "data_json": {
-                        "type": "string",
-                        "description": "JSON string with data to include in the file.",
-                    },
-                },
-                "required": ["prompt", "data_json"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "edit_file",
             "description": (
                 "Edit a previously generated file (Excel, CSV, etc.). "
-                "Provide the task_id and filename of the existing file, plus "
-                "a prompt describing the edits. The AI code execution sandbox "
-                "receives the existing file and modifies it in place."
+                "Provide task_id and filename of the existing file, plus "
+                "a prompt describing the edits. The AI sandbox modifies it."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "task_id of the previously generated file.",
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Filename to edit (e.g. 'Informe_Gastos.xlsx').",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Detailed instructions for what to change in the file.",
-                    },
-                    "data_json": {
-                        "type": "string",
-                        "description": "Optional: additional data for the edit (JSON string).",
-                        "default": "",
-                    },
+                    "task_id": {"type": "string", "description": "task_id of the file."},
+                    "filename": {"type": "string", "description": "Filename to edit."},
+                    "prompt": {"type": "string", "description": "Instructions for edits."},
+                    "data_json": {"type": "string", "description": "Optional additional data.", "default": ""},
                 },
                 "required": ["task_id", "filename", "prompt"],
             },
@@ -564,26 +725,9 @@ def run_agent(
     attachments: list[dict] | None = None,
     chat_artifacts: list[dict] | None = None,
 ) -> dict[str, Any]:
-    """
-    Run the unified agent. Handles everything from simple answers to complex tasks.
-
-    Args:
-        attachments: User-uploaded files [{filename, mime_type, data (base64)}]
-        chat_artifacts: Files generated in previous turns [{filename, task_id, url}]
-
-    Returns:
-        {
-            "answer": str,
-            "chart": dict | None,
-            "sources": list[dict],
-            "artifacts": list[dict],
-            "usage": list[dict],
-        }
-    """
     emit = on_event or _noop
 
-    # Build system prompt as content blocks (Mejora 2: separate cached blocks)
-    # Inject artifact context so the agent knows about previously generated files
+    # Build system prompt
     artifact_ctx = _build_artifact_context(chat_artifacts)
     full_extra = extra_system
     if artifact_ctx:
@@ -594,7 +738,6 @@ def run_agent(
     if conversation_history:
         messages.extend(conversation_history)
 
-    # Build user message with multimodal attachments (images/PDFs via LiteLLM native)
     user_content = _build_user_content(user_message, attachments)
     messages.append({"role": "user", "content": user_content})
 
@@ -603,11 +746,11 @@ def run_agent(
     sources_collected: list[dict] = []
     artifacts: list[dict] = []
     usage_records: list[dict] = []
+    code_retry_counts: dict[str, int] = {}
 
     emit("agent_start", {"question": user_message, "model": model_id})
 
     for iteration in range(max_iterations):
-        # Check cancellation
         if chat_id and is_cancelled(chat_id):
             raise CancelledError(f"Chat {chat_id} cancelled")
         if task_id and is_cancelled(task_id):
@@ -648,7 +791,6 @@ def run_agent(
         if cache_read > 0:
             log.info(f"[iter_{iteration+1}] Cache hit: {cache_read} tokens read from cache")
 
-        # Track cost if running as task
         if task_id:
             from hackathon_backend.services.lambdas.agent.core.chat_store import _estimate_cost
             from hackathon_backend.services.lambdas.agent.core.task_manager import add_task_cost, check_budget
@@ -670,8 +812,6 @@ def run_agent(
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
             final_text = choice.message.content or ""
             emit("agent_done", {"message": "Respuesta generada"})
-
-            # Try to extract structured result from the text
             result = _parse_final_response(final_text, sources_collected)
             result["artifacts"] = artifacts
             result["usage"] = usage_records
@@ -680,16 +820,13 @@ def run_agent(
         # Process tool calls
         messages.append(choice.message)
 
-        # Summarize what tools the agent decided to call
         tool_names = [tc.function.name for tc in choice.message.tool_calls]
-        tool_summary = ", ".join(tool_names)
         emit("tool_calls", {
-            "message": f"Ejecutando: {tool_summary}",
+            "message": f"Ejecutando: {', '.join(tool_names)}",
             "tools": tool_names,
             "iteration": iteration + 1,
         })
 
-        # Log each tool call with full arguments for debugging
         for _tc in choice.message.tool_calls:
             _tc_args = _tc.function.arguments or "{}"
             log.info(f"[agent] Tool call: {_tc.function.name}({_tc_args[:500]})")
@@ -701,26 +838,27 @@ def run_agent(
 
         for tool_call in choice.message.tool_calls:
             fn_name = tool_call.function.name
+            tc_id = tool_call.id
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps({"error": "Invalid JSON"}),
                 })
                 continue
 
+            # ---------------------------------------------------------------
+            # dynamo_query — returns dataset card
+            # ---------------------------------------------------------------
             if fn_name == "dynamo_query":
                 query_counter += 1
                 query_key = f"query_{query_counter}"
-
                 table_name = args["table_name"]
                 table_label = table_name.replace("_", " ")
 
-                # Log full query details for debugging
                 query_details = {
-                    "table": table_name,
-                    "query_key": query_key,
+                    "table": table_name, "query_key": query_key,
                     "index": args.get("index_name"),
                     "pk_field": args.get("pk_field", "userId"),
                     "sk_field": args.get("sk_field"),
@@ -728,10 +866,7 @@ def run_agent(
                     "filter": args.get("filter_expression"),
                     "limit": args.get("limit"),
                 }
-                emit("querying", {
-                    "message": f"Consultando {table_label}...",
-                    **query_details,
-                })
+                emit("querying", {"message": f"Consultando {table_label}...", **query_details})
                 log.info(f"[dynamo_query] {query_key}: {json.dumps(query_details, default=str)}")
 
                 result = _execute_query(
@@ -746,19 +881,18 @@ def run_agent(
                     limit=args.get("limit"),
                 )
                 query_results[query_key] = result
-                # Cache for reuse in subsequent turns (e.g., "put that in Excel")
                 _cache_query_results(chat_id, query_results)
 
                 if result.get("success"):
                     emit("query_result", {
-                        "query_key": query_key,
-                        "table": table_name,
+                        "query_key": query_key, "table": table_name,
                         "count": result["count"],
                         "message": f"Encontrados {result['count']} registros en {table_label}",
                         **query_details,
                     })
                     log.info(f"[dynamo_query] {query_key}: {result['count']} items from {table_name}")
-                    # Collect sources
+
+                    # Collect sources for invoice/bank tables
                     if table_name in ("User_Expenses", "User_Invoice_Incomes"):
                         for item in result["items"]:
                             src = _extract_source(item)
@@ -779,218 +913,115 @@ def run_agent(
                                 "transactionId": item.get("transactionId"),
                             })
 
-                # Build slim response for LLM (Mejora 1)
-                response_for_llm = {
-                    "query_key": query_key,
-                    "success": result["success"],
-                    "table": result["table"],
-                    "count": result["count"],
-                }
-                if not result["success"]:
-                    response_for_llm["error"] = result.get("error", "Unknown")
+                # Build dataset card instead of raw items
+                if result.get("success"):
+                    card = _build_dataset_card(query_key, result, table_name)
+                    response_for_llm = card
                 else:
-                    items_for_llm = result["items"][:50]
-                    # Slim: only fields the LLM needs for decision-making
-                    slim = [_slim_item(it, table_name) for it in items_for_llm]
-                    response_for_llm["items"] = slim
-                    if result["count"] > 50:
-                        response_for_llm["note"] = (
-                            f"Showing 50 of {result['count']}. "
-                            "Use run_analysis to access the full dataset."
-                        )
+                    response_for_llm = {
+                        "query_key": query_key, "success": False,
+                        "table": table_name,
+                        "error": result.get("error", "Unknown"),
+                    }
 
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps(response_for_llm, ensure_ascii=False, default=str),
                 })
 
-            elif fn_name == "run_analysis":
+            # ---------------------------------------------------------------
+            # run_code — sandboxed local execution (unified: analysis + files)
+            # ---------------------------------------------------------------
+            elif fn_name == "run_code":
+                code = args.get("code", "")
+                file_task_id = task_id or f"chat_{str(uuid.uuid4())[:8]}"
+
                 # Load cached query results if none this turn
                 if not query_results:
                     cached = _get_cached_query_results(chat_id)
                     if cached:
                         query_results = cached
-                        log.info(f"[run_analysis] Loaded {len(cached)} cached queries for chat {chat_id}")
+                        log.info(f"[run_code] Loaded {len(cached)} cached queries for chat {chat_id}")
 
-                code = args["code"]
                 code_preview = code.strip().split("\n")[0][:80]
-                log.info(f"[run_analysis] Code:\n{code}")
+                log.info(f"[run_code] Code:\n{code}")
                 emit("analyzing", {
-                    "message": f"Ejecutando analisis de datos...",
+                    "message": "Ejecutando codigo...",
                     "detail": code_preview,
-                    "code": code,
+                    "code": code[:200],
                     "available_queries": list(query_results.keys()),
                     "query_counts": {k: v.get("count", 0) for k, v in query_results.items()},
                 })
-                result = _execute_code(code, query_results)
-                log.info(f"[run_analysis] Success={result['success']}, result_type={type(result.get('result')).__name__}")
 
-                if result["success"] and isinstance(result["result"], dict):
-                    analysis = result["result"]
-                    if "answer" in analysis:
-                        log.info(f"[run_analysis] Answer: {str(analysis.get('answer', ''))[:200]}")
-                        emit("analysis_result", {
-                            "message": "Análisis completado",
-                            "answer_preview": str(analysis.get("answer", ""))[:300],
-                            "has_chart": analysis.get("chart") is not None,
-                            "sources_count": len(analysis.get("sources") or sources_collected),
-                        })
-                        emit("agent_done", {"message": "Análisis completado"})
-                        return {
-                            "answer": analysis.get("answer", ""),
-                            "chart": analysis.get("chart"),
-                            "sources": analysis.get("sources") or sources_collected,
-                            "artifacts": artifacts,
-                            "usage": usage_records,
-                        }
+                exec_result = _safe_exec(code, query_results, file_task_id)
+                elapsed_ms = exec_result.get("elapsed_ms", 0)
 
-                messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
-                })
-
-            elif fn_name == "generate_file":
-                prompt_preview = (args.get("prompt", ""))[:100]
-                emit("generating", {
-                    "message": f"Generando archivo (code execution)...",
-                    "detail": prompt_preview,
-                    "model": model_id,
-                })
-
-                file_task_id = task_id or f"chat_{str(uuid.uuid4())[:8]}"
-                emit("code_exec_start", {
-                    "message": f"Escribiendo y ejecutando codigo Python ({model_id})...",
-                    "task_id": file_task_id,
-                })
-
-                # If no queries this turn, try to load from cache (previous turns)
-                if not query_results:
-                    cached = _get_cached_query_results(chat_id)
-                    if cached:
-                        query_results = cached
-                        log.info(f"[generate_file] Loaded {len(cached)} cached queries for chat {chat_id}")
-                    else:
-                        tool_result = json.dumps({
-                            "error": True,
-                            "message": (
-                                "ERROR: No query data available and no cached data found. "
-                                "You must call dynamo_query first to fetch the data, "
-                                "then call generate_file again."
-                            ),
-                        })
-                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
-                        continue
-
-                # CRITICAL: Pass FULL query data as base64-encoded JSON.
-                # The LLM's data_json is unreliable (JS templates, truncated, etc.)
-                # We encode full query_results as base64 — the DATA section will
-                # contain ONLY the raw base64 string, making it trivial for the
-                # sandbox LLM to decode.
-                import base64 as _b64_gen
-
-                gen_prompt = args.get("prompt", "")
-
-                # Build full dataset from all queries
-                full_data = {}
-                total_items = 0
-                for qk, qv in query_results.items():
-                    full_data[qk] = {
-                        "items": qv.get("items", []),
-                        "count": qv.get("count", 0),
-                        "table": qv.get("table", ""),
-                    }
-                    total_items += len(qv.get("items", []))
-
-                data_json_str = json.dumps(full_data, ensure_ascii=False, default=str)
-                data_size_kb = len(data_json_str) / 1024
-
-                if data_size_kb > 200:
-                    # Large dataset: pass raw JSON (not base64) to save tokens.
-                    # code_runner handles model routing + fallbacks.
-                    data_for_exec = data_json_str
-                    gen_prompt = (
-                        f"IMPORTANT — DATA LOADING:\n"
-                        f"The DATA section below contains {total_items} items as raw JSON.\n"
-                        f"Load it like this:\n"
-                        f"```python\n"
-                        f"import json\n"
-                        f"# DATA section contains raw JSON — parse it from the DATA variable below\n"
-                        f"data = json.loads(DATA_STRING)  # DATA_STRING = the entire DATA section\n"
-                        f"```\n"
-                        f"Use ALL {total_items} items. NEVER use sample/dummy data.\n\n"
-                        f"TASK:\n{args.get('prompt', '')}"
-                    )
-                    log.info(f"[generate_file] Large dataset ({data_size_kb:.0f}KB, {total_items} items)")
-                    code_exec_model = model_id
-                else:
-                    data_b64 = _b64_gen.b64encode(data_json_str.encode("utf-8")).decode()
-                    data_for_exec = data_b64
-                    code_exec_model = model_id
-
-                    gen_prompt = (
-                        f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
-                        f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
-                        f"Decode it:\n"
-                        f"```python\n"
-                        f"import json, base64\n"
-                        f"raw_b64 = '<entire content of DATA section>'\n"
-                        f"data = json.loads(base64.b64decode(raw_b64))\n"
-                        f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
-                        f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
-                        f"```\n"
-                        f"NEVER use sample/dummy/fake data. Use ALL {total_items} items.\n\n"
-                        f"TASK:\n{args.get('prompt', '')}"
-                    )
-
-                code_result = _native_code_exec(
-                    prompt=gen_prompt,
-                    model_id=code_exec_model,
-                    data_context=data_for_exec,
-                    task_id=file_task_id,
-                    system_prompt=CODE_EXEC_SYSTEM,
+                # Audit every execution
+                _audit_code_execution(
+                    task_id=file_task_id, code=code, query_results=query_results,
+                    result=exec_result.get("result"), error=exec_result.get("error"),
+                    elapsed_ms=elapsed_ms, files=exec_result.get("files"),
+                    location_id=location_id, chat_id=chat_id,
                 )
 
-                # Track usage
-                if code_result.get("usage"):
-                    cu = code_result["usage"]
-                    if isinstance(cu, dict):
-                        usage_records.append(cu)
-                    elif isinstance(cu, list):
-                        usage_records.extend(cu)
+                if not exec_result["success"]:
+                    # Retry tracking
+                    retry_key = f"{iteration}_{fn_name}"
+                    code_retry_counts[retry_key] = code_retry_counts.get(retry_key, 0) + 1
 
-                # Collect artifacts
-                file_response = {
-                    "success": code_result.get("success", False),
-                    "files": [],
-                    "text": code_result.get("text", "")[:500],
-                }
+                    if code_retry_counts[retry_key] >= 3:
+                        log.error(f"[run_code] 3 failures, giving up: {exec_result['error']}")
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc_id,
+                            "content": json.dumps({
+                                "error": exec_result["error"],
+                                "fatal": True,
+                                "message": "Code execution failed 3 times. Explain the issue to the user.",
+                            }),
+                        })
+                    else:
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc_id,
+                            "content": json.dumps({
+                                "error": exec_result["error"],
+                                "attempt": code_retry_counts[retry_key],
+                                "max_attempts": 3,
+                                "hint": "Fix the code and call run_code again.",
+                            }),
+                        })
+                    continue
+
+                # Success — check for result and/or files
+                result_val = exec_result.get("result")
+                generated_files = exec_result.get("files", [])
+
+                # Validate generated files
+                if generated_files:
+                    generated_files = _validate_generated_files(generated_files)
+
+                # Handle files → artifacts
                 generated_filenames = []
-                from hackathon_backend.services.lambdas.agent.core.storage import _use_s3 as _gen_s3_check, save_artifact as _gen_save
-                for f in code_result.get("files", []):
+                from hackathon_backend.services.lambdas.agent.core.storage import (
+                    _use_s3 as _s3_check, save_artifact as _save_art,
+                )
+                for f in generated_files:
                     file_url = f"/api/tasks/{file_task_id}/artifacts/{f['filename']}"
-                    # Upload to S3 in Lambda mode and use presigned URL
-                    if _gen_s3_check():
-                        gen_path = f["path"]
-                        if os.path.isfile(gen_path):
-                            with open(gen_path, "rb") as _gfh:
-                                s3_res = _gen_save(file_task_id, f["filename"], _gfh.read())
+                    if _s3_check():
+                        fp = f["path"]
+                        if os.path.isfile(fp):
+                            with open(fp, "rb") as _fh:
+                                s3_res = _save_art(file_task_id, f["filename"], _fh.read())
                             file_url = s3_res.get("url", file_url)
                     artifact = {
-                        "filename": f["filename"],
-                        "path": f["path"],
+                        "filename": f["filename"], "path": f["path"],
                         "task_id": file_task_id,
-                        "type": f.get("type", "excel"),
+                        "type": f.get("type", "file"),
                         "size_bytes": f.get("size_bytes", 0),
                         "url": file_url,
                     }
                     artifacts.append(artifact)
                     generated_filenames.append(f["filename"])
-                    file_response["files"].append({
-                        "filename": f["filename"],
-                        "url": artifact["url"],
-                    })
 
-                    # Register artifact if running as task
                     if task_id:
                         from hackathon_backend.services.lambdas.agent.core.task_manager import add_task_artifact
                         add_task_artifact(task_id, artifact)
@@ -1001,20 +1032,50 @@ def run_agent(
                         "files": generated_filenames,
                         "success": True,
                     })
-                elif not code_result.get("success"):
-                    error_text = code_result.get("text", "")[:300]
-                    log.error(f"[generate_file] Code execution FAILED: {error_text}")
-                    emit("file_generated", {
-                        "message": f"Error generando archivo: {error_text[:100]}",
-                        "success": False,
-                        "error": error_text,
+
+                # If result has 'answer', return immediately
+                if isinstance(result_val, dict) and "answer" in result_val:
+                    log.info(f"[run_code] Answer: {str(result_val.get('answer', ''))[:200]}")
+                    emit("analysis_result", {
+                        "message": "Analisis completado",
+                        "answer_preview": str(result_val.get("answer", ""))[:300],
+                        "has_chart": result_val.get("chart") is not None,
+                        "sources_count": len(result_val.get("sources") or sources_collected),
                     })
+                    emit("agent_done", {"message": "Analisis completado"})
+                    return {
+                        "answer": result_val.get("answer", ""),
+                        "chart": result_val.get("chart"),
+                        "sources": result_val.get("sources") or sources_collected,
+                        "artifacts": artifacts,
+                        "usage": usage_records,
+                    }
+
+                # Build tool response
+                tool_response: dict[str, Any] = {"success": True}
+                if result_val is not None:
+                    tool_response["result"] = result_val
+                if generated_files:
+                    tool_response["files"] = [
+                        {
+                            "filename": f["filename"],
+                            "url": f"/api/tasks/{file_task_id}/artifacts/{f['filename']}",
+                            "valid": f.get("valid", True),
+                            "metrics": f.get("metrics", {}),
+                            **({"warning": f["warning"]} if f.get("warning") else {}),
+                        }
+                        for f in generated_files
+                    ]
+                tool_response["elapsed_ms"] = elapsed_ms
 
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
-                    "content": json.dumps(file_response, ensure_ascii=False, default=str),
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": json.dumps(tool_response, ensure_ascii=False, default=str),
                 })
 
+            # ---------------------------------------------------------------
+            # edit_file — AI sandbox for editing existing files
+            # ---------------------------------------------------------------
             elif fn_name == "edit_file":
                 edit_task_id = args.get("task_id", "")
                 edit_filename = args.get("filename", "")
@@ -1026,10 +1087,8 @@ def run_agent(
                     "model": model_id,
                 })
 
-                # Find the existing file — local first, then S3
                 existing_path = os.path.join(ARTIFACTS_DIR, edit_task_id, edit_filename)
                 if not os.path.isfile(existing_path):
-                    # In Lambda mode, file may be in S3 — download it locally
                     from hackathon_backend.services.lambdas.agent.core.storage import _use_s3, get_artifact
                     if _use_s3():
                         file_bytes = get_artifact(edit_task_id, edit_filename)
@@ -1039,20 +1098,16 @@ def run_agent(
                                 _fw.write(file_bytes)
                     if not os.path.isfile(existing_path):
                         messages.append({
-                            "role": "tool", "tool_call_id": tool_call.id,
-                            "content": json.dumps({
-                                "error": f"File not found: {edit_filename} (task_id={edit_task_id})"
-                            }),
+                            "role": "tool", "tool_call_id": tc_id,
+                            "content": json.dumps({"error": f"File not found: {edit_filename} (task_id={edit_task_id})"}),
                         })
                         continue
 
-                # Read existing file as base64 for the code sandbox
                 import base64 as _b64
                 with open(existing_path, "rb") as fh:
                     file_b64 = _b64.b64encode(fh.read()).decode()
                 file_size = os.path.getsize(existing_path)
 
-                # Build prompt for code execution: edit the existing file
                 edit_code_prompt = (
                     f"You are editing an EXISTING file: {edit_filename} ({file_size} bytes).\n"
                     f"The file is provided as base64 in the variable EXISTING_FILE_B64.\n"
@@ -1078,7 +1133,6 @@ def run_agent(
                     system_prompt=CODE_EXEC_SYSTEM,
                 )
 
-                # Track usage
                 if code_result.get("usage"):
                     cu = code_result["usage"]
                     if isinstance(cu, dict):
@@ -1086,61 +1140,54 @@ def run_agent(
                     elif isinstance(cu, list):
                         usage_records.extend(cu)
 
-                # Collect edited artifacts
-                file_response = {
+                file_response: dict[str, Any] = {
                     "success": code_result.get("success", False),
                     "files": [],
                     "text": code_result.get("text", "")[:500],
                     "edited": True,
                 }
-                from hackathon_backend.services.lambdas.agent.core.storage import _use_s3 as _s3_check, save_artifact as _save_art
+                from hackathon_backend.services.lambdas.agent.core.storage import (
+                    _use_s3 as _s3_chk, save_artifact as _sv_art,
+                )
                 for f in code_result.get("files", []):
                     file_url = f"/api/tasks/{edit_task_id}/artifacts/{f['filename']}"
-                    # Upload edited file to S3 in Lambda mode
-                    if _s3_check():
+                    if _s3_chk():
                         edited_path = f["path"]
                         if os.path.isfile(edited_path):
                             with open(edited_path, "rb") as _fh:
-                                s3_res = _save_art(edit_task_id, f["filename"], _fh.read())
+                                s3_res = _sv_art(edit_task_id, f["filename"], _fh.read())
                             file_url = s3_res.get("url", file_url)
                     artifact = {
-                        "filename": f["filename"],
-                        "path": f["path"],
+                        "filename": f["filename"], "path": f["path"],
                         "task_id": edit_task_id,
                         "type": f.get("type", "excel"),
                         "size_bytes": f.get("size_bytes", 0),
-                        "url": file_url,
-                        "edited": True,
+                        "url": file_url, "edited": True,
                     }
                     artifacts.append(artifact)
-                    file_response["files"].append({
-                        "filename": f["filename"],
-                        "url": artifact["url"],
-                    })
+                    file_response["files"].append({"filename": f["filename"], "url": file_url})
 
                 if code_result.get("files"):
                     fnames = [f["filename"] for f in code_result["files"]]
                     emit("file_generated", {
                         "message": f"Archivo editado: {', '.join(fnames)}",
-                        "files": fnames,
-                        "success": True,
-                        "edited": True,
+                        "files": fnames, "success": True, "edited": True,
                     })
 
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps(file_response, ensure_ascii=False, default=str),
                 })
 
             else:
                 messages.append({
-                    "role": "tool", "tool_call_id": tool_call.id,
+                    "role": "tool", "tool_call_id": tc_id,
                     "content": json.dumps({"error": f"Unknown tool: {fn_name}"}),
                 })
 
     # Max iterations
     return {
-        "answer": "Se ha alcanzado el límite de iteraciones.",
+        "answer": "Se ha alcanzado el limite de iteraciones.",
         "chart": None,
         "sources": sources_collected,
         "artifacts": artifacts,
@@ -1152,9 +1199,7 @@ def run_agent(
 # Response parser
 # ---------------------------------------------------------------------------
 def _parse_final_response(text: str, default_sources: list[dict]) -> dict:
-    """Parse the agent's final text response into structured output."""
     result = {"answer": text, "chart": None, "sources": default_sources}
-
     if "```json" in text:
         try:
             start = text.index("```json") + 7
@@ -1171,7 +1216,6 @@ def _parse_final_response(text: str, default_sources: list[dict]) -> dict:
                 result["answer"] = clean
         except (ValueError, json.JSONDecodeError):
             pass
-
     return result
 
 
@@ -1182,7 +1226,7 @@ _HEAVY_TASK_KEYWORDS: dict[str, list[str]] = {
     "cash_flow_forecast": [
         "prevision tesoreria", "prevision de tesoreria", "cash flow", "flujo de caja",
         "prevision de caja", "13 semanas", "forecast tesoreria",
-        "previsión de tesorería", "previsión tesorería", "prevision caja", "tesoreria 13",
+        "prevision de tesoreria", "prevision tesoreria", "prevision caja", "tesoreria 13",
     ],
     "pack_reporting": [
         "pack reporting", "reporting mensual", "p&l mensual", "cuenta resultados", "balance mensual",
@@ -1203,8 +1247,8 @@ _HEAVY_TASK_KEYWORDS: dict[str, list[str]] = {
         "three way matching", "cruce tres vias", "albaranes facturas",
     ],
     "bank_reconciliation": [
-        "conciliacion bancaria", "conciliación bancaria", "conciliar facturas",
-        "conciliar transacciones", "reconciliacion", "reconciliación",
+        "conciliacion bancaria", "conciliacion bancaria", "conciliar facturas",
+        "conciliar transacciones", "reconciliacion", "reconciliacion",
         "transacciones sin conciliar", "facturas sin conciliar",
         "bank reconciliation", "matching bancario", "cruce bancario",
         "conciliar banco", "conciliar pagos", "pagos sin conciliar",
@@ -1213,30 +1257,19 @@ _HEAVY_TASK_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
-# Questions that should NOT be treated as heavy tasks
 _INFORMATIONAL_PREFIXES = [
-    "que es", "qué es", "que son", "qué son", "como funciona", "cómo funciona",
-    "como se calcula", "cómo se calcula", "explicame", "explícame", "dime que es",
-    "que significa", "qué significa", "para que sirve", "para qué sirve",
+    "que es", "que es", "que son", "que son", "como funciona", "como funciona",
+    "como se calcula", "como se calcula", "explicame", "explicame", "dime que es",
+    "que significa", "que significa", "para que sirve", "para que sirve",
     "what is", "how does", "explain",
 ]
 
 
 def detect_heavy_task(user_message: str) -> str | None:
-    """
-    Detect if a message requires heavy background processing.
-
-    Returns the task_type string if heavy, or None for inline processing.
-    This is used by the server to decide whether to run the agent inline
-    (with streaming) or in a background task (with progress tracking).
-    """
     msg_lower = user_message.lower()
-
-    # Informational questions are never heavy
     for prefix in _INFORMATIONAL_PREFIXES:
-        if msg_lower.startswith(prefix) or msg_lower.startswith("¿" + prefix):
+        if msg_lower.startswith(prefix) or msg_lower.startswith("?" + prefix):
             return None
-
     for task_type, keywords in _HEAVY_TASK_KEYWORDS.items():
         for kw in keywords:
             if kw in msg_lower:

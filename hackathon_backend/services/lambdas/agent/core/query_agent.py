@@ -95,6 +95,7 @@ def _extract_source(item: dict) -> dict | None:
 # DynamoDB query functions — the agent calls these via tool use
 # ---------------------------------------------------------------------------
 STAGE = os.getenv("TABLE_ENV_PREFIX", "Dev")
+MAX_ITEMS_PER_QUERY = 10_000  # Hard limit to prevent memory exhaustion
 
 # Fields to keep when sending DynamoDB items to LLM (strip heavy fields)
 KEEP_FIELDS = {
@@ -214,12 +215,13 @@ def _execute_query(
         # Skip projection for simplicity — fields are small enough
         pass
 
-    # Execute with pagination
+    # Execute with pagination (hard limit: MAX_ITEMS_PER_QUERY)
     items = []
+    effective_limit = min(limit, MAX_ITEMS_PER_QUERY) if limit else MAX_ITEMS_PER_QUERY
     try:
         response = table.query(**query_kwargs)
         items.extend(response.get("Items", []))
-        while "LastEvaluatedKey" in response and (not limit or len(items) < limit):
+        while "LastEvaluatedKey" in response and len(items) < effective_limit:
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
             response = table.query(**query_kwargs)
             items.extend(response.get("Items", []))
@@ -298,6 +300,9 @@ QUERY_AGENT_TOOLS = [
                             "User_Expenses", "User_Invoice_Incomes", "Bank_Reconciliations",
                             "Payroll_Slips", "Delivery_Notes", "Employees", "Providers",
                             "Customers", "Daily_Stats", "Monthly_Stats",
+                            "Provider_Products", "Location_Custom_PnL", "Location_Budgets",
+                            "Cierre_Caja", "Stock_Inventory", "Location_Accounting_Accounts",
+                            "GC_Transactions_By_Account",
                         ],
                     },
                     "index_name": {
