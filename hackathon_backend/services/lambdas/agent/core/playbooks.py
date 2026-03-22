@@ -214,6 +214,7 @@ STEP 2 — EXPLORE (run_code): Understand the unreconciled landscape BEFORE tryi
   - Look at ai_enrichment field — it may have vendor_cif, payment_type, category.
   - List unique suppliers in unreconciled invoices and unique merchants in unreconciled txns.
   - Identify patterns: Are there txns that look like they aggregate multiple invoices?
+  DO NOT set `result` here — this is just exploration. You MUST continue to STEP 3.
 
 STEP 3 — MATCH CREATIVELY (run_code): Try multiple strategies, from obvious to creative:
   a) EXACT amount match: abs(txn.amount) == invoice.total (within 0.01€ tolerance)
@@ -245,7 +246,10 @@ CRITICAL DATA RULES:
 - Bank txns: amount < 0 = outflow (expense payment), amount > 0 = inflow (income received)
 - Invoice reconciled: True = already matched, MISSING = unreconciled. NEVER False.
 - DO NOT use reconciliationState field (always says UNRECONCILED, even for reconciled items).
-- DO NOT filter by amount_due or amount_paid for reconciliation status.""",
+- DO NOT filter by amount_due or amount_paid for reconciliation status.
+
+CRITICAL: You MUST complete ALL 4 steps. Do NOT stop after exploration or matching.
+Only set `result` in STEP 4 with the final summary. The user expects an Excel report.""",
     },
 
     "reportes_financieros": {
@@ -304,76 +308,84 @@ Invoices add context (categories, suppliers) but are NOT the primary numbers."""
         "name": "Deteccion de Errores Contables",
         "guidance": """\
 PLAYBOOK — DETECCION DE ERRORES EXPLORATORIA:
-You are an AI auditor. Your job is to find accounting errors, anomalies, and inconsistencies
-by EXPLORING the data creatively — not just running a fixed checklist.
+You are an AI auditor. Find REAL accounting errors — not false positives.
+Quality over quantity: 5 real errors are worth more than 200 false alarms.
 
 STEP 1 — FETCH DATA (parallel queries):
   - User_Expenses by PK — ALL expense invoices
-  - Bank_Reconciliations by PK — ALL bank transactions (to cross-reference)
-  - User_Invoice_Incomes by PK — ALL income invoices (if relevant)
+  - Bank_Reconciliations by PK — ALL bank transactions (for cross-reference)
 
 STEP 2 — EXPLORE THE DATA (first run_code):
-  Before checking for errors, UNDERSTAND the data landscape:
-  - How many invoices? Date range? Document types (invoice vs credit note)?
-  - What fields are available? Which are frequently empty/null?
-  - What are the amount distributions per category?
-  - How many suppliers? Any with temporary CIFs (TEMP-*)?
-  - Print summary stats so you know what you're working with.
+  UNDERSTAND the data before checking errors:
+  - Count invoices, date range, document types (invoice vs credit_note)
+  - Count reconciled (reconciled=True) vs unreconciled (field missing)
+  - Amount distributions per category, supplier count, temporary CIFs
+  - Print summary stats. DO NOT import pandas (use basic Python).
+  DO NOT set `result` here. You MUST continue to STEP 3.
 
-STEP 3 — SYSTEMATIC CHECKS (second run_code):
-  Run these standard checks, but ALSO look for anything else suspicious:
+STEP 3 — ERROR DETECTION (second run_code):
+  Check for REAL errors. Be precise — avoid false positives:
 
-  a) DUPLICATES:
-     - Same supplier_cif + invoice_number (exact duplicate)
-     - Same supplier_cif + total + similar date (possible duplicate with different number)
-     - Same total + same date from different suppliers (suspicious)
+  a) DUPLICATES (BLOQUEANTE if confirmed):
+     - EXACT duplicate: same supplier_cif + invoice_number → definite error
+     - PROBABLE duplicate: same supplier_cif + same total + dates within 7 days → suspicious
+     - Do NOT flag invoices with different invoice_numbers as duplicates just because same amount
 
-  b) VAT / CALCULATION ERRORS:
-     - total != importe + sum(ivas[].amount) - retencion (math doesn't add up)
-     - IVA rate not standard (4%, 10%, 21%) — unusual rates may be errors
-     - vatTotalAmount != sum(ivas[].amount) — internal inconsistency
-     - Invoices with importe=0 or total=0 (empty invoices)
+  b) VAT / MATH ERRORS (BLOQUEANTE):
+     - total != importe + sum(ivas[].amount) - retencion (with 0.02€ tolerance for rounding)
+     - vatTotalAmount != sum(ivas[].amount)
+     - Only flag if the difference is > 0.02€ (rounding tolerance)
+     - Invoices with ivas=[] are OK (foreign suppliers, exempt operations)
 
-  c) MISSING / INCOMPLETE DATA:
-     - No supplier_cif or temporary CIF (TEMP-*)
-     - No category, no concept, no invoice_number
-     - Missing dates (invoice_date, due_date)
+  c) MISSING DATA (ADVERTENCIA, not BLOQUEANTE):
+     - Temporary CIF (starts with TEMP-) → supplier not properly registered
+     - Missing invoice_number, missing category
+     - Missing due_date (only flag if amount_due > 0)
 
-  d) DATE ANOMALIES:
-     - invoice_date in the future
-     - charge_date much earlier/later than invoice_date (>90 days)
+  d) DATE ANOMALIES (ADVERTENCIA):
+     - invoice_date in the future (> today)
      - due_date before invoice_date
+     - charge_date more than 180 days from invoice_date
 
-  e) CROSS-REFERENCE WITH BANK (creative exploration):
-     - Invoices marked reconciled=True but no matching bank transaction found
-     - Bank payments without any matching invoice (ghost payments)
-     - Invoice amount_paid != total but reconciled=True (partial payment inconsistency)
-     - Multiple invoices paid on same day to same supplier (bulk payment or duplicate?)
+  e) CROSS-REFERENCE INSIGHTS (INFORMATIVO, not BLOQUEANTE):
+     - Bank payments > 1000€ without any matching invoice amount (ghost payments)
+     - Unreconciled invoices older than 90 days (possibly forgotten)
+     - DO NOT flag "reconciled invoice without bank match" as error — reconciliation
+       may have been done via N-to-1 matching, partial payments, or manual process.
+       The reconciled=True flag IS the source of truth. Trust it.
 
-  f) OUTLIERS & ANOMALIES (be creative here):
-     - Amounts far above average for their category
-     - Round-number invoices (exact 1000, 5000, 10000) — may warrant review
-     - Same supplier billing very different amounts for same concept
-     - Credit notes without a matching original invoice
-     - Invoices where amount_due > 0 but reconciled=True
+  f) OUTLIERS (INFORMATIVO):
+     - Amounts > 3x the average for their category
+     - Credit notes without a matching original invoice (by supplier + similar amount)
 
-  EXPLORE BEYOND THIS LIST — look at the actual data and flag anything that looks wrong,
-  unusual, or worth investigating. You are the auditor, use your judgment.
+  IMPORTANT FALSE POSITIVE RULES:
+  - reconciled=True means CORRECTLY reconciled. Do NOT flag these as errors.
+  - Invoices with ivas=[] or no vatTotalAmount are often foreign/exempt — NOT errors.
+  - Different invoices to same supplier on same day are NORMAL for recurring services.
+  - amount_paid matching total with reconciled=True is CORRECT, not suspicious.
+  DO NOT set `result` here. You MUST continue to STEP 4.
 
-STEP 4 — GENERATE REPORT (run_code):
-  Create an Excel with:
-  - Sheet "Resumen": total invoices, errors found by severity, key findings
-  - Sheet "Errores Bloqueantes": critical issues that must be fixed
-  - Sheet "Advertencias": issues worth reviewing
-  - Sheet "Informativos": minor observations
-  - Sheet "Cruce Bancario": cross-reference findings between invoices and bank
-  Color-code by severity. Include invoice_number, supplier, amount, and the specific error.
-  ALWAYS include categoryDate (SK) for each invoice so the frontend can locate them.
+STEP 4 — GENERATE EXCEL REPORT (third run_code):
+  Create Excel with:
+  - Sheet "Resumen": total invoices, real errors found by severity, key findings
+  - Sheet "Errores": all issues sorted by severity, with columns:
+    severity, error_type, invoice_number, supplier, amount, description, categoryDate
+  - Sheet "Detalle Facturas": all invoices with key fields for reference
+  ALWAYS include categoryDate (SK) for each invoice for frontend integration.
+  Color-code: red=BLOQUEANTE, yellow=ADVERTENCIA, blue=INFORMATIVO.
 
-Classify severity:
-  - BLOQUEANTE: Math errors (IVA wrong), exact duplicates, reconciliation contradictions
-  - ADVERTENCIA: Missing fields, suspicious patterns, date anomalies
-  - INFORMATIVO: Outliers, temporary CIFs, minor observations""",
+  Set `result` here with:
+  - "answer": summary text with error counts and key findings
+  - "chart": bar chart of errors by type
+  - "sources": list of ONLY the problematic invoices (NOT all 230)
+
+Severity guide:
+  - BLOQUEANTE: Math errors (IVA mismatch > 0.02€), exact duplicates
+  - ADVERTENCIA: Temporary CIFs, missing fields, date anomalies
+  - INFORMATIVO: Outliers, old unreconciled invoices, ghost bank payments
+
+CRITICAL: Complete ALL 4 steps. Only set `result` in STEP 4 with Excel.
+DO NOT use pandas — use basic Python (collections, datetime). It's more reliable.""",
     },
 
     "auditoria_iva": {
@@ -465,21 +477,72 @@ Analyze profitability by client, category, or period.
     "prediccion_cashflow": {
         "name": "Prediccion de Cash Flow",
         "guidance": """\
-PLAYBOOK — PREDICCION CASHFLOW:
-Build a 13-week cash flow forecast from bank data.
+PLAYBOOK — PREDICCION DE CASHFLOW EXPLORATORIA:
+You are a treasury analyst. Build a realistic 13-week cash flow forecast by UNDERSTANDING
+the business patterns, not just averaging numbers.
 
-1. QUERY Bank_Reconciliations by PK — ALL transactions (amount, bookingDate, ai_enrichment).
-2. In run_code:
-   - Classify by ai_enrichment.payment_type and amount sign
-   - Calculate weekly averages per category (last 12 weeks)
-   - Project 13 weeks forward
-   - Opening balance = last known bank balance
-   - Weekly: inflows, outflows, net, cumulative balance
-   - Flag weeks where balance goes negative
-3. Generate Excel with forecast table + line chart.
+STEP 1 — FETCH DATA (parallel queries):
+  - Bank_Reconciliations by PK — ALL bank transactions (source of truth for cash)
+  - User_Expenses by PK — ALL invoices (for pending payments = future outflows)
 
-IMPORTANT: Bank_Reconciliations is the ONLY source of truth for real cash movements.
-Do NOT use invoice data for cash flow — use actual bank transactions.""",
+STEP 2 — EXPLORE CASH PATTERNS (first run_code):
+  UNDERSTAND the cash flow dynamics before projecting:
+  - Group transactions by week (bookingDate). How many weeks of history?
+  - Separate inflows (amount > 0) vs outflows (amount < 0) per week.
+  - Use ai_enrichment.payment_type and ai_enrichment.category to classify:
+    * Recurring outflows: rent, salaries, subscriptions (predictable, repeat monthly)
+    * Variable outflows: supplier payments (irregular, tied to invoices)
+    * Recurring inflows: client payments, subscriptions
+    * One-off items: large unusual transactions (should NOT repeat in forecast)
+  - Identify seasonality: are some months heavier than others?
+  - Detect trends: are inflows/outflows growing, declining, or stable?
+  - Find the latest bank balance (cumulative sum of all transactions).
+  - List pending invoices (reconciled != True) — these are FUTURE outflows.
+  DO NOT set `result` here. You MUST continue to STEP 3.
+
+STEP 3 — BUILD FORECAST (second run_code):
+  Use your exploration insights to build an intelligent forecast:
+
+  a) RECURRING ITEMS (high confidence):
+     - Identify payments that repeat monthly (same merchant/description ± similar amount)
+     - Project these at their usual timing and amount
+     - Examples: rent, salaries, insurance, software subscriptions
+
+  b) VARIABLE ITEMS (medium confidence):
+     - For non-recurring outflows: use category-level weekly averages (last 8-12 weeks)
+     - For inflows: use weekly averages, but weight recent weeks more heavily
+     - Apply trend: if inflows grew 5%/month, continue that trend (dampened)
+
+  c) KNOWN FUTURE PAYMENTS (from pending invoices):
+     - Invoices with due_date in the forecast period → scheduled outflow
+     - Invoices without due_date: estimate using average payment delay for that supplier
+
+  d) SAFETY ADJUSTMENTS:
+     - Exclude one-off large transactions from averages (> 3x category average)
+     - Apply a conservative buffer: reduce projected inflows by 10%, increase outflows by 5%
+
+  Build week-by-week projection:
+  - Opening balance (= current bank balance)
+  - Each week: projected inflows, projected outflows, net, cumulative balance
+  - Flag weeks where balance might go negative or below a safety threshold
+  DO NOT set `result` here. You MUST continue to STEP 4.
+
+STEP 4 — GENERATE EXCEL REPORT (third run_code):
+  Create Excel with:
+  - Sheet "Forecast 13 Semanas": week-by-week table with inflows, outflows, net, balance
+  - Sheet "Detalle Categorias": breakdown of projected flows by category
+  - Sheet "Pagos Pendientes": pending invoices that will hit in the forecast period
+  - Sheet "Historico Semanal": historical weekly data used as basis
+  Include a line chart of projected balance over 13 weeks.
+  Color-code weeks where balance drops below safety threshold.
+
+  Set `result` with summary, chart (line chart of balance), and key metrics.
+
+IMPORTANT:
+- Bank_Reconciliations is the ONLY source for actual cash movements.
+- Pending invoices (User_Expenses with reconciled != True) add known future outflows.
+- DO NOT use pandas. Use basic Python (collections, datetime).
+- Complete ALL 4 steps. Only set `result` in STEP 4 with Excel.""",
     },
 
     "simulacion": {

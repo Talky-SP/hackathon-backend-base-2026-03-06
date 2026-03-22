@@ -805,29 +805,41 @@ def _get_task_guidance(task_type: str) -> str:
     """Return task-specific instructions for the AI planner."""
     guidance = {
         "cash_flow_forecast": """\
-TASK-SPECIFIC GUIDANCE — CASH FLOW FORECAST:
-The cash flow forecast MUST be built primarily from Bank_Reconciliations (real bank movements).
-This table contains ALL actual money movements: amount<0 = outflow, amount>0 = inflow.
+TASK-SPECIFIC GUIDANCE — CASH FLOW FORECAST (EXPLORATORIO):
+You are a treasury analyst. Build a realistic 13-week forecast by understanding cash patterns.
 
-Steps:
-1. Fetch ALL bank transactions from Bank_Reconciliations (PK=locationId, query by PK directly).
-   Extract: bookingDate, amount, description, merchant, ai_enrichment.payment_type
-2. In run_code, classify transactions into categories using ai_enrichment.payment_type
-   (vendor_payment, payroll, social_security, bank_fee, tax_payment) and amount sign.
-   Group by week and category to find historical patterns (weekly averages for inflows/outflows).
-3. Project 13 weeks forward based on historical weekly averages per category.
-   Calculate: opening_balance (last known bank position), weekly inflows, weekly outflows, closing_balance.
-   Identify liquidity alerts (weeks where projected balance goes negative).
-4. IMPORTANT: Use run_code to create a professional Excel with:
-   - Sheet 1: 13-week forecast table with weekly columns (inflows, outflows, net, cumulative balance)
-   - Sheet 2: Historical analysis (weekly actuals by category)
-   - Sheet 3: Executive summary with key metrics and alerts
-   - Include a line chart showing projected balance over 13 weeks
-   Save files to output_dir.
+STEP 1 — FETCH DATA (parallel queries):
+  - Bank_Reconciliations by PK — ALL transactions (source of truth)
+  - User_Expenses by PK — pending invoices = known future outflows
 
-DO NOT use User_Expenses or User_Invoice_Incomes as primary data for cash flow.
-Bank_Reconciliations IS the source of truth for actual cash movements.
-You MUST generate an Excel file — this is a report task, not just a data query.""",
+STEP 2 — EXPLORE PATTERNS (first run_code):
+  - Group bank txns by week. Separate inflows (amount>0) vs outflows (amount<0).
+  - Classify by ai_enrichment.payment_type/category:
+    * Recurring: rent, salaries, subscriptions (predictable)
+    * Variable: supplier payments (irregular)
+    * One-off: large unusual transactions (exclude from averages)
+  - Detect trends and seasonality. Find current bank balance.
+  - List pending invoices (reconciled != True) as future outflows.
+  DO NOT set result here. Continue to STEP 3.
+
+STEP 3 — BUILD FORECAST (second run_code):
+  - Recurring items: project at their usual timing/amount
+  - Variable items: weighted weekly averages (recent weeks > older)
+  - Pending invoices: schedule by due_date or estimated payment delay
+  - Safety: exclude one-offs, reduce inflows 10%, increase outflows 5%
+  - Week-by-week: opening balance → inflows → outflows → closing balance
+  - Flag weeks with negative or low balance
+  DO NOT set result here. Continue to STEP 4.
+
+STEP 4 — GENERATE EXCEL (third run_code):
+  - Sheet "Forecast 13 Semanas": weekly table with inflows, outflows, net, balance
+  - Sheet "Detalle Categorias": flows by category
+  - Sheet "Pagos Pendientes": pending invoices hitting the forecast period
+  - Sheet "Historico": historical weekly data used as basis
+  Include line chart of projected balance. Color-code risk weeks.
+  You MUST generate an Excel file.
+
+DO NOT use pandas. Use basic Python. Complete ALL steps. Set result only in STEP 4.""",
 
         "pack_reporting": """\
 TASK-SPECIFIC GUIDANCE — PACK REPORTING (P&L):

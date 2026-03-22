@@ -271,6 +271,10 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
         import openpyxl
         import openpyxl.styles
         import openpyxl.utils
+        import openpyxl.chart
+        import openpyxl.chart.label
+        import openpyxl.formatting
+        import openpyxl.formatting.rule
         injected["openpyxl"] = openpyxl
     except ImportError:
         pass
@@ -307,8 +311,9 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
     _allowed_modules = set(injected.keys()) | {
         "json", "datetime", "collections", "decimal", "math", "re", "statistics",
         "openpyxl", "openpyxl.styles", "openpyxl.utils", "openpyxl.chart",
+        "openpyxl.chart.label", "openpyxl.chart.series",
         "openpyxl.formatting", "openpyxl.formatting.rule",
-        "pandas", "numpy", "matplotlib", "matplotlib.pyplot",
+        "numpy", "matplotlib", "matplotlib.pyplot",
     }
 
     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -618,7 +623,7 @@ TOOLS:
   All items are stored in memory for run_code to access.
 - `run_code`: Execute Python code with full access to ALL queried data.
   Use for: analysis, aggregation, charts, AND file generation (Excel, CSV, PDF).
-  Environment: data dict, output_dir, pandas (pd), openpyxl, matplotlib (plt), numpy (np).
+  Environment: data dict, output_dir, openpyxl, matplotlib (plt), numpy (np). NO pandas — use basic Python.
   Helpers: group_by(), monthly_totals(), top_n(), filter_items(), sum_field().
 MULTIMODAL INPUT:
 - Users can attach images (PNG, JPG) and PDFs — you can see and analyze them.
@@ -637,7 +642,7 @@ DATASET CARDS:
 run_code ENVIRONMENT:
 - `data`: dict of all query results. `data['query_1']['items']` = list of dicts.
 - `output_dir`: path to save files (Excel, CSV, PNG, PDF).
-- Libraries: openpyxl, pandas (pd), numpy (np), matplotlib.pyplot (plt), json, Decimal.
+- Libraries: openpyxl, numpy (np), matplotlib.pyplot (plt), json, Decimal. NO pandas available — use basic Python (dicts, lists, collections).
 - datetime, timedelta, Counter, defaultdict available.
 - Helpers: group_by(items, field, agg_field, agg_fn), monthly_totals(items, date_field, amt_field),
   top_n(items, field, n, sort_field), filter_items(items, **conditions), sum_field(items, field).
@@ -858,7 +863,7 @@ UNIFIED_TOOLS = [
                 "- `output_dir`: path to save files (Excel, CSV, PNG, PDF).\n"
                 "- `existing_files`: dict mapping filename→path for previously generated artifacts.\n"
                 "  To edit an existing file: wb = openpyxl.load_workbook(existing_files['name.xlsx'])\n"
-                "- Libraries: openpyxl, pandas (pd), numpy (np), matplotlib.pyplot (plt), json, Decimal.\n"
+                "- Libraries: openpyxl, numpy (np), matplotlib.pyplot (plt), json, Decimal. NO pandas available — use basic Python (dicts, lists, collections).\n"
                 "- datetime, timedelta, Counter, defaultdict.\n"
                 "- Helpers: group_by(items, field, agg_field='total', agg_fn='sum'), "
                 "monthly_totals(items, date_field, amount_field), "
@@ -1283,9 +1288,11 @@ def run_agent(
                         "success": True,
                     })
 
-                # If result has 'answer', return immediately
-                if isinstance(result_val, dict) and "answer" in result_val:
-                    log.info(f"[run_code] Answer: {str(result_val.get('answer', ''))[:200]}")
+                # If result has 'answer' AND we have generated files, return immediately
+                # (this means the agent completed the final step with Excel/report).
+                # If no files, let the LLM continue — it may have more steps to do.
+                if isinstance(result_val, dict) and "answer" in result_val and generated_files:
+                    log.info(f"[run_code] Final answer with files: {str(result_val.get('answer', ''))[:200]}")
                     emit("analysis_result", {
                         "message": "Analisis completado",
                         "answer_preview": str(result_val.get("answer", ""))[:300],

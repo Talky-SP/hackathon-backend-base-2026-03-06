@@ -33,7 +33,17 @@
       "Bash(taskkill //F //PID 20452 //T)",
       "Bash(taskkill //F //PID 56604 //T)",
       "Bash(find . -type d -name \"__pycache__\" -path \"*/agent/*\" -exec rm -rf {} +)",
-      "Bash(AWS_PROFILE=hackathon-equipo1 python -m hackathon_backend.services.lambdas.agent.server --reload)"
+      "Bash(AWS_PROFILE=hackathon-equipo1 python -m hackathon_backend.services.lambdas.agent.server --reload)",
+      "Bash(taskkill //F //PID 44384 //T)",
+      "Bash(taskkill //F //PID 21424 //T)",
+      "Bash(taskkill //F //PID 31748 //T)",
+      "Bash(taskkill //F //PID 44912 //T)",
+      "Bash(taskkill //F //PID 14544 //T)",
+      "Bash(find c:/hackathon-backend-base-2026-03-06 -type d -name \"__pycache__\" -path \"*/agent/*\" -exec rm -rf {} +)",
+      "Bash(curl -s http://localhost:8000/docs)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(find c:/hackathon-backend-base-2026-03-06 -type d -name \"__pycache__\" -exec rm -rf {} +)",
+      "Bash(python -c \"import pandas; print\\(f''pandas {pandas.__version__} OK''\\)\")"
     ]
   }
 }
