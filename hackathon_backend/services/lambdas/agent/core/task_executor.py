@@ -879,41 +879,47 @@ Cross-reference invoices, delivery notes, and purchase orders.
 3. Match by supplier_cif + product descriptions. Flag discrepancies.""",
 
         "bank_reconciliation": """\
-TASK-SPECIFIC GUIDANCE — BANK RECONCILIATION (CONCILIACION BANCARIA):
-Automatically match unreconciled bank transactions with unreconciled invoices/payrolls.
+TASK-SPECIFIC GUIDANCE — BANK RECONCILIATION (CONCILIACION BANCARIA EXPLORATORIA):
+You are an AI forensic accountant. The unreconciled items are the HARD cases that a standard
+algorithm couldn't match. Your job is to EXPLORE the data creatively and find matches.
 
-Steps:
-1. Query ALL Bank_Reconciliations by PK (locationId) — NO filter, NO GSI.
-   IMPORTANT: Unreconciled txns (status=PENDING) do NOT have the `reconciled` field at all,
-   and are NOT indexed in LocationByStatusDate GSI. You MUST query all, then filter in run_code.
-   In code: unreconciled = [t for t in txns if t.get('status') != 'MATCHED']
-2. Query User_Expenses by PK. In run_code filter UNRECONCILED invoices:
-   `unreconciled_invoices = [it for it in items if not it.get('reconciled')]`
-   The field 'reconciled' is True for reconciled invoices, MISSING (not present) for unreconciled.
-   WARNING: Do NOT use 'reconciliationState' — it is ALWAYS 'UNRECONCILED' for ALL items (broken field).
-3. Query User_Invoice_Incomes by PK. Same filter for unreconciled.
-4. In run_code, implement matching algorithm:
+STEP 1 — FETCH DATA (parallel queries):
+  - Bank_Reconciliations by PK — ALL transactions
+  - User_Expenses by PK — ALL expense invoices
+  - User_Invoice_Incomes by PK — ALL income invoices
 
-   MATCHING RULES (by priority):
-   a) EXACT MATCH (confidence=HIGH): abs(txn.amount) == invoice.total AND
-      (ai_enrichment.vendor_cif == supplier_cif OR ai_enrichment.vendor_cif == client_cif)
-   b) AMOUNT MATCH (confidence=MEDIUM): abs(txn.amount) == invoice.total (within 0.01 EUR tolerance)
-      AND date proximity (bookingDate within 30 days of invoice_date or due_date)
-   c) PARTIAL MATCH (confidence=LOW): amount close (within 5%) AND CIF matches
-   d) AGGREGATE MATCH: Sum of multiple invoices = single bank transaction (N-1 matching)
+STEP 2 — EXPLORE (first run_code): Understand the unreconciled landscape BEFORE matching.
+  Filter:
+  - Unreconciled bank txns: `[t for t in txns if t.get('status') != 'MATCHED']`
+  - Unreconciled invoices: `[i for i in invoices if not i.get('reconciled')]`
+    (reconciled=True → matched. Field MISSING → unreconciled. NEVER use reconciliationState.)
+  Explore:
+  - Print counts, amount ranges, date ranges for each set
+  - Examine ai_enrichment field in bank txns (may contain vendor_cif, payment_type, category)
+  - List top merchants in unreconciled txns and top suppliers in unreconciled invoices
+  - Look for patterns: descriptions containing supplier names, CIFs, invoice numbers
 
-   For EXPENSES: txn.amount < 0 matches invoice.total (outflow pays an expense)
-   For INCOMES: txn.amount > 0 matches invoice.total (inflow receives a payment)
+STEP 3 — MATCH CREATIVELY (second run_code): Try MULTIPLE strategies, combine signals:
+  a) Exact amount: abs(txn.amount) == invoice.total (±0.01€)
+  b) CIF match: ai_enrichment.vendor_cif == supplier_cif
+  c) Fuzzy name: supplier name partially in txn.description or txn.merchant (case-insensitive)
+  d) Date proximity: bookingDate near invoice_date, due_date, or charge_date (±30 days)
+  e) N-to-1: sum of N invoices from same supplier ≈ one bank txn amount
+  f) 1-to-N: one large invoice split across multiple smaller bank txns
+  g) Fees: txn.amount ≈ invoice.total ± bank fee (1-10€)
+  h) Partial payment: txn.amount matches amount_paid or a fraction of total
 
-5. IMPORTANT: Use run_code to create Excel (save to output_dir) with:
-   - Sheet 1: "Propuesta Conciliacion" — matched pairs with confidence score, txn details, invoice details
-   - Sheet 2: "Transacciones Sin Conciliar" — bank txns with no match found
-   - Sheet 3: "Facturas Sin Conciliar" — invoices (expenses + incomes) with no match found
-   - Sheet 4: "Resumen" — summary stats (total matched, unmatched, by confidence level)
-   Color-code: green=high confidence, yellow=medium, red=low.
-   You MUST generate an Excel file — this is a reconciliation report task.
+  Score each match by combining signals. Explain WHY you think each match is correct.
+  Bank amount < 0 = expense payment. Bank amount > 0 = income received.
 
-IMPORTANT: Do NOT modify any records. Only PROPOSE matches. The user reviews and approves.""",
+STEP 4 — EXCEL REPORT (third run_code):
+  - Sheet "Matches Propuestos": pairs with confidence %, reasoning, amounts, dates
+  - Sheet "Txns Sin Match": remaining unmatched bank transactions
+  - Sheet "Facturas Sin Match": remaining unmatched invoices
+  - Sheet "Resumen": stats and insights from your exploration
+  Color-code by confidence. You MUST generate an Excel file.
+
+IMPORTANT: Do NOT modify records. Only PROPOSE matches. The user reviews and approves.""",
     }
     return guidance.get(task_type, "")
 

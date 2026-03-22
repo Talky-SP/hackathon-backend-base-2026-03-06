@@ -198,31 +198,46 @@ IMPORTANT: Start with multiple parallel dynamo_query calls to fetch all data at 
     "conciliacion": {
         "name": "Conciliacion Bancaria Inteligente",
         "guidance": """\
-PLAYBOOK — CONCILIACION BANCARIA:
-Match unreconciled bank transactions with unreconciled invoices.
+PLAYBOOK — CONCILIACION BANCARIA EXPLORATORIA:
+You are an AI forensic accountant. The unreconciled items are the HARD cases that a simple
+algorithm couldn't match. You must EXPLORE the data creatively to find matches.
 
-1. QUERY Bank_Reconciliations by PK (NO GSI, NO filter) — get ALL transactions.
-2. QUERY User_Expenses by PK — get all expense invoices.
-3. QUERY User_Invoice_Incomes by PK — get all income invoices.
-4. In run_code, implement matching:
-   - UNRECONCILED bank txns: status != 'MATCHED' (i.e. status == 'PENDING')
-   - UNRECONCILED invoices: `not it.get('reconciled')` (field is MISSING when unreconciled, True when reconciled)
-     DO NOT use reconciliationState — it is ALWAYS 'UNRECONCILED' even for reconciled invoices (unreliable field).
-     DO NOT filter by amount_due — "sin conciliar" != "pendiente de pago", they are DIFFERENT concepts.
-   - For EXPENSES: txn.amount < 0 matches invoice.total (compare abs values)
-   - For INCOMES: txn.amount > 0 matches invoice.total
-   - Match rules (by priority):
-     a) HIGH (90%): abs(txn.amount) == invoice.total AND vendor_cif/client_cif matches
-     b) MEDIUM (70%): abs(txn.amount) == invoice.total AND date within 30 days
-     c) LOW (50%): amount within 5% AND CIF matches
-     d) POSSIBLE (40%): amount within 10% AND date within 60 days
-   - Present matches with confidence score, sorted by confidence desc
+STEP 1 — FETCH DATA:
+  Query Bank_Reconciliations, User_Expenses, User_Invoice_Incomes (all by PK, no filters).
 
-CRITICAL RULES:
-- Unreconciled txns have status='PENDING'. The 'reconciled' field may be MISSING (not false).
-- Do NOT use LocationByStatusDate GSI for unreconciled items.
-- Do NOT add extra filters like amount_due > 0 or amount_paid == 0.
-- Compare abs(txn.amount) with invoice.total (bank amounts can be negative for expenses).""",
+STEP 2 — EXPLORE (run_code): Understand the unreconciled landscape BEFORE trying to match.
+  - Separate unreconciled bank txns: `[t for t in txns if t.get('status') != 'MATCHED']`
+  - Separate unreconciled invoices: `[i for i in invoices if not i.get('reconciled')]`
+    (reconciled=True means matched. Field MISSING = unreconciled. NEVER use reconciliationState.)
+  - Print stats: how many of each? What amount ranges? What date ranges?
+  - Look at the merchant/description field in bank txns — does it contain supplier names or CIFs?
+  - Look at ai_enrichment field — it may have vendor_cif, payment_type, category.
+  - List unique suppliers in unreconciled invoices and unique merchants in unreconciled txns.
+  - Identify patterns: Are there txns that look like they aggregate multiple invoices?
+
+STEP 3 — MATCH CREATIVELY (run_code): Try multiple strategies, from obvious to creative:
+  a) EXACT amount match: abs(txn.amount) == invoice.total (within 0.01€ tolerance)
+  b) CIF match: txn.ai_enrichment.vendor_cif == invoice.supplier_cif
+  c) Name fuzzy match: supplier name appears in txn.description or txn.merchant
+  d) Date proximity: bookingDate close to invoice_date or due_date or charge_date
+  e) N-to-1 aggregation: sum of N invoices from same supplier == one bank txn
+  f) 1-to-N split: one invoice paid in multiple bank transactions
+  g) Amount with fees: txn.amount ≈ invoice.total ± small bank fee (1-5€)
+  h) Partial payments: txn.amount is a percentage of invoice.total (check amount_paid field)
+
+  Combine multiple signals into a confidence score. Be creative — these are the hard cases!
+
+STEP 4 — GENERATE REPORT (run_code): Create Excel with:
+  - Sheet "Matches Propuestos": matched pairs with confidence score, reasoning for each match
+  - Sheet "Txns Sin Match": remaining unmatched bank transactions
+  - Sheet "Facturas Sin Match": remaining unmatched invoices
+  - Sheet "Resumen": stats, match distribution by confidence, insights discovered
+
+CRITICAL DATA RULES:
+- Bank txns: amount < 0 = outflow (expense payment), amount > 0 = inflow (income received)
+- Invoice reconciled: True = already matched, MISSING = unreconciled. NEVER False.
+- DO NOT use reconciliationState field (always says UNRECONCILED, even for reconciled items).
+- DO NOT filter by amount_due or amount_paid for reconciliation status.""",
     },
 
     "reportes_financieros": {
