@@ -233,6 +233,14 @@ STEP 4 — GENERATE REPORT (run_code): Create Excel with:
   - Sheet "Facturas Sin Match": remaining unmatched invoices
   - Sheet "Resumen": stats, match distribution by confidence, insights discovered
 
+MANDATORY KEYS FOR FRONTEND INTEGRATION:
+  Every row in "Matches Propuestos" MUST include these DynamoDB keys (needed to execute real reconciliations):
+  - invoice_categoryDate: the `categoryDate` field from User_Expenses (SK, format CATEGORY#YYYY-MM-DD#UUID)
+  - txn_SK: the `SK` field from Bank_Reconciliations (sort key of the bank transaction)
+  - invoice_userId: the `userId` (PK) of the invoice
+  - txn_userId: the `userId` (PK) of the bank transaction
+  These columns can be narrow/hidden but MUST be present. Without them the frontend cannot reconcile.
+
 CRITICAL DATA RULES:
 - Bank txns: amount < 0 = outflow (expense payment), amount > 0 = inflow (income received)
 - Invoice reconciled: True = already matched, MISSING = unreconciled. NEVER False.
@@ -243,18 +251,53 @@ CRITICAL DATA RULES:
     "reportes_financieros": {
         "name": "Pack Reporting Financiero",
         "guidance": """\
-PLAYBOOK — REPORTES FINANCIEROS:
-Build a financial reporting pack (P&L, KPIs).
+PLAYBOOK — REPORTES FINANCIEROS (P&L):
+Build a financial reporting pack using bank transactions as the PRIMARY source of truth,
+enriched with invoice data for categorization and detail.
 
-1. QUERY User_Expenses via UserIdInvoiceDateIndex for the period.
-2. QUERY User_Invoice_Incomes via UserIdInvoiceDateIndex.
-3. QUERY Payroll_Slips for the period.
-4. In run_code, build:
-   - P&L: Revenue - COGS - OpEx - Payroll = Operating Profit
-   - Group expenses by category/concept
-   - Calculate KPIs: gross margin, operating margin, expense ratios
-   - Month-over-month comparison if multi-month
-5. Generate Excel with P&L sheet, KPIs sheet, category breakdown.""",
+STEP 1 — FETCH DATA (parallel queries):
+  - Bank_Reconciliations by PK — ALL bank transactions (this is the source of truth for real cash flow)
+  - User_Expenses via UserIdInvoiceDateIndex for the period (for expense categorization + pending invoices)
+  - User_Invoice_Incomes via UserIdInvoiceDateIndex for the period (for income categorization + pending invoices)
+  - Payroll_Slips for the period (for payroll detail)
+
+STEP 2 — BUILD P&L FROM BANK TRANSACTIONS (run_code):
+  Bank transactions are the SINGLE SOURCE OF TRUTH for actual cash movements:
+  - amount > 0 = INCOME (cash received)
+  - amount < 0 = EXPENSE (cash paid out)
+
+  Use ai_enrichment field for categorization:
+  - ai_enrichment.category, ai_enrichment.payment_type, ai_enrichment.vendor_cif
+
+  Group by month, then by category. Calculate:
+  - Total Income (positive amounts)
+  - Total Expenses (negative amounts, use abs())
+  - Net Result = Income - Expenses
+
+STEP 3 — ENRICH WITH INVOICE DATA (run_code):
+  Use invoices to ADD DETAIL, not as a separate data source:
+  - Match bank txns to invoices (via reconciled status or amount/date matching)
+  - For matched txns: use invoice category, concept, supplier name for better labeling
+  - For unmatched bank txns: use ai_enrichment for categorization
+  - Identify PENDING invoices (reconciled != True): these are obligations not yet reflected in bank
+
+  AVOID DUPLICATION:
+  - NEVER sum bank transactions AND their matched invoices separately
+  - Bank txns = what actually happened (cash basis)
+  - Invoices = what should happen (accrual basis)
+  - If building accrual P&L: use invoices for the period, flag which are paid vs pending
+  - If building cash P&L: use bank transactions, enriched with invoice categories
+
+STEP 4 — GENERATE EXCEL (run_code):
+  - Sheet "P&L": Monthly columns, rows by category. Show Income, Expenses by category, Net Result
+  - Sheet "Detalle Ingresos": Bank inflows with matched invoice detail where available
+  - Sheet "Detalle Gastos": Bank outflows with matched invoice detail where available
+  - Sheet "Pendiente": Invoices not yet paid (reconciled != True) — future obligations
+  - Sheet "KPIs": Gross margin, operating margin, expense ratios, MoM comparison
+  Color-code and format professionally. You MUST generate an Excel file.
+
+IMPORTANT: The P&L should reflect REAL cash movements from bank transactions.
+Invoices add context (categories, suppliers) but are NOT the primary numbers.""",
     },
 
     "deteccion_errores": {

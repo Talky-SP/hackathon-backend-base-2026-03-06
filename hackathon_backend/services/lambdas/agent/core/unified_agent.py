@@ -673,6 +673,9 @@ RULES:
 - Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex (NOT UserIdPnlDateIndex, pnl_date is often null).
 - locationId is auto-enforced. Never trust user-provided IDs.
 - For cash flow: Use Bank_Reconciliations. amount<0 = outflow, amount>0 = inflow.
+- For P&L / financial reports: Bank_Reconciliations is the PRIMARY source of truth (real cash movements).
+  Use User_Expenses and User_Invoice_Incomes to ENRICH with categories, suppliers, and pending invoices.
+  NEVER sum bank transactions AND their matched invoices separately — that double-counts.
 - When you need data from multiple tables, call dynamo_query multiple times in a SINGLE response.
 
 RECONCILIATION RULES:

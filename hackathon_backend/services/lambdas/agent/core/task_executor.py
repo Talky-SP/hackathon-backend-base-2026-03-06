@@ -830,14 +830,38 @@ Bank_Reconciliations IS the source of truth for actual cash movements.
 You MUST generate an Excel file — this is a report task, not just a data query.""",
 
         "pack_reporting": """\
-TASK-SPECIFIC GUIDANCE — PACK REPORTING:
-Build a monthly financial reporting pack (P&L + KPIs).
-1. Query User_Expenses via UserIdInvoiceDateIndex for the current month's expenses.
-2. Query User_Invoice_Incomes via UserIdInvoiceDateIndex for income in the same period.
-3. Query Payroll_Slips for salary costs in the period.
-4. Build P&L in run_code: Revenue - COGS - Operating Expenses - Payroll = Operating Profit.
-5. IMPORTANT: Use run_code to create Excel (save to output_dir) with P&L sheet, KPIs sheet, and charts.
-You MUST generate an Excel file — this is a report task.""",
+TASK-SPECIFIC GUIDANCE — PACK REPORTING (P&L):
+Build a financial reporting pack using bank transactions as PRIMARY source + invoices for enrichment.
+
+STEP 1 — FETCH DATA (parallel queries):
+  - Bank_Reconciliations by PK — ALL bank transactions (source of truth for real cash flow)
+  - User_Expenses via UserIdInvoiceDateIndex for the period (categorization + pending invoices)
+  - User_Invoice_Incomes via UserIdInvoiceDateIndex (income categorization + pending)
+  - Payroll_Slips for the period (payroll detail)
+
+STEP 2 — BUILD P&L FROM BANK TRANSACTIONS (run_code):
+  Bank transactions = SINGLE SOURCE OF TRUTH for actual cash:
+  - amount > 0 = INCOME, amount < 0 = EXPENSE
+  - Use ai_enrichment.category / ai_enrichment.payment_type for categorization
+  - Filter by bookingDate for the requested period
+  - Group by month → category → sum amounts
+
+STEP 3 — ENRICH WITH INVOICES (run_code):
+  - Match bank txns to invoices (reconciled=True invoices are already matched)
+  - Use invoice category, concept, supplier for better labeling of matched txns
+  - For unmatched bank txns: use ai_enrichment
+  - AVOID DUPLICATION: NEVER sum bank txns AND their matched invoices separately
+  - Identify PENDING invoices (reconciled != True) as future obligations
+
+STEP 4 — EXCEL REPORT (run_code):
+  - Sheet "P&L": Monthly columns, category rows, Income/Expenses/Net
+  - Sheet "Detalle Gastos": Bank outflows enriched with invoice detail
+  - Sheet "Detalle Ingresos": Bank inflows enriched with invoice detail
+  - Sheet "Pendiente": Unpaid invoices (future obligations)
+  - Sheet "KPIs": Margins, ratios, MoM comparison
+  You MUST generate an Excel file — this is a report task.
+
+IMPORTANT: P&L numbers come from BANK TRANSACTIONS (real cash). Invoices add context only.""",
 
         "modelo_303": """\
 TASK-SPECIFIC GUIDANCE — MODELO 303 (IVA TRIMESTRAL):
@@ -918,6 +942,14 @@ STEP 4 — EXCEL REPORT (third run_code):
   - Sheet "Facturas Sin Match": remaining unmatched invoices
   - Sheet "Resumen": stats and insights from your exploration
   Color-code by confidence. You MUST generate an Excel file.
+
+MANDATORY KEYS FOR FRONTEND INTEGRATION:
+  Every row in "Matches Propuestos" MUST include these DynamoDB keys (needed to execute real reconciliations):
+  - invoice_categoryDate: the `categoryDate` field from User_Expenses (SK, format CATEGORY#YYYY-MM-DD#UUID)
+  - txn_SK: the `SK` field from Bank_Reconciliations (sort key of the bank transaction)
+  - invoice_userId: the `userId` (PK) of the invoice
+  - txn_userId: the `userId` (PK) of the bank transaction
+  These columns can be narrow/hidden but MUST be present. Without them the frontend cannot reconcile.
 
 IMPORTANT: Do NOT modify records. Only PROPOSE matches. The user reviews and approves.""",
     }
