@@ -31,7 +31,6 @@ from langfuse import observe
 from hackathon_backend.services.lambdas.agent.core.config import traced_completion, is_cancelled, CancelledError
 from hackathon_backend.services.lambdas.agent.core.query_agent import (
     _execute_query, _execute_code, _sanitize, _extract_source,
-    QUERY_AGENT_TOOLS, QUERY_AGENT_SYSTEM,
 )
 from hackathon_backend.services.lambdas.agent.core.unified_agent import (
     _safe_exec, _build_dataset_card, _validate_generated_files,
@@ -100,6 +99,8 @@ In run_code:
 - Helpers available: group_by(), monthly_totals(), top_n(), filter_items(), sum_field()
 - Libraries: pandas (pd), openpyxl, matplotlib (plt), numpy (np), json, Decimal, datetime
 - Assign results to `result` variable (dict with 'answer' key)
+- ALWAYS generate .xlsx (Excel) files using openpyxl, NEVER .csv
+- Save files to output_dir: f'{output_dir}/report.xlsx'
 
 YOUR SPECIFIC OBJECTIVE:
 {objective}
@@ -253,7 +254,7 @@ Focus ONLY on your objective — do not try to answer the full user question."""
                 )
 
                 if not exec_result["success"]:
-                    retry_key = f"{iteration}_run_code"
+                    retry_key = "run_code_failures"
                     code_retry_counts[retry_key] = code_retry_counts.get(retry_key, 0) + 1
                     if code_retry_counts[retry_key] >= 3:
                         messages.append({

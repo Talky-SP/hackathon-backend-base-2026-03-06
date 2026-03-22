@@ -28,7 +28,7 @@ from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
 )
 from hackathon_backend.services.lambdas.agent.core.data_catalog import (
-    get_projection_fields, build_projection_expression,
+    get_projection_fields, build_projection_expression, TABLE_CATALOG,
 )
 
 AWS_PROFILE = os.getenv("AWS_PROFILE", "")
@@ -143,6 +143,18 @@ def _execute_query(
     ddb = _get_dynamodb()
     full_table_name = f"{STAGE}_{table_name}"
     table = ddb.Table(full_table_name)
+
+    # Auto-correct pk_field based on table's actual PK from data_catalog
+    # LLM often says "userId" for tables that actually use "locationId"
+    if not index_name:  # Only for primary key queries, not GSIs
+        catalog_entry = TABLE_CATALOG.get(table_name, {})
+        actual_pk_name = catalog_entry.get("pk", pk_field)
+        if pk_field in ("userId", "locationId", "PK") and actual_pk_name in ("userId", "locationId"):
+            pk_field = actual_pk_name
+            import logging
+            logging.getLogger(__name__).info(
+                f"[dynamo_query] Auto-corrected pk_field to '{pk_field}' for {table_name}"
+            )
 
     # SECURITY: Always use location_id, never trust LLM-provided PK value
     # for userId/locationId fields

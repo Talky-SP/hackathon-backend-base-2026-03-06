@@ -55,7 +55,12 @@ _QUERY_CACHE_TTL = 600  # 10 minutes
 def _cache_query_results(chat_id: str, query_results: dict[str, dict]) -> None:
     if not chat_id or not query_results:
         return
-    _QUERY_CACHE[chat_id] = {"results": query_results, "ts": time.time()}
+    # Only cache queries that returned data (skip 0-item results)
+    useful = {k: v for k, v in query_results.items()
+              if v.get("count", len(v.get("items", []))) > 0}
+    if not useful:
+        return
+    _QUERY_CACHE[chat_id] = {"results": useful, "ts": time.time()}
     if len(_QUERY_CACHE) > 50:
         oldest = sorted(_QUERY_CACHE, key=lambda k: _QUERY_CACHE[k]["ts"])
         for k in oldest[:len(_QUERY_CACHE) - 50]:
@@ -235,8 +240,13 @@ _SAFE_BUILTINS = {
 }
 
 
-def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
-    """Execute code in a sandboxed environment with data injection."""
+def _safe_exec(code: str, query_results: dict, file_task_id: str,
+               existing_artifacts: list[dict] | None = None) -> dict:
+    """Execute code in a sandboxed environment with data injection.
+
+    existing_artifacts: list of {"filename": str, "path": str, "task_id": str}
+        from previous turns — accessible via existing_files dict in the sandbox.
+    """
     output_dir = os.path.join(ARTIFACTS_DIR, file_task_id)
     os.makedirs(output_dir, exist_ok=True)
     log.info(f"[_safe_exec] task={file_task_id}, output_dir={output_dir}, queries={list(query_results.keys())}")
@@ -277,23 +287,41 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str) -> dict:
     except ImportError:
         pass
 
-    # Restricted open() — only allows writing inside output_dir
+    # Restricted open() — write only in output_dir, read also from any artifact dir
     _real_open = open
-    _allowed_dir = os.path.normpath(output_dir)
+    _allowed_write_dir = os.path.normpath(output_dir)
+    _artifacts_root = os.path.normpath(ARTIFACTS_DIR)
 
     def _sandbox_open(path, mode="r", *args, **kwargs):
         norm = os.path.normpath(str(path))
-        if not norm.startswith(_allowed_dir):
+        is_read = not any(m in mode for m in ("w", "a", "x", "+"))
+        if is_read and norm.startswith(_artifacts_root):
+            # Allow reading any existing artifact (for edit workflows)
+            return _real_open(path, mode, *args, **kwargs)
+        if not norm.startswith(_allowed_write_dir):
             raise PermissionError(f"Cannot open '{path}' — use output_dir for file operations")
         return _real_open(path, mode, *args, **kwargs)
 
     builtins_with_open = {**_SAFE_BUILTINS, "open": _sandbox_open}
+
+    # Build existing_files map: {filename: absolute_path} for artifacts from previous turns
+    _existing_files: dict[str, str] = {}
+    for art in (existing_artifacts or []):
+        art_path = art.get("path", "")
+        if art_path and os.path.isfile(art_path):
+            _existing_files[art["filename"]] = art_path
+        else:
+            # Try to find in artifacts dir by task_id
+            candidate = os.path.join(ARTIFACTS_DIR, art.get("task_id", ""), art.get("filename", ""))
+            if os.path.isfile(candidate):
+                _existing_files[art["filename"]] = candidate
 
     safe_globals = {
         "__builtins__": builtins_with_open,
         # Data
         "data": query_results,
         "output_dir": output_dir,
+        "existing_files": _existing_files,  # {filename: path} — read-only access to previous artifacts
         "result": None,
         # Standard lib
         "json": json, "Decimal": Decimal,
@@ -599,6 +627,16 @@ run_code ENVIRONMENT:
 - Assign results to `result` variable (dict with 'answer', 'chart', 'sources').
 - Save files to output_dir: f'{output_dir}/report.xlsx'
 - NEVER use sample/dummy data. ALWAYS use data from `data` dict.
+
+FILE GENERATION & EDITING:
+- ALWAYS generate .xlsx (Excel) files, NEVER .csv. Users expect Excel format.
+- Use openpyxl to create workbooks. Save to f'{output_dir}/filename.xlsx'
+- Add headers, formatting, and multiple sheets when appropriate.
+- To EDIT a previously generated file: use run_code with `existing_files` dict.
+  `existing_files` maps filename → absolute path of artifacts from previous turns.
+  Example: `wb = openpyxl.load_workbook(existing_files['report.xlsx'])`
+  Then modify and save to output_dir: `wb.save(f'{output_dir}/report.xlsx')`
+  This is FASTER than edit_file. Prefer run_code for Excel edits.
 
 run_code RESULT FORMAT:
 ```python
@@ -1049,6 +1087,19 @@ def run_agent(
                         query_results = cached
                         log.info(f"[run_code] Loaded {len(cached)} cached queries for chat {chat_id}")
 
+                # If no data and code references data[], tell the LLM to query first
+                # But allow run_code without data for file editing (uses existing_files)
+                if not query_results and "data[" in code:
+                    log.warning(f"[run_code] No data available — telling LLM to query first")
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc_id,
+                        "content": json.dumps({
+                            "error": "NO DATA AVAILABLE. The data dict is empty — you must call dynamo_query first to fetch data before calling run_code. Call dynamo_query now.",
+                            "hint": "Call dynamo_query to fetch the data you need, then call run_code.",
+                        }),
+                    })
+                    continue
+
                 code_preview = code.strip().split("\n")[0][:80]
                 log.info(f"[run_code] Code:\n{code}")
                 emit("analyzing", {
@@ -1059,7 +1110,8 @@ def run_agent(
                     "query_counts": {k: v.get("count", 0) for k, v in query_results.items()},
                 })
 
-                exec_result = _safe_exec(code, query_results, file_task_id)
+                exec_result = _safe_exec(code, query_results, file_task_id,
+                                        existing_artifacts=artifacts)
                 elapsed_ms = exec_result.get("elapsed_ms", 0)
 
                 # Audit every execution
@@ -1071,8 +1123,8 @@ def run_agent(
                 )
 
                 if not exec_result["success"]:
-                    # Retry tracking
-                    retry_key = f"{iteration}_{fn_name}"
+                    # Retry tracking (global counter, not per-iteration)
+                    retry_key = "run_code_failures"
                     code_retry_counts[retry_key] = code_retry_counts.get(retry_key, 0) + 1
 
                     if code_retry_counts[retry_key] >= 3:
@@ -1101,9 +1153,40 @@ def run_agent(
                 result_val = exec_result.get("result")
                 generated_files = exec_result.get("files", [])
 
-                # Validate generated files
+                # Validate generated files — catch empty outputs
                 if generated_files:
                     generated_files = _validate_generated_files(generated_files)
+                    # If ALL files are invalid (empty), treat as failure
+                    if generated_files and all(not f.get("valid", True) for f in generated_files):
+                        retry_key = "run_code_failures"
+                        code_retry_counts[retry_key] = code_retry_counts.get(retry_key, 0) + 1
+                        warnings = "; ".join(f.get("warning", "empty file") for f in generated_files)
+                        log.warning(f"[run_code] All generated files are empty: {warnings}")
+                        if code_retry_counts[retry_key] >= 3:
+                            messages.append({
+                                "role": "tool", "tool_call_id": tc_id,
+                                "content": json.dumps({
+                                    "error": f"Files generated but ALL are empty: {warnings}",
+                                    "fatal": True,
+                                    "message": "Generated files have no data after 3 attempts. Check your data source — you may be reading from the wrong query key. Tell the user what went wrong.",
+                                }),
+                            })
+                            continue
+                        else:
+                            # Tell LLM which queries have data so it can fix
+                            data_summary = {k: v.get("count", len(v.get("items", [])))
+                                            for k, v in query_results.items()}
+                            messages.append({
+                                "role": "tool", "tool_call_id": tc_id,
+                                "content": json.dumps({
+                                    "error": f"Files generated but ALL are empty: {warnings}",
+                                    "attempt": code_retry_counts[retry_key],
+                                    "max_attempts": 3,
+                                    "available_data": data_summary,
+                                    "hint": "Your code produced empty files. Check which query key has data — look at available_data to find the correct key with items > 0. Fix the data source and try again.",
+                                }),
+                            })
+                            continue
 
                 # Handle files → artifacts
                 generated_filenames = []
