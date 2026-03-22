@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(aws cloudformation:*)",
-      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent; print\\(''OK''\\)\")"
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent; print\\(''OK''\\)\")",
+      "Bash(grep -E \"\\\\.py$\")"
     ]
   }
 }

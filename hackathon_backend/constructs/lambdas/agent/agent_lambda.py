@@ -82,6 +82,8 @@ class AgentLambda(Construct):
         ))
 
         # Grant DynamoDB read on all data tables (for the agent to query)
+        # Data tables use "{Stage}_{TableName}" naming (e.g. Dev_Bank_Reconciliations)
+        stage_prefix = config.stage.capitalize()  # "Dev", "Pre", "Prod"
         self.function.add_to_role_policy(iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
             actions=[
@@ -91,8 +93,8 @@ class AgentLambda(Construct):
                 "dynamodb:BatchGetItem",
             ],
             resources=[
-                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{config.resource_name('*')}",
-                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{config.resource_name('*')}/index/*",
+                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{stage_prefix}_*",
+                f"arn:aws:dynamodb:{config.region}:{config.account_id}:table/{stage_prefix}_*/index/*",
             ],
         ))
 
