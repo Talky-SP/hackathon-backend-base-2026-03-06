@@ -39,6 +39,37 @@ from hackathon_backend.services.lambdas.agent.core.code_runner import (
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Query results cache — reuse data across turns within the same chat
+# ---------------------------------------------------------------------------
+# Key: chat_id → {"results": {query_key: {...}}, "ts": timestamp}
+# TTL: 10 minutes — after that, data is considered stale
+_QUERY_CACHE: dict[str, dict] = {}
+_QUERY_CACHE_TTL = 600  # seconds
+
+
+def _cache_query_results(chat_id: str, query_results: dict[str, dict]) -> None:
+    """Save query results to cache for this chat."""
+    if not chat_id or not query_results:
+        return
+    _QUERY_CACHE[chat_id] = {"results": query_results, "ts": time.time()}
+    # Evict old entries (keep max 50 chats)
+    if len(_QUERY_CACHE) > 50:
+        oldest = sorted(_QUERY_CACHE, key=lambda k: _QUERY_CACHE[k]["ts"])
+        for k in oldest[:len(_QUERY_CACHE) - 50]:
+            del _QUERY_CACHE[k]
+
+
+def _get_cached_query_results(chat_id: str) -> dict[str, dict] | None:
+    """Retrieve cached query results for this chat if still fresh."""
+    if not chat_id or chat_id not in _QUERY_CACHE:
+        return None
+    entry = _QUERY_CACHE[chat_id]
+    if time.time() - entry["ts"] > _QUERY_CACHE_TTL:
+        del _QUERY_CACHE[chat_id]
+        return None
+    return entry["results"]
+
+# ---------------------------------------------------------------------------
 # Multimodal: supported MIME types for native LLM processing
 # ---------------------------------------------------------------------------
 _IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
@@ -247,6 +278,10 @@ FILE DATA: generate_file automatically injects ALL query data (full dataset, not
 preview you see). You do NOT need to pass data in data_json — just describe what file to create in \
 the prompt field. The sandbox receives data["query_1"]["items"] etc. with ALL records. \
 NEVER reference data with JS templates like ${...} — just describe the columns/format you want.
+DATA CACHE: Query results from recent turns are cached automatically. If the user asks to \
+generate a file with data you already queried recently (e.g., "ponlo en Excel"), you can call \
+generate_file directly — the cached data will be used. You do NOT need to re-query. \
+However, if more than 10 minutes have passed or the user asks for different data, query again.
 
 NUMBER FORMATTING: Use Spanish format in answer text (1.234,56 EUR). Keep raw numbers in chart data.
 TODAY'S DATE: 2026-03-21."""
@@ -685,6 +720,8 @@ def run_agent(
                     limit=args.get("limit"),
                 )
                 query_results[query_key] = result
+                # Cache for reuse in subsequent turns (e.g., "put that in Excel")
+                _cache_query_results(chat_id, query_results)
 
                 if result.get("success"):
                     emit("query_result", {
@@ -740,6 +777,13 @@ def run_agent(
                 })
 
             elif fn_name == "run_analysis":
+                # Load cached query results if none this turn
+                if not query_results:
+                    cached = _get_cached_query_results(chat_id)
+                    if cached:
+                        query_results = cached
+                        log.info(f"[run_analysis] Loaded {len(cached)} cached queries for chat {chat_id}")
+
                 code = args["code"]
                 code_preview = code.strip().split("\n")[0][:80]
                 emit("analyzing", {
@@ -779,6 +823,24 @@ def run_agent(
                     "task_id": file_task_id,
                 })
 
+                # If no queries this turn, try to load from cache (previous turns)
+                if not query_results:
+                    cached = _get_cached_query_results(chat_id)
+                    if cached:
+                        query_results = cached
+                        log.info(f"[generate_file] Loaded {len(cached)} cached queries for chat {chat_id}")
+                    else:
+                        tool_result = json.dumps({
+                            "error": True,
+                            "message": (
+                                "ERROR: No query data available and no cached data found. "
+                                "You must call dynamo_query first to fetch the data, "
+                                "then call generate_file again."
+                            ),
+                        })
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+                        continue
+
                 # CRITICAL: Pass FULL query data as base64-encoded JSON.
                 # The LLM's data_json is unreliable (JS templates, truncated, etc.)
                 # We encode full query_results as base64 — the DATA section will
@@ -788,44 +850,41 @@ def run_agent(
 
                 gen_prompt = args.get("prompt", "")
 
-                if query_results:
-                    # Build full dataset from all queries
-                    full_data = {}
-                    total_items = 0
-                    for qk, qv in query_results.items():
-                        full_data[qk] = {
-                            "items": qv.get("items", []),
-                            "count": qv.get("count", 0),
-                            "table": qv.get("table", ""),
-                        }
-                        total_items += len(qv.get("items", []))
+                # Build full dataset from all queries
+                full_data = {}
+                total_items = 0
+                for qk, qv in query_results.items():
+                    full_data[qk] = {
+                        "items": qv.get("items", []),
+                        "count": qv.get("count", 0),
+                        "table": qv.get("table", ""),
+                    }
+                    total_items += len(qv.get("items", []))
 
-                    data_json_bytes = json.dumps(full_data, ensure_ascii=False, default=str).encode("utf-8")
-                    data_b64 = _b64_gen.b64encode(data_json_bytes).decode()
+                data_json_bytes = json.dumps(full_data, ensure_ascii=False, default=str).encode("utf-8")
+                data_b64 = _b64_gen.b64encode(data_json_bytes).decode()
 
-                    # data_context = raw base64 string (nothing else)
-                    data_for_exec = data_b64
+                # data_context = raw base64 string (nothing else)
+                data_for_exec = data_b64
 
-                    # Prepend data loading instructions to the prompt
-                    gen_prompt = (
-                        f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
-                        f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
-                        f"Copy the ENTIRE content of the DATA section into a Python variable and decode it:\n"
-                        f"```python\n"
-                        f"import json, base64\n"
-                        f"# The DATA section below contains the raw base64 string — copy it all\n"
-                        f"raw_b64 = \"\"\"<paste entire DATA section here>\"\"\"\n"
-                        f"data = json.loads(base64.b64decode(raw_b64))\n"
-                        f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
-                        f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
-                        f"```\n"
-                        f"The DATA section contains {total_items} real items from the database.\n"
-                        f"NEVER use sample/dummy/fake data. NEVER create example data. Use ONLY the decoded data.\n"
-                        f"NEVER limit to a subset — use ALL {total_items} items.\n\n"
-                        f"TASK:\n{args.get('prompt', '')}"
-                    )
-                else:
-                    data_for_exec = args.get("data_json", "")
+                # Prepend data loading instructions to the prompt
+                gen_prompt = (
+                    f"IMPORTANT — DATA LOADING (YOU MUST DO THIS FIRST):\n"
+                    f"The full dataset ({total_items} items) is in the DATA section below as a raw base64 string.\n"
+                    f"Copy the ENTIRE content of the DATA section into a Python variable and decode it:\n"
+                    f"```python\n"
+                    f"import json, base64\n"
+                    f"# The DATA section below contains the raw base64 string — copy it all\n"
+                    f"raw_b64 = '<entire content of DATA section>'\n"
+                    f"data = json.loads(base64.b64decode(raw_b64))\n"
+                    f"# data is a dict: {{'query_1': {{'items': [...], 'count': N, 'table': 'TableName'}}, ...}}\n"
+                    f"# Use: items = data['query_1']['items']  # list of {total_items} dicts\n"
+                    f"```\n"
+                    f"The DATA section contains {total_items} real items from the database.\n"
+                    f"NEVER use sample/dummy/fake data. NEVER create example data. Use ONLY the decoded data.\n"
+                    f"NEVER limit to a subset — use ALL {total_items} items.\n\n"
+                    f"TASK:\n{args.get('prompt', '')}"
+                )
 
                 code_result = _native_code_exec(
                     prompt=gen_prompt,
