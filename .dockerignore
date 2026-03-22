@@ -1,0 +1,13 @@
+cdk.out
+.venv
+.git
+__pycache__
+*.pyc
+node_modules
+tests
+docs
+scripts
+.claude
+*.md
+cdk.json
+source.bat

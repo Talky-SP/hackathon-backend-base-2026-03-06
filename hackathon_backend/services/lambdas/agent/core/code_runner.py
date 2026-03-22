@@ -572,6 +572,15 @@ IMPORTANT RULES:
 6. Currency format: #,##0.00 € (EUR)
 7. Return structured JSON results alongside Excel files
 8. Handle edge cases (empty data, missing fields) gracefully
+
+DATA LOADING:
+- Data is provided as base64-encoded JSON in the DATA section (variable FULL_DATA_B64).
+- ALWAYS decode it first:
+  import json, base64
+  data = json.loads(base64.b64decode(FULL_DATA_B64))
+- data is a dict: {"query_1": {"items": [...], "count": N, "table": "TableName"}, ...}
+- Use ALL items from each query. NEVER use sample/dummy data. NEVER limit to a subset.
+- If FULL_DATA_B64 is not present, the data may be inline JSON — parse it directly.
 """
 
 

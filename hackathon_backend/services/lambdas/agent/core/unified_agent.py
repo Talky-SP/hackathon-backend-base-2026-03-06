@@ -241,11 +241,12 @@ result = {
 ```
 
 IMPORTANT: When user asks for a downloadable file (Excel, CSV, PDF), you MUST call generate_file \
-directly with the data. Do NOT use run_analysis to produce an "answer" — that will end the \
-conversation without creating a file. Instead: dynamo_query → generate_file (pass data as data_json).
-NOTE: generate_file automatically injects ALL query_results (full dataset, not just the 50-item preview). \
-In your generate_file prompt, tell the code to use data["query_results"]["query_N"]["items"] for the \
-complete data. NEVER tell the code to use only 50 items or a subset — always process ALL items.
+directly. Do NOT use run_analysis to produce an "answer" — that will end the conversation without \
+creating a file. Instead: dynamo_query → generate_file.
+FILE DATA: generate_file automatically injects ALL query data (full dataset, not just the 50-item \
+preview you see). You do NOT need to pass data in data_json — just describe what file to create in \
+the prompt field. The sandbox receives data["query_1"]["items"] etc. with ALL records. \
+NEVER reference data with JS templates like ${...} — just describe the columns/format you want.
 
 NUMBER FORMATTING: Use Spanish format in answer text (1.234,56 EUR). Keep raw numbers in chart data.
 TODAY'S DATE: 2026-03-21."""
@@ -447,10 +448,11 @@ UNIFIED_TOOLS = [
                 "Generate Excel/CSV/chart files using AI code execution sandbox. "
                 "The AI writes and runs Python code (openpyxl, pandas, matplotlib). "
                 "Use for downloadable reports, exports, detailed Excel files. "
-                "NOTE: All query_results data is automatically injected — the code execution "
-                "sandbox receives the FULL dataset (not just the 50-item preview you see). "
-                "The data is available as data['query_results']['query_N']['items']. "
-                "Always use ALL items from query_results, never limit to a subset."
+                "NOTE: All query data is AUTOMATICALLY injected as base64-encoded JSON — "
+                "the sandbox receives the FULL dataset (all items, not the 50 you see). "
+                "You do NOT need to pass the data yourself in data_json. "
+                "Just describe what file to create in the prompt. "
+                "The sandbox decodes data['query_N']['items'] with ALL records."
             ),
             "parameters": {
                 "type": "object",
@@ -777,31 +779,56 @@ def run_agent(
                     "task_id": file_task_id,
                 })
 
-                # CRITICAL: Pass FULL query data, not just the 50 slim items the LLM saw.
-                # The LLM's data_json often only contains the slim subset it received.
-                # We inject all query_results so code execution has the complete dataset.
-                data_for_exec = args.get("data_json", "")
+                # CRITICAL: Pass FULL query data as base64-encoded JSON file.
+                # The LLM's data_json is unreliable (JS templates, truncated, etc.)
+                # We encode full query_results as base64 — same pattern as edit_file.
+                import base64 as _b64_gen
+
+                gen_prompt = args.get("prompt", "")
+
                 if query_results:
+                    # Build full dataset from all queries
                     full_data = {}
+                    total_items = 0
                     for qk, qv in query_results.items():
                         full_data[qk] = {
                             "items": qv.get("items", []),
                             "count": qv.get("count", 0),
                             "table": qv.get("table", ""),
                         }
-                    # Merge: LLM's data_json as "prompt_data", full queries as "query_results"
-                    try:
-                        llm_data = json.loads(data_for_exec) if data_for_exec else {}
-                    except (json.JSONDecodeError, TypeError):
-                        llm_data = {"raw": data_for_exec} if data_for_exec else {}
-                    merged = {
-                        "prompt_data": llm_data,
-                        "query_results": full_data,
-                    }
-                    data_for_exec = json.dumps(merged, ensure_ascii=False, default=str)
+                        total_items += len(qv.get("items", []))
+
+                    data_json_bytes = json.dumps(full_data, ensure_ascii=False, default=str).encode("utf-8")
+                    data_b64 = _b64_gen.b64encode(data_json_bytes).decode()
+
+                    # Build data_context with base64 data
+                    data_for_exec = json.dumps({
+                        "FULL_DATA_B64": data_b64,
+                        "total_items": total_items,
+                        "queries": {k: {"count": v["count"], "table": v["table"]} for k, v in full_data.items()},
+                    }, ensure_ascii=False)
+
+                    # Prepend data loading instructions to the prompt
+                    gen_prompt = (
+                        f"IMPORTANT — DATA LOADING:\n"
+                        f"The full dataset ({total_items} items) is provided as base64-encoded JSON.\n"
+                        f"You MUST decode it FIRST before doing anything else:\n"
+                        f"```python\n"
+                        f"import json, base64\n"
+                        f"data = json.loads(base64.b64decode(FULL_DATA_B64))\n"
+                        f"# data is a dict with keys like 'query_1', 'query_2', etc.\n"
+                        f"# Each has: {{'items': [...], 'count': N, 'table': 'TableName'}}\n"
+                        f"# Example: all_items = data['query_1']['items']  # list of {total_items} dicts\n"
+                        f"```\n"
+                        f"NEVER use sample/dummy data. NEVER limit to a subset. Use ALL {total_items} items.\n"
+                        f"The variable FULL_DATA_B64 is available in the DATA section below.\n\n"
+                        f"TASK:\n{args.get('prompt', '')}"
+                    )
+                else:
+                    data_for_exec = args.get("data_json", "")
 
                 code_result = _native_code_exec(
-                    prompt=args.get("prompt", ""),
+                    prompt=gen_prompt,
                     model_id=model_id,
                     data_context=data_for_exec,
                     task_id=file_task_id,
