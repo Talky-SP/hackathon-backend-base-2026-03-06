@@ -265,11 +265,14 @@ def run_subagent(
     query_counter = 0
     code_retry_counts: dict[str, int] = {}
 
+    doc_filenames = [os.path.basename(p) for p in doc_paths]
     log.info(f"[subagent:{subagent_id}] Starting: {objective[:100]}, docs={len(doc_paths)}, model={model_id}")
     emit("subagent_start", {
         "subagent_id": subagent_id,
+        "message": f"Subagente {subagent_id}: procesando {len(doc_paths)} documentos",
         "objective": objective[:200],
         "doc_count": len(doc_paths),
+        "documents": doc_filenames,
     })
 
     # Build messages
@@ -306,7 +309,10 @@ def run_subagent(
 
         emit("subagent_thinking", {
             "subagent_id": subagent_id,
+            "message": f"Subagente {subagent_id}: iteracion {iteration + 1}",
             "iteration": iteration + 1,
+            "max_iterations": max_iterations,
+            "cost_usd": round(cost_usd, 4),
         })
 
         response = traced_completion(
@@ -370,6 +376,7 @@ def run_subagent(
                 log.info(f"[subagent:{subagent_id}] dynamo_query: {table_name}")
                 emit("subagent_query", {
                     "subagent_id": subagent_id,
+                    "message": f"Subagente {subagent_id}: consultando {table_name}",
                     "table": table_name,
                     "query_key": query_key,
                 })
@@ -403,6 +410,7 @@ def run_subagent(
                 log.info(f"[subagent:{subagent_id}] run_code: {code[:100]}...")
                 emit("subagent_code", {
                     "subagent_id": subagent_id,
+                    "message": f"Subagente {subagent_id}: ejecutando codigo",
                     "code_preview": code[:200],
                 })
 
@@ -542,10 +550,11 @@ def dispatch_subagents(
              f"budget=${budget_per_subagent:.2f}/agent, model={model_id}")
 
     emit("dispatch_start", {
+        "message": f"Lanzando {len(subtasks)} subagentes para {total_docs} documentos (max {max_parallel} en paralelo)",
         "subagent_count": len(subtasks),
         "total_documents": total_docs,
         "max_parallel": max_parallel,
-        "budget_per_subagent": budget_per_subagent,
+        "budget_per_subagent": round(budget_per_subagent, 3),
     })
 
     results: list[dict] = []
@@ -577,8 +586,10 @@ def dispatch_subagents(
                 results.append(result)
                 emit("subagent_complete", {
                     "subagent_id": result["subagent_id"],
+                    "message": f"Subagente {result['subagent_id']} completado ({len(results)}/{len(subtasks)})",
                     "success": result["success"],
                     "cost_usd": result["cost_usd"],
+                    "iterations": result["iterations"],
                     "completed": len(results),
                     "total": len(subtasks),
                 })
@@ -613,12 +624,13 @@ def dispatch_subagents(
 
     log.info(f"[dispatch] {summary}")
     emit("dispatch_complete", {
+        "message": summary,
         "success": len(successful) > 0,
         "total_subagents": len(subtasks),
         "successful": len(successful),
         "failed": len(failed),
-        "total_cost_usd": total_cost,
-        "elapsed_s": elapsed_s,
+        "total_cost_usd": round(total_cost, 4),
+        "elapsed_s": round(elapsed_s, 1),
     })
 
     return {

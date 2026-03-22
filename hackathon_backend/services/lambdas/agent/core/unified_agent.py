@@ -1458,39 +1458,96 @@ def run_agent(
                     on_event=emit,
                 )
 
-                # Collect artifacts from subagents
+                # Collect artifacts and usage from subagents
                 for sr in dispatch_result.get("subagent_results", []):
                     for art in sr.get("artifacts", []):
                         artifacts.append(art)
                     usage_records.extend(sr.get("usage", []))
 
-                # Build summary for LLM — include all extracted data
+                # Store FULL subagent results in query_results so run_code can access them
+                # (keeps them OUT of the LLM context but available for code execution)
+                all_extracted = []
                 subagent_summaries = []
                 for sr in dispatch_result.get("subagent_results", []):
+                    sa_id = sr["subagent_id"]
                     sa_summary = {
-                        "subagent_id": sr["subagent_id"],
+                        "subagent_id": sa_id,
                         "success": sr["success"],
                         "cost_usd": sr["cost_usd"],
                         "iterations": sr["iterations"],
                     }
                     if sr.get("error"):
                         sa_summary["error"] = sr["error"]
-                    if sr.get("result"):
-                        sa_summary["result"] = sr["result"]
+
+                    # Extract compact summary for LLM (not full data)
+                    result_data = sr.get("result") or {}
+                    if isinstance(result_data, dict):
+                        extracted = result_data.get("extracted_data", [])
+                        all_extracted.extend(extracted)
+                        sa_summary["documents_processed"] = len(extracted)
+                        sa_summary["total_amount"] = sum(
+                            d.get("total", 0) or 0 for d in extracted if isinstance(d, dict)
+                        )
+                        # Compact preview: filename + total + matched status
+                        sa_summary["documents"] = [
+                            {
+                                "filename": d.get("filename", "?"),
+                                "supplier": d.get("supplier", "?"),
+                                "total": d.get("total"),
+                                "date": d.get("date"),
+                                "matched": d.get("matched_db_record") is not None,
+                                "issues": d.get("issues", []),
+                            }
+                            for d in extracted[:20]  # cap at 20 per subagent
+                        ]
+                        if result_data.get("issues"):
+                            sa_summary["issues"] = result_data["issues"]
                     subagent_summaries.append(sa_summary)
 
+                # Store full extracted data in query_results for run_code access
+                query_counter += 1
+                subagent_data_key = f"subagent_results"
+                query_results[subagent_data_key] = {
+                    "items": all_extracted,
+                    "count": len(all_extracted),
+                    "table": "subagent_extracted_data",
+                    "success": True,
+                }
+                _cache_query_results(chat_id, query_results)
+
+                # Emit detailed progress for frontend
+                for sa_sum in subagent_summaries:
+                    emit("subagent_result", {
+                        "subagent_id": sa_sum["subagent_id"],
+                        "success": sa_sum["success"],
+                        "documents_processed": sa_sum.get("documents_processed", 0),
+                        "total_amount": sa_sum.get("total_amount", 0),
+                        "cost_usd": sa_sum.get("cost_usd", 0),
+                        "documents": sa_sum.get("documents", []),
+                    })
+
+                # Build COMPACT tool response for LLM (not the full data)
                 tool_response = {
                     "success": dispatch_result["success"],
                     "summary": dispatch_result["summary"],
                     "total_cost_usd": dispatch_result["total_cost_usd"],
                     "documents_processed": dispatch_result["documents_processed"],
+                    "total_extracted": len(all_extracted),
                     "subagent_results": subagent_summaries,
+                    "data_access": (
+                        f"Full extracted data stored in data['{subagent_data_key}']['items'] "
+                        f"({len(all_extracted)} documents). Use run_code to process them."
+                    ),
                 }
 
                 emit("subagents_done", {
                     "message": dispatch_result["summary"],
                     "success": dispatch_result["success"],
+                    "subagent_count": len(subtasks),
+                    "documents_processed": len(all_extracted),
                     "total_cost": dispatch_result["total_cost_usd"],
+                    "elapsed_s": dispatch_result.get("elapsed_s"),
+                    "subagents": subagent_summaries,
                 })
 
                 messages.append({
