@@ -1542,12 +1542,30 @@ def run_agent(
                         "documents": sa_sum.get("documents", []),
                     })
 
-                # Build data preview for LLM so it knows the structure
-                data_preview = ""
-                if all_extracted:
+                # Build explicit data preview and code example for LLM
+                data_preview_str = ""
+                sample_keys = []
+                if all_extracted and isinstance(all_extracted[0], dict):
                     sample = all_extracted[0]
-                    if isinstance(sample, dict):
-                        data_preview = f"Sample item keys: {list(sample.keys())}\nSample: {json.dumps(sample, ensure_ascii=False, default=str)[:500]}"
+                    sample_keys = list(sample.keys())
+                    # Truncate long values in sample for display
+                    clean_sample = {}
+                    for k, v in sample.items():
+                        if isinstance(v, (list, dict)):
+                            clean_sample[k] = f"[{len(v)} items]" if isinstance(v, list) else "{...}"
+                        else:
+                            clean_sample[k] = v
+                    data_preview_str = json.dumps(clean_sample, ensure_ascii=False, default=str)
+
+                code_example = (
+                    f"# CORRECT way to access the data:\n"
+                    f"invoices = data['subagent_results']['items']  # FLAT list of {len(all_extracted)} invoice dicts\n"
+                    f"# Each item is a dict with keys: {sample_keys}\n"
+                    f"# Example:\n"
+                    f"for inv in invoices:\n"
+                    f"    print(inv.get('filename'), inv.get('supplier'), inv.get('total'))\n"
+                    f"# DO NOT nest loops — items is NOT grouped by subagent"
+                )
 
                 tool_response = {
                     "success": dispatch_result["success"],
@@ -1556,11 +1574,13 @@ def run_agent(
                     "documents_processed": dispatch_result["documents_processed"],
                     "total_extracted": len(all_extracted),
                     "subagent_results": subagent_summaries,
-                    "data_access": (
-                        f"ALL {len(all_extracted)} extracted documents stored in data['{subagent_data_key}']['items']. "
-                        f"Use run_code to access: items = data['{subagent_data_key}']['items']"
-                    ),
-                    "data_preview": data_preview,
+                    "HOW_TO_ACCESS_DATA": code_example,
+                    "data_structure": {
+                        "path": f"data['subagent_results']['items']",
+                        "type": f"FLAT list of {len(all_extracted)} dicts (one per invoice)",
+                        "item_keys": sample_keys,
+                        "sample_item": data_preview_str,
+                    },
                 }
 
                 emit("subagents_done", {
