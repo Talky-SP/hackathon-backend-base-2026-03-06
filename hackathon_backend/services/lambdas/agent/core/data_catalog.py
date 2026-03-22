@@ -465,6 +465,12 @@ _RESERVED_WORDS = {
     "date", "comment", "data", "source", "position", "role", "location",
     "number", "size", "time", "year", "month", "day", "hour", "minute",
     "second", "action", "domain", "limit", "order", "by",
+    # Financial fields that are DynamoDB reserved words
+    "total", "amount", "percent", "sum", "index", "table", "all",
+    "between", "group", "level", "range", "select", "set", "user",
+    "zone", "replace", "exists", "values", "abort", "absolute",
+    "language", "both", "transaction", "condition", "exchange",
+    "primary", "global", "last", "first", "next", "end", "start",
 }
 
 
