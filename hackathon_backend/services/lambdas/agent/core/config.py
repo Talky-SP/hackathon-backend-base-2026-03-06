@@ -18,8 +18,8 @@ litellm.drop_params = True
 # ---------------------------------------------------------------------------
 _secrets_cache: dict[str, dict] = {}
 
-AWS_PROFILE = os.getenv("AWS_PROFILE", "hackathon-equipo1")
-AWS_REGION = os.getenv("AWS_REGION", "eu-west-3")
+AWS_PROFILE = os.getenv("AWS_PROFILE", "")  # Empty in Lambda (uses IAM role), set locally
+AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_REGION_NAME", "eu-west-3"))
 
 SECRET_NAMES = {
     "vertex_ai": "talky/vertex-ai",
@@ -31,7 +31,10 @@ SECRET_NAMES = {
 
 
 def _get_sm_client():
-    session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
+    kwargs = {"region_name": AWS_REGION}
+    if AWS_PROFILE:
+        kwargs["profile_name"] = AWS_PROFILE
+    session = boto3.Session(**kwargs)
     return session.client("secretsmanager")
 
 

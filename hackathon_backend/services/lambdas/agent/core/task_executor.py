@@ -848,10 +848,11 @@ TASK-SPECIFIC GUIDANCE — BANK RECONCILIATION (CONCILIACION BANCARIA):
 Automatically match unreconciled bank transactions with unreconciled invoices/payrolls.
 
 Steps:
-1. Query Bank_Reconciliations by PK (locationId). Filter unreconciled:
-   Use filter_expression: [{"field": "reconciled", "op": "ne", "value": true}]
-   OR use LocationByStatusDate GSI with SK begins_with "PENDING".
-2. Query User_Expenses by PK. In run_analysis filter items where reconciled is None/False.
+1. Query ALL Bank_Reconciliations by PK (locationId) — NO filter, NO GSI.
+   IMPORTANT: Unreconciled txns (status=PENDING) do NOT have the `reconciled` field at all,
+   and are NOT indexed in LocationByStatusDate GSI. You MUST query all, then filter in run_analysis.
+   In code: unreconciled = [t for t in txns if t.get('status') != 'MATCHED']
+2. Query User_Expenses by PK. In run_analysis filter items where reconciled is None/missing.
 3. Query User_Invoice_Incomes by PK. Same filter for unreconciled.
 4. In run_analysis, implement matching algorithm:
 

@@ -28,8 +28,8 @@ from hackathon_backend.services.lambdas.agent.core.code_runner import (
     run_code_execution as _native_code_exec, CODE_EXEC_SYSTEM,
 )
 
-AWS_PROFILE = os.getenv("AWS_PROFILE", "hackathon-equipo1")
-AWS_REGION = os.getenv("AWS_REGION", "eu-west-3")
+AWS_PROFILE = os.getenv("AWS_PROFILE", "")
+AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_REGION_NAME", "eu-west-3"))
 
 _dynamodb = None
 
@@ -37,7 +37,10 @@ _dynamodb = None
 def _get_dynamodb():
     global _dynamodb
     if _dynamodb is None:
-        session = boto3.Session(profile_name=AWS_PROFILE, region_name=AWS_REGION)
+        kwargs = {"region_name": AWS_REGION}
+        if AWS_PROFILE:
+            kwargs["profile_name"] = AWS_PROFILE
+        session = boto3.Session(**kwargs)
         _dynamodb = session.resource("dynamodb")
     return _dynamodb
 

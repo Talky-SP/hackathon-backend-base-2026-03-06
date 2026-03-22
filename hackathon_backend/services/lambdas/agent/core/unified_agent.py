@@ -233,19 +233,23 @@ RULES:
 
 BANK RECONCILIATION RULES:
 - Bank_Reconciliations is the source of truth for real bank movements.
-- Each bank transaction has a `reconciled` field (Boolean): true=matched, false/missing=unreconciled.
-- `status` field: PENDING (not yet processed), MATCHED (reconciled), UNMATCHED (reviewed but no match).
-- To find UNRECONCILED transactions: filter where reconciled is false/missing OR status != "MATCHED".
+- IMPORTANT DATA REALITY:
+  * Reconciled transactions (179): have status=MATCHED, reconciled=True, and status_date field populated.
+  * Unreconciled transactions (251): have status=PENDING, and DO NOT have the `reconciled` field at all \
+(the field is MISSING, NOT false). They also lack `status_date`, so the LocationByStatusDate GSI \
+DOES NOT index them.
+- HOW TO QUERY:
+  * ALL transactions: query by PK=locationId (no GSI, no filter) → returns all 430.
+  * Only RECONCILED: filter status="MATCHED" or reconciled=True.
+  * Only UNRECONCILED: filter status="PENDING". Do NOT filter by reconciled=false (field doesn't exist \
+on unreconciled items). Alternatively: query ALL, then in run_analysis filter by status != "MATCHED".
+  * DO NOT use LocationByStatusDate GSI for unreconciled — those items are not indexed there.
 - To find which invoice matches a transaction: check `matched_expense_id` or `matched_invoice_id`.
-- Invoices (User_Expenses, User_Invoice_Incomes) also have `reconciled` (Boolean) and `matched_transaction_id`.
 - RECONCILIATION MATCHING: To propose reconciliation between invoices and bank transactions:
-  1. Query Bank_Reconciliations with filter reconciled=false (or status=PENDING) → unmatched txns
-  2. Query User_Expenses and/or User_Invoice_Incomes with filter reconciled=false → unmatched invoices
-  3. In run_analysis, match by: amount (txn.amount ≈ -invoice.total for expenses, txn.amount ≈ invoice.total for incomes),
-     date proximity (bookingDate near charge_date/due_date), and vendor/client CIF (ai_enrichment.vendor_cif = supplier_cif).
+  1. Query ALL Bank_Reconciliations (no filter) → then filter status="PENDING" in run_analysis
+  2. Query User_Expenses and/or User_Invoice_Incomes → then filter unreconciled in run_analysis
+  3. In run_analysis, match by: amount, date proximity, and vendor/client CIF.
   4. Present matches with confidence score: exact amount+CIF = high, amount only = medium, date only = low.
-- Use UserByReconStateDate GSI: SK begins_with "U#" for unreconciled, "R#" for reconciled invoices.
-- For unreconciled invoice count: query with SK begins_with "U#" on UserByReconStateDate GSI.
 
 - ALWAYS respond in the same language the user writes in.
 - Be precise with numbers. Use EUR formatting (€) and Spanish number format (1.234,56).
