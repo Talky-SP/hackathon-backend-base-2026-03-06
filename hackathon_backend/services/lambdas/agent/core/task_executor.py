@@ -805,39 +805,34 @@ def _get_task_guidance(task_type: str) -> str:
     """Return task-specific instructions for the AI planner."""
     guidance = {
         "cash_flow_forecast": """\
-TASK-SPECIFIC GUIDANCE — CASH FLOW FORECAST (EXPLORATORIO):
-You are a treasury analyst. Build a realistic 13-week forecast by understanding cash patterns.
+TASK-SPECIFIC GUIDANCE — CASH FLOW FORECAST (WORLD-CLASS TREASURY):
+You are the best financial analyst in the world. Build a forecast a CFO would trust.
 
-STEP 1 — FETCH DATA (parallel queries):
-  - Bank_Reconciliations by PK — ALL transactions (source of truth)
-  - User_Expenses by PK — pending invoices = known future outflows
+STEP 1 — FETCH (parallel): Bank_Reconciliations + User_Expenses (pending = future outflows)
 
-STEP 2 — EXPLORE PATTERNS (first run_code):
-  - Group bank txns by week. Separate inflows (amount>0) vs outflows (amount<0).
-  - Classify by ai_enrichment.payment_type/category:
-    * Recurring: rent, salaries, subscriptions (predictable)
-    * Variable: supplier payments (irregular)
-    * One-off: large unusual transactions (exclude from averages)
-  - Detect trends and seasonality. Find current bank balance.
-  - List pending invoices (reconciled != True) as future outflows.
-  DO NOT set result here. Continue to STEP 3.
+STEP 2 — DEEP EXPLORATION (first run_code):
+  - Weekly time series: inflows, outflows, net, running balance
+  - Classify txns (ai_enrichment): recurring vs variable vs one-off
+  - Detect trends (MoM growth), seasonality, burn rate, runway
+  - Pending invoices by due_date = known future outflows
+  DO NOT set result. Continue.
 
-STEP 3 — BUILD FORECAST (second run_code):
-  - Recurring items: project at their usual timing/amount
-  - Variable items: weighted weekly averages (recent weeks > older)
-  - Pending invoices: schedule by due_date or estimated payment delay
-  - Safety: exclude one-offs, reduce inflows 10%, increase outflows 5%
-  - Week-by-week: opening balance → inflows → outflows → closing balance
-  - Flag weeks with negative or low balance
-  DO NOT set result here. Continue to STEP 4.
+STEP 3 — INTELLIGENT FORECAST (second run_code):
+  - Recurring: project at historical frequency/amount with trend
+  - Variable: exponentially weighted averages (recent > older)
+  - Pending invoices: place by due_date or supplier's avg delay
+  - THREE SCENARIOS: Optimista (+15% in, -5% out), Base, Pesimista (-15% in, +10% out)
+  - Risk: min balance, tightest week, runway days
+  DO NOT set result. Continue.
 
-STEP 4 — GENERATE EXCEL (third run_code):
-  - Sheet "Forecast 13 Semanas": weekly table with inflows, outflows, net, balance
-  - Sheet "Detalle Categorias": flows by category
-  - Sheet "Pagos Pendientes": pending invoices hitting the forecast period
-  - Sheet "Historico": historical weekly data used as basis
-  Include line chart of projected balance. Color-code risk weeks.
-  You MUST generate an Excel file.
+STEP 4 — EXCEL + CHART (third run_code):
+  Excel: Forecast (3 scenarios), Categorias, Pagos Pendientes, Historico, Resumen Ejecutivo
+  CHART: use SEPARATE datasets for historical vs projected:
+    Dataset "Histórico": past weekly balances + nulls for future
+    Dataset "Proyección Base": nulls for past + forecasted balances
+    Dataset "Escenario Pesimista": nulls for past + pessimistic balances
+  They overlap at current week. Frontend renders each in different color.
+  You MUST generate Excel. Set result only here.
 
 DO NOT use pandas. Use basic Python. Complete ALL steps. Set result only in STEP 4.""",
 

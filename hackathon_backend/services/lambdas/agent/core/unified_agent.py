@@ -310,6 +310,7 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
     # Safe __import__ — only allow pre-loaded modules (no arbitrary imports)
     _allowed_modules = set(injected.keys()) | {
         "json", "datetime", "collections", "decimal", "math", "re", "statistics",
+        "time", "_strptime",  # needed internally by datetime.strptime()
         "openpyxl", "openpyxl.styles", "openpyxl.utils", "openpyxl.chart",
         "openpyxl.chart.label", "openpyxl.chart.series",
         "openpyxl.formatting", "openpyxl.formatting.rule",
@@ -369,6 +370,7 @@ def _safe_exec(code: str, query_results: dict, file_task_id: str,
     except Exception as e:
         elapsed_ms = int((time.time() - t0) * 1000)
         log.error(f"[_safe_exec] FAILED after {elapsed_ms}ms: {type(e).__name__}: {e}")
+        print(f"[_safe_exec] FAILED: {type(e).__name__}: {e}", flush=True)
         return {
             "success": False, "result": None, "files": [],
             "error": f"{type(e).__name__}: {e}", "elapsed_ms": elapsed_ms,
@@ -673,6 +675,11 @@ result = {
     "sources": [{"categoryDate": "...", "supplier": "...", "total": 123.45}]
 }
 ```
+CHART TIPS:
+- For forecasts/predictions: use SEPARATE datasets for historical vs projected data.
+  Dataset 1 "Histórico": real past data + nulls for future. Dataset 2 "Proyección": nulls for past + projected.
+  They overlap at the current point. The frontend renders each dataset in a different color.
+- Keep sources concise: only include the most relevant items (top errors, key metrics), NOT all raw data.
 
 RULES:
 - Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex (NOT UserIdPnlDateIndex, pnl_date is often null).

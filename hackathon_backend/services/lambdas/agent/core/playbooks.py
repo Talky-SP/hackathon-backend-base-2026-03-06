@@ -477,72 +477,126 @@ Analyze profitability by client, category, or period.
     "prediccion_cashflow": {
         "name": "Prediccion de Cash Flow",
         "guidance": """\
-PLAYBOOK — PREDICCION DE CASHFLOW EXPLORATORIA:
-You are a treasury analyst. Build a realistic 13-week cash flow forecast by UNDERSTANDING
-the business patterns, not just averaging numbers.
+PLAYBOOK — PREDICCION DE CASHFLOW (WORLD-CLASS TREASURY ANALYSIS):
+You are the best financial analyst and data scientist in the world. Your cash flow forecasts
+are famous for being accurate, insightful, and actionable. You don't just average numbers —
+you UNDERSTAND the business, detect patterns, and build intelligent projections.
 
 STEP 1 — FETCH DATA (parallel queries):
-  - Bank_Reconciliations by PK — ALL bank transactions (source of truth for cash)
-  - User_Expenses by PK — ALL invoices (for pending payments = future outflows)
+  - Bank_Reconciliations by PK — ALL bank transactions (the ground truth)
+  - User_Expenses by PK — ALL invoices (pending = known future outflows)
 
-STEP 2 — EXPLORE CASH PATTERNS (first run_code):
-  UNDERSTAND the cash flow dynamics before projecting:
-  - Group transactions by week (bookingDate). How many weeks of history?
-  - Separate inflows (amount > 0) vs outflows (amount < 0) per week.
-  - Use ai_enrichment.payment_type and ai_enrichment.category to classify:
-    * Recurring outflows: rent, salaries, subscriptions (predictable, repeat monthly)
-    * Variable outflows: supplier payments (irregular, tied to invoices)
-    * Recurring inflows: client payments, subscriptions
-    * One-off items: large unusual transactions (should NOT repeat in forecast)
-  - Identify seasonality: are some months heavier than others?
-  - Detect trends: are inflows/outflows growing, declining, or stable?
-  - Find the latest bank balance (cumulative sum of all transactions).
-  - List pending invoices (reconciled != True) — these are FUTURE outflows.
-  DO NOT set `result` here. You MUST continue to STEP 3.
+STEP 2 — DEEP FINANCIAL EXPLORATION (first run_code):
+  Think like a CFO studying their treasury. EXPLORE creatively:
 
-STEP 3 — BUILD FORECAST (second run_code):
-  Use your exploration insights to build an intelligent forecast:
+  CASH FLOW ANATOMY:
+  - Group all transactions by week (bookingDate). Build a complete weekly time series.
+  - Separate: inflows (amount > 0), outflows (amount < 0), net per week.
+  - Calculate running balance week by week. What's the current position?
 
-  a) RECURRING ITEMS (high confidence):
-     - Identify payments that repeat monthly (same merchant/description ± similar amount)
-     - Project these at their usual timing and amount
-     - Examples: rent, salaries, insurance, software subscriptions
+  PATTERN RECOGNITION:
+  - Use ai_enrichment (payment_type, category, vendor_cif) to classify each transaction.
+  - Identify RECURRING payments: same merchant + similar amount repeating monthly.
+    (rent, salaries, social security, insurance, software, subscriptions)
+  - Identify VARIABLE flows: supplier payments that vary in timing and amount.
+  - Identify ONE-OFF transactions: unusually large amounts that won't repeat.
+    (capital injections, one-time purchases, extraordinary items)
+  - Look at DESCRIPTIONS/MERCHANTS for clues about what each payment is.
 
-  b) VARIABLE ITEMS (medium confidence):
-     - For non-recurring outflows: use category-level weekly averages (last 8-12 weeks)
-     - For inflows: use weekly averages, but weight recent weeks more heavily
-     - Apply trend: if inflows grew 5%/month, continue that trend (dampened)
+  TREND & SEASONALITY:
+  - Are inflows growing, declining, or stable? Calculate month-over-month growth.
+  - Is there weekly seasonality? (e.g., more outflows on Mondays, inflows on Fridays)
+  - Is there monthly seasonality? (e.g., rent on day 1, salaries on day 28)
+  - What's the BURN RATE? (average weekly net cash consumption/generation)
+  - What's the RUNWAY? (current balance / average weekly burn = weeks until zero)
 
-  c) KNOWN FUTURE PAYMENTS (from pending invoices):
-     - Invoices with due_date in the forecast period → scheduled outflow
-     - Invoices without due_date: estimate using average payment delay for that supplier
+  PENDING OBLIGATIONS:
+  - List all unreconciled invoices (reconciled != True) — these WILL need to be paid.
+  - Group by due_date: how much is due this week, next week, in 30/60/90 days?
+  - Identify largest upcoming payments (top 5 pending invoices by amount).
 
-  d) SAFETY ADJUSTMENTS:
-     - Exclude one-off large transactions from averages (> 3x category average)
-     - Apply a conservative buffer: reduce projected inflows by 10%, increase outflows by 5%
+  Print ALL insights. This exploration drives the quality of your forecast.
+  DO NOT set `result`. Continue to STEP 3.
 
-  Build week-by-week projection:
-  - Opening balance (= current bank balance)
-  - Each week: projected inflows, projected outflows, net, cumulative balance
-  - Flag weeks where balance might go negative or below a safety threshold
-  DO NOT set `result` here. You MUST continue to STEP 4.
+STEP 3 — INTELLIGENT FORECAST MODEL (second run_code):
+  Build a SOPHISTICATED forecast using everything you learned:
 
-STEP 4 — GENERATE EXCEL REPORT (third run_code):
-  Create Excel with:
-  - Sheet "Forecast 13 Semanas": week-by-week table with inflows, outflows, net, balance
-  - Sheet "Detalle Categorias": breakdown of projected flows by category
-  - Sheet "Pagos Pendientes": pending invoices that will hit in the forecast period
-  - Sheet "Historico Semanal": historical weekly data used as basis
-  Include a line chart of projected balance over 13 weeks.
-  Color-code weeks where balance drops below safety threshold.
+  a) BASELINE — RECURRING CASHFLOWS (high confidence, 90%):
+     For each identified recurring payment/income:
+     - Project at its historical frequency and average amount
+     - Apply any detected trend (growing/shrinking)
+     - Place in the correct week based on historical timing pattern
 
-  Set `result` with summary, chart (line chart of balance), and key metrics.
+  b) VARIABLE FLOWS — WEIGHTED PROJECTION (medium confidence, 70%):
+     - Use EXPONENTIALLY WEIGHTED moving average (recent weeks count 2x)
+     - Apply detected monthly trend as growth/decay factor
+     - For supplier payments: cross-reference with pending invoices for better timing
+
+  c) SCHEDULED PAYMENTS — FROM PENDING INVOICES (high confidence):
+     - Invoices with due_date → place as outflow in that specific week
+     - Invoices without due_date → estimate using supplier's historical payment lag
+     - Large one-time pending invoices: flag separately with exact week
+
+  d) SCENARIO ANALYSIS (this is what makes you world-class):
+     Build THREE scenarios:
+     - OPTIMISTA: inflows +15%, outflows -5%, all pending delayed 2 weeks
+     - BASE (most likely): your best estimate from a/b/c above
+     - PESIMISTA: inflows -15%, outflows +10%, all pending paid immediately
+     Calculate balance trajectory for each scenario.
+
+  e) RISK INDICATORS:
+     - Minimum projected balance across all scenarios
+     - Week where cash is tightest (lowest balance)
+     - Probability of negative balance (if pessimistic goes negative)
+     - Recommended safety buffer
+     - Days of cash runway at current burn rate
+
+  DO NOT set `result`. Continue to STEP 4.
+
+STEP 4 — GENERATE WORLD-CLASS REPORT (third run_code):
+  Create a professional Excel:
+  - Sheet "Forecast 13 Semanas": week-by-week with 3 scenarios (optimista/base/pesimista)
+    Columns: Week, Inflows, Outflows, Net, Balance (Base), Balance (Optimista), Balance (Pesimista)
+  - Sheet "Analisis Categorias": flows breakdown by category with historical avg + projected
+  - Sheet "Pagos Pendientes": upcoming invoices sorted by due_date with supplier and amount
+  - Sheet "Historico Semanal": actual weekly data that fed the model
+  - Sheet "Resumen Ejecutivo": key metrics, runway, alerts, recommendations
+  Color-code risk weeks (red if any scenario goes negative, yellow if tight).
+
+  CHART FORMAT for `result`:
+  The chart MUST show HISTORICAL + FORECAST with different visual treatment:
+  - Use TWO datasets in the chart:
+    Dataset 1: "Histórico" — historical weekly balances (last 8-12 weeks of real data)
+    Dataset 2: "Proyección Base" — forecasted 13 weeks
+  - Historical data labels: all the past weeks (S-12, S-11, ..., S-1, Actual)
+  - Forecast data labels: future weeks (S+1, S+2, ..., S+13)
+  - The two series OVERLAP at "Actual" (current week) to create a continuous line
+  - This way the frontend renders past in one color and future in another.
+
+  Example chart structure:
+  ```
+  result = {
+      "answer": "Summary text...",
+      "chart": {
+          "type": "line",
+          "title": "Proyección de Tesorería - 13 Semanas",
+          "labels": ["S-8","S-7","S-6","S-5","S-4","S-3","S-2","S-1","Actual","S+1","S+2",...,"S+13"],
+          "datasets": [
+              {"label": "Histórico", "data": [real_balances..., current, null, null, ...]},
+              {"label": "Proyección Base", "data": [null, null, ..., current, projected_1, projected_2, ...]},
+              {"label": "Escenario Pesimista", "data": [null,..., current, pessimistic_1, ...]},
+          ]
+      },
+      "sources": [{"metric": "Saldo Actual", "value": X}, {"metric": "Saldo Proyectado S+13", ...}]
+  }
+  ```
+  Use null values so each dataset only shows its segment. They connect at "Actual".
 
 IMPORTANT:
-- Bank_Reconciliations is the ONLY source for actual cash movements.
-- Pending invoices (User_Expenses with reconciled != True) add known future outflows.
-- DO NOT use pandas. Use basic Python (collections, datetime).
-- Complete ALL 4 steps. Only set `result` in STEP 4 with Excel.""",
+- Bank_Reconciliations = ground truth. Pending invoices = known future outflows.
+- DO NOT use pandas. Use basic Python (collections, datetime, statistics).
+- Complete ALL 4 steps. Only set `result` in STEP 4 with Excel.
+- Your analysis should be so good that a CFO would trust it for real treasury decisions.""",
     },
 
     "simulacion": {

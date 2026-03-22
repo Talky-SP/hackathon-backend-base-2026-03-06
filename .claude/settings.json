@@ -43,7 +43,8 @@
       "Bash(curl -s http://localhost:8000/docs)",
       "Bash(taskkill //F //IM python.exe)",
       "Bash(find c:/hackathon-backend-base-2026-03-06 -type d -name \"__pycache__\" -exec rm -rf {} +)",
-      "Bash(python -c \"import pandas; print\\(f''pandas {pandas.__version__} OK''\\)\")"
+      "Bash(python -c \"import pandas; print\\(f''pandas {pandas.__version__} OK''\\)\")",
+      "Read(//tmp/**)"
     ]
   }
 }
