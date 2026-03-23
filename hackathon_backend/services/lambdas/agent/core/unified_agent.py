@@ -1046,6 +1046,7 @@ def run_agent(
     artifacts: list[dict] = []
     usage_records: list[dict] = []
     code_retry_counts: dict[str, int] = {}
+    last_chart: dict | None = None  # Capture chart from run_code results
 
     emit("agent_start", {"question": user_message, "model": model_id})
 
@@ -1116,9 +1117,13 @@ def run_agent(
             final_text = choice.message.content or ""
             emit("agent_done", {"message": "Respuesta generada"})
             result = _parse_final_response(final_text, sources_collected)
+            # Merge chart from run_code if the LLM didn't include one in its text
+            if not result.get("chart") and last_chart:
+                result["chart"] = last_chart
+                log.info(f"[run_agent] Injected chart from run_code: {last_chart.get('type')}")
             result["artifacts"] = artifacts
             result["usage"] = usage_records
-            log.info(f"[run_agent] DONE iterations={iteration+1}, artifacts={[a.get('filename') for a in artifacts]}, answer_len={len(final_text)}")
+            log.info(f"[run_agent] DONE iterations={iteration+1}, chart={result.get('chart') is not None}, artifacts={[a.get('filename') for a in artifacts]}, answer_len={len(final_text)}")
             return result
 
         # Process tool calls
@@ -1307,6 +1312,11 @@ def run_agent(
                 # Success — check for result and/or files
                 result_val = exec_result.get("result")
                 generated_files = exec_result.get("files", [])
+
+                # Capture chart data from run_code for final response
+                if isinstance(result_val, dict) and result_val.get("chart"):
+                    last_chart = result_val["chart"]
+                    log.info(f"[run_code] Captured chart: type={last_chart.get('type')}, title={last_chart.get('title')}")
 
                 # Validate generated files — catch empty outputs
                 if generated_files:
