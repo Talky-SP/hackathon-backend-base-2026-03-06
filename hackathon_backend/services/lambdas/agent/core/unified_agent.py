@@ -690,11 +690,16 @@ result = {
     "sources": [{"categoryDate": "...", "supplier": "...", "total": 123.45}]
 }
 ```
-CHART TIPS:
+CHART RULES (CRITICAL):
+- ALWAYS include chart data when the response involves numeric comparisons, distributions, trends, or rankings.
+- If the user explicitly asks for a chart/gráfica/gráfico, you MUST include result["chart"] — NEVER respond with just text or a markdown table.
+- The frontend renders charts from the result["chart"] JSON structure. Without it, no visual chart appears.
+- Chart types: "bar" (comparisons), "pie" (distributions), "line" (trends over time), "table" (detailed data).
 - For forecasts/predictions: use SEPARATE datasets for historical vs projected data.
   Dataset 1 "Histórico": real past data + nulls for future. Dataset 2 "Proyección": nulls for past + projected.
   They overlap at the current point. The frontend renders each dataset in a different color.
 - Keep sources concise: only include the most relevant items (top errors, key metrics), NOT all raw data.
+- Do NOT use matplotlib to generate chart images. Use the result["chart"] JSON structure — the frontend renders it.
 
 RULES:
 - Use GSIs, never full scans. Date queries -> UserIdInvoiceDateIndex (NOT UserIdPnlDateIndex, pnl_date is often null).
@@ -914,6 +919,7 @@ UNIFIED_TOOLS = [
                 "filter_items(items, **conditions), sum_field(items, field).\n"
                 "\n\nRULES:\n"
                 "- Assign analysis results to `result` variable (dict with 'answer', 'chart', 'sources').\n"
+                "- ALWAYS include result['chart'] for numeric data (bar/pie/line/table). The frontend renders it visually.\n"
                 "- Save generated files to output_dir (e.g. f'{output_dir}/report.xlsx').\n"
                 "- NEVER use sample/dummy data. Always use data from `data` dict.\n"
                 "- Code runs in a sandboxed environment. No imports needed — all libraries pre-injected."

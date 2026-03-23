@@ -44,6 +44,10 @@ class LambdaStack(Stack):
                 "companies": dynamodb_stack.companies_table.table_name,
                 "organizations": dynamodb_stack.organizations_table.table_name,
                 "organization_locations": dynamodb_stack.organization_locations_table.table_name,
+                "user_invoice_category_configs": dynamodb_stack.user_invoice_category_configs_table.table_name,
+                "document_ibans": dynamodb_stack.document_ibans_table.table_name,
+                "daily_stats": dynamodb_stack.daily_stats_table.table_name,
+                "monthly_stats": dynamodb_stack.monthly_stats_table.table_name,
             }
 
             agent = AgentLambda(
