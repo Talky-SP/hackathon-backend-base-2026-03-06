@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from decimal import Decimal
 import uuid
 from typing import Any
 
@@ -87,8 +88,8 @@ if _USE_DYNAMO:
             "result_summary": "",
             "error": "",
             "total_tokens": 0,
-            "cost_usd": "0.0",
-            "cost_budget_usd": str(limits["max_usd"]),
+            "cost_usd": Decimal("0.0"),
+            "cost_budget_usd": Decimal(str(limits["max_usd"])),
             "artifacts": "[]",
             "created_at": str(now),
             "started_at": "",
@@ -184,10 +185,11 @@ if _USE_DYNAMO:
 
     def add_task_cost(task_id: str, tokens: int, cost_usd: float) -> dict:
         table = _get_table()
+        cost_decimal = Decimal(str(cost_usd))
         resp = table.update_item(
             Key={"pk": f"TASK#{task_id}", "sk": "META"},
             UpdateExpression="SET total_tokens = total_tokens + :t, cost_usd = cost_usd + :c",
-            ExpressionAttributeValues={":t": tokens, ":c": cost_usd},
+            ExpressionAttributeValues={":t": tokens, ":c": cost_decimal},
             ReturnValues="ALL_NEW",
         )
         item = resp.get("Attributes", {})

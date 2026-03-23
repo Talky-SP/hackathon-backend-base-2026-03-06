@@ -54,7 +54,8 @@
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import UNIFIED_TOOLS; print\\([t[''function''][''name''] for t in UNIFIED_TOOLS]\\)\")",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.unified_agent import run_agent; from hackathon_backend.services.lambdas.agent.core.subagent_runner import _find_extracted_list; print\\(''OK''\\); print\\(_find_extracted_list\\({''invoices'': [1,2,3], ''summary'': ''test''}\\)\\); print\\(_find_extracted_list\\({''extracted_data'': [4,5]}\\)\\); print\\(_find_extracted_list\\({''foo'': [6,7,8,9], ''bar'': ''x''}\\)\\)\")",
       "Bash(python -c \"from hackathon_backend.services.lambdas.agent.lambda_handler import handler; print\\(''OK''\\)\")",
-      "Bash(python -c \"from aws_cdk import Size; print\\(''Size import OK:'', Size.mebibytes\\(2048\\)\\)\")"
+      "Bash(python -c \"from aws_cdk import Size; print\\(''Size import OK:'', Size.mebibytes\\(2048\\)\\)\")",
+      "Bash(python -c \"from hackathon_backend.services.lambdas.agent.core.task_manager import create_task, add_task_cost; print\\(''task_manager OK''\\)\")"
     ]
   }
 }
